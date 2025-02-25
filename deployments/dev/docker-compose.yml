@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../..:/app
+    command: tail -f /dev/null
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      TOKEN_ALGORITHM: RS256
+      TOKEN_EXPIRATION_SECONDS: 3600
+      REDIS_URL: redis://redis:6379
+      JWKS_SERVICE_URL: http://jwks-service-app:8082
+    depends_on:
+      - redis
+      - jwks-service-app
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander
+    restart: always
+    environment:
+      - REDIS_HOSTS=redis
+      - REDIS_COMMANDER_DEFAULT_PORT=6379
+    ports:
+      - "6380:8081"
+    depends_on:
+      - redis
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: jwk_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/jwt/postgresql/data
+
+  jwks-service-app:
+    image: filipov/jwks-service-app:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8082
+      DATABASE_URL: postgres://user:password@postgres:5432/jwk_db
+      RUN_MIGRATIONS_ON_START: 1
+      PRIVATE_KEY_EXPIRATION_SECONDS: 86400
+      KEY_EXPIRATION_SECONDS: 172800
+    ports:
+      - "8082:8082"
+    depends_on:
+      - postgres
+
+  swagger-ui:
+    image: swaggerapi/swagger-ui:latest
+    ports:
+      - "8081:8080"
+    environment:
+      CONFIG_URL: /config.json
+    volumes:
+      - ./config.json:/usr/share/nginx/html/config.json
+    depends_on:
+      - jwks-service-app
+      - app
+
+volumes:
+  postgres_data:

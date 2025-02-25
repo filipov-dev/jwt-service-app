@@ -1,0 +1,12 @@
+{
+  "urls": [
+    {
+      "url": "http://localhost:8080/api-docs/openapi.json",
+      "name": "JWT Service App"
+    },
+    {
+      "url": "http://localhost:8082/api-docs/openapi.json",
+      "name": "JWKS Service App"
+    }
+  ]
+}

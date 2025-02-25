@@ -1,0 +1,39 @@
+name: Create Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - Cargo.toml
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          echo "VERSION=$(grep -m1 'version' Cargo.toml | cut -d '"' -f 2)" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.VERSION }}
+          release_name: v${{ env.VERSION }}
+          body: ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+
+      - name: Trigger another workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/filipov-dev/jwt-service-app/actions/workflows/docker.yml/dispatches \
+            -d '{"ref":"v${{ env.VERSION }}"}'
