@@ -1,9 +1,10 @@
 use actix_web::{HttpResponse, ResponseError};
-use jsonwebtoken::errors::Error as JwtError;
 use redis::RedisError;
 use reqwest::Error as ReqwestError;
 use serde_json::json;
 use thiserror::Error;
+
+use crate::models::jwt::JwtError;
 
 #[derive(Debug, Error)]
 pub enum Error {
