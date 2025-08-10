@@ -24,6 +24,7 @@ FROM debian:bullseye-slim as runner
 RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \
         libssl1.1 \
+        ca-certificates \
         && rm -rf /var/lib/apt/lists/*
 
 # Copy the built application from the builder stage
