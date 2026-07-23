@@ -80,7 +80,9 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `HOST` | `127.0.0.1` | Адрес привязки. |
 | `PORT` | `8080` | Порт. |
 | `TOKEN_ALGORITHM` | `RS256` | Алгоритм подписи (см. `SUPPORTED_ALGORITHMS` в `key.rs`). |
-| `TOKEN_EXPIRATION_SECONDS` | `3600` | TTL токена и записи `jti` в Redis. |
+| `TOKEN_EXPIRATION_SECONDS` | `3600` | TTL токена и записи `jti` в Redis по умолчанию (когда `ttl` не передан в запросе). |
+| `TOKEN_TTL_MIN_SECONDS` | `1` | Нижняя граница кастомного `ttl` в теле `POST /tokens`. |
+| `TOKEN_TTL_MAX_SECONDS` | `86400` | Верхняя граница кастомного `ttl` в теле `POST /tokens`. |
 | `TOKEN_JKU` | — (нет) | Если задан, кладётся в заголовок `jku` и проверяется при верификации. |
 | `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
 | `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |

@@ -28,6 +28,15 @@ use tracing::{error, info};
 use uuid::Uuid;
 use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 
+/// Читает `u64` из переменной окружения, откатываясь на `default` при её
+/// отсутствии или неразборчивом значении.
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Error, Debug)]
 pub enum JtiError {
     #[error("Bad connection")]
@@ -88,13 +97,18 @@ pub struct TokenClaims {
 impl TokenClaims {
     /// Формирует новый набор claims и регистрирует `jti` в хранилище.
     ///
-    /// Время жизни берётся из `TOKEN_EXPIRATION_SECONDS` (по умолчанию `3600`);
-    /// на его основе вычисляются `exp` и TTL записи в хранилище. `jti`
-    /// генерируется как UUID v4.
+    /// Время жизни определяется аргументом `ttl` (секунды): если он задан,
+    /// используется он (после проверки границ), иначе — `TOKEN_EXPIRATION_SECONDS`
+    /// (по умолчанию `3600`). На его основе вычисляются `exp` и TTL записи в
+    /// хранилище — они всегда совпадают. `jti` генерируется как UUID v4.
+    ///
+    /// Границы кастомного `ttl` задаются `TOKEN_TTL_MIN_SECONDS` (по умолчанию
+    /// `1`) и `TOKEN_TTL_MAX_SECONDS` (по умолчанию `86400`).
     ///
     /// # Errors
-    /// - [`JwtError::UnprocessableEntity`] — пустой `audience` или невалидное
-    ///   значение `TOKEN_EXPIRATION_SECONDS`;
+    /// - [`JwtError::UnprocessableEntity`] — пустой `audience`, невалидное
+    ///   значение `TOKEN_EXPIRATION_SECONDS` или кастомный `ttl` вне границ
+    ///   `[TOKEN_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS]`;
     /// - [`JwtError::StoreError`] — сформированные claims не прошли
     ///   самопроверку [`TokenClaims::is_verify`].
     ///
@@ -105,17 +119,34 @@ impl TokenClaims {
         issuer: &str,
         subject: &str,
         audience: &[String],
+        ttl: Option<u64>,
         store: Data<T>,
     ) -> Result<Self, JwtError> {
-        let expiration_seconds = match env::var("TOKEN_EXPIRATION_SECONDS")
-            .unwrap_or("3600".into())
-            .parse::<u64>() {
-                Ok(v) => { v }
-                Err(e) => {
-                    error!("{}", e);
-                    return Err(JwtError::UnprocessableEntity)
+        let expiration_seconds = match ttl {
+            Some(requested) => {
+                let min = env_u64("TOKEN_TTL_MIN_SECONDS", 1);
+                let max = env_u64("TOKEN_TTL_MAX_SECONDS", 86400);
+
+                if requested < min || requested > max {
+                    error!(
+                        "Requested ttl {} out of bounds [{}, {}]",
+                        requested, min, max
+                    );
+                    return Err(JwtError::UnprocessableEntity);
                 }
-            };
+
+                requested
+            }
+            None => match env::var("TOKEN_EXPIRATION_SECONDS")
+                .unwrap_or("3600".into())
+                .parse::<u64>() {
+                    Ok(v) => { v }
+                    Err(e) => {
+                        error!("{}", e);
+                        return Err(JwtError::UnprocessableEntity)
+                    }
+                },
+        };
 
         if audience.is_empty() {
             return Err(JwtError::UnprocessableEntity);
@@ -604,7 +635,7 @@ mod tests {
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
-        let claims = TokenClaims::create_new("issuer", "subject", &audience, store.clone())
+        let claims = TokenClaims::create_new("issuer", "subject", &audience, None, store.clone())
             .await
             .unwrap();
 
@@ -621,7 +652,46 @@ mod tests {
     #[actix_web::test]
     async fn create_new_rejects_empty_audience() {
         let store = Data::new(MockStore::new());
-        let result = TokenClaims::create_new("issuer", "subject", &[], store).await;
+        let result = TokenClaims::create_new("issuer", "subject", &[], None, store).await;
+        assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
+    }
+
+    #[actix_web::test]
+    async fn create_new_honors_custom_ttl() {
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let before = Utc::now().timestamp() as usize;
+        let claims =
+            TokenClaims::create_new("issuer", "subject", &audience, Some(120), store.clone())
+                .await
+                .unwrap();
+        let after = Utc::now().timestamp() as usize;
+
+        // exp = iat + ttl, с поправкой на возможный сдвиг секунды при замере.
+        assert!(claims.exp >= before + 120 && claims.exp <= after + 120);
+        assert_eq!(claims.exp, claims.iat + 120);
+    }
+
+    #[actix_web::test]
+    async fn create_new_rejects_ttl_below_min() {
+        // Дефолтная нижняя граница — 1 секунда, значит 0 недопустим.
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, Some(0), store).await;
+        assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
+    }
+
+    #[actix_web::test]
+    async fn create_new_rejects_ttl_above_max() {
+        // Дефолтная верхняя граница — 86400 секунд.
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, Some(86401), store).await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 
