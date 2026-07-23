@@ -253,3 +253,140 @@ impl KeyManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Тесты реконструкции публичных ключей из компонентов JWK.
+    //!
+    //! Стратегия: генерируем настоящий ключ через OpenSSL, раскладываем его на
+    //! компоненты JWK (base64url), скармливаем реконструктору и убеждаемся, что
+    //! получившийся публичный ключ совпадает с исходным (`public_eq`). Сеть и
+    //! `jwks-service-app` не задействуются — проверяется только чистая крипто-логика.
+
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use openssl::bn::{BigNum, BigNumContext};
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+
+    /// base64url без паддинга — формат, в котором компоненты приходят в JWK.
+    fn b64(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Пустой JWK с заданным алгоритмом; поля-компоненты заполняются в тесте.
+    fn jwk(alg: &str) -> Jwk {
+        Jwk {
+            kty: String::new(),
+            alg: alg.to_string(),
+            kid: "test-kid".to_string(),
+            crv: None,
+            x: None,
+            y: None,
+            n: None,
+            e: None,
+        }
+    }
+
+    #[test]
+    fn reconstructs_rsa_public_key() {
+        let rsa = Rsa::generate(2048).unwrap();
+        let n = b64(&rsa.n().to_vec());
+        let e = b64(&rsa.e().to_vec());
+        let original = PKey::from_rsa(rsa).unwrap();
+
+        let mut jwk = jwk("RS256");
+        jwk.kty = "RSA".to_string();
+        jwk.n = Some(n);
+        jwk.e = Some(e);
+
+        let reconstructed = KeyManager::get_public_key_from_rs(jwk).unwrap();
+        assert!(reconstructed.public_eq(&original));
+    }
+
+    #[test]
+    fn reconstructs_ec_public_key_es256() {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ec = EcKey::generate(&group).unwrap();
+
+        let mut ctx = BigNumContext::new().unwrap();
+        let mut x = BigNum::new().unwrap();
+        let mut y = BigNum::new().unwrap();
+        ec.public_key()
+            .affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)
+            .unwrap();
+
+        let original = PKey::from_ec_key(ec).unwrap();
+
+        let mut jwk = jwk("ES256");
+        jwk.kty = "EC".to_string();
+        jwk.crv = Some("P-256".to_string());
+        jwk.x = Some(b64(&x.to_vec()));
+        jwk.y = Some(b64(&y.to_vec()));
+
+        let reconstructed = KeyManager::get_public_key_from_es(jwk).unwrap();
+        assert!(reconstructed.public_eq(&original));
+    }
+
+    #[test]
+    fn reconstructs_eddsa_public_key_ed25519() {
+        let original = PKey::generate_ed25519().unwrap();
+        let raw = original.raw_public_key().unwrap();
+
+        let mut jwk = jwk("EdDSA");
+        jwk.kty = "OKP".to_string();
+        jwk.crv = Some("Ed25519".to_string());
+        jwk.x = Some(b64(&raw));
+
+        let reconstructed = KeyManager::get_public_key_from_dsa(jwk).unwrap();
+        assert!(reconstructed.public_eq(&original));
+    }
+
+    #[test]
+    fn es_rejects_unsupported_curve() {
+        // Неизвестный `alg` для EC — кривая не выбирается, ждём `Unsupported`.
+        let jwk = jwk("ES999");
+        let result = KeyManager::get_public_key_from_es(jwk);
+        assert!(matches!(result, Err(KeyError::Unsupported)));
+    }
+
+    #[test]
+    fn dsa_rejects_missing_crv() {
+        // `x` присутствует и валиден, но `crv` не задан — ждём `InvalidKey`.
+        let raw = PKey::generate_ed25519().unwrap().raw_public_key().unwrap();
+        let mut jwk = jwk("EdDSA");
+        jwk.x = Some(b64(&raw));
+        jwk.crv = None;
+
+        let result = KeyManager::get_public_key_from_dsa(jwk);
+        assert!(matches!(result, Err(KeyError::InvalidKey)));
+    }
+
+    #[test]
+    fn dsa_rejects_unsupported_crv() {
+        let raw = PKey::generate_ed25519().unwrap().raw_public_key().unwrap();
+        let mut jwk = jwk("EdDSA");
+        jwk.x = Some(b64(&raw));
+        jwk.crv = Some("Ed99999".to_string());
+
+        let result = KeyManager::get_public_key_from_dsa(jwk);
+        assert!(matches!(result, Err(KeyError::Unsupported)));
+    }
+
+    #[test]
+    fn ed448_id_is_recognised() {
+        // Проверяем ветку Ed448 в маппинге `crv` -> `Id` (реконструкция ключа).
+        let original = PKey::generate_ed448().unwrap();
+        let raw = original.raw_public_key().unwrap();
+
+        let mut jwk = jwk("EdDSA");
+        jwk.crv = Some("Ed448".to_string());
+        jwk.x = Some(b64(&raw));
+
+        let reconstructed = KeyManager::get_public_key_from_dsa(jwk).unwrap();
+        assert!(reconstructed.public_eq(&original));
+    }
+}
