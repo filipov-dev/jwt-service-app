@@ -1,3 +1,14 @@
+//! HTTP-обработчики публичного API.
+//!
+//! Модуль содержит три эндпоинта:
+//! - `POST /tokens` — выпуск токена ([`create_token`]);
+//! - `POST /tokens/verify` — проверка токена ([`verify_token`]);
+//! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]).
+//!
+//! Обработчики намеренно тонкие: вся доменная логика вынесена в
+//! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
+//! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации.
+
 use std::env;
 use actix_web::{web, HttpResponse, post, delete};
 use chrono::Utc;
@@ -20,6 +31,18 @@ use crate::models::jwt::{JtiStore, JwtError};
         (status = 400, body = ErrorResponse)
     )
 )]
+/// Выпускает новый JWT.
+///
+/// Тело запроса — [`TokenRequest`] с `sub` (subject) и `aud` (audience).
+/// Issuer (`iss`) подставляется из заголовка `Host`. При выпуске генерируется
+/// `jti` и сохраняется в Redis с TTL, равным времени жизни токена.
+///
+/// # Ответы
+/// - `200 OK` — [`TokenResponse`] с подписанным токеном;
+/// - `422 Unprocessable Entity` — некорректные входные данные (например, пустой
+///   `aud` или невалидный `TOKEN_EXPIRATION_SECONDS`);
+/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`;
+/// - `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).
 #[post("/tokens")]
 pub async fn create_token(
     req: web::Json<TokenRequest>,
@@ -66,6 +89,17 @@ pub async fn create_token(
         (status = 401, body = ErrorResponse)
     )
 )]
+/// Проверяет валидность JWT.
+///
+/// Тело запроса — [`TokenVerifyRequest`] с самим `token` и ожидаемым
+/// `audience`. Проверяются подпись (по публичному ключу из JWKS, найденному по
+/// `kid`), совпадение `iss` с заголовком `Host`, вхождение `audience` в `aud`,
+/// временные границы (`nbf`/`iat`/`exp`) и наличие `jti` в Redis (не отозван).
+///
+/// # Ответы
+/// - `200 OK` — токен валиден, в теле возвращаются его claims;
+/// - `401 Unauthorized` — любая ошибка проверки (намеренно без деталей);
+/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
 #[post("/tokens/verify")]
 pub async fn verify_token(
     request: web::Json<TokenVerifyRequest>,
@@ -91,6 +125,14 @@ pub async fn verify_token(
         (status = 404, body = ErrorResponse)
     )
 )]
+/// Отзывает токен по его идентификатору `jti`.
+///
+/// Удаляет запись `jti` из Redis; после этого проверка соответствующего токена
+/// в [`verify_token`] будет неуспешной. Операция идемпотентна.
+///
+/// # Ответы
+/// - `204 No Content` — всегда, даже если `jti` не существовал. Ошибка Redis
+///   логируется, но наружу не пробрасывается.
 #[delete("/tokens/{jti}")]
 pub async fn revoke_token(
     jti: web::Path<String>,

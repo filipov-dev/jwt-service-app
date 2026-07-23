@@ -1,3 +1,17 @@
+//! Точка входа `jwt-service-app`.
+//!
+//! HTTP-сервис на actix-web для выпуска, проверки и отзыва JWT. Сервис не
+//! хранит криптографические ключи сам — за них отвечает внешний
+//! `jwks-service-app` (см. [`jwk::JwkService`]). Идентификаторы токенов (`jti`)
+//! отслеживаются в Redis (см. [`redis::RedisClient`]).
+//!
+//! Здесь конфигурируется и запускается HTTP-сервер: логирование (`tracing`),
+//! CORS, общие данные приложения (Redis-клиент и менеджер ключей), маршруты и
+//! выдача OpenAPI-спецификации.
+//!
+//! Конфигурация — через переменные окружения (`HOST`, `PORT`,
+//! `TOKEN_ALGORITHM`, и т.д.), полный список см. в `AGENTS.md`.
+
 use std::env;
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
@@ -18,6 +32,12 @@ use crate::key::KeyManager;
 use crate::redis::RedisClient;
 use crate::models::{ErrorResponse, TokenResponse, TokenRequest};
 
+/// Корневой описатель OpenAPI-документации.
+///
+/// Перечисляет пути (эндпоинты) и компоненты-схемы, из которых `utoipa`
+/// генерирует OpenAPI-спецификацию. При добавлении нового эндпоинта его нужно
+/// зарегистрировать здесь в `paths(...)`, а новые DTO — в `components(schemas(...))`,
+/// иначе они не попадут в спеку.
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -33,13 +53,31 @@ use crate::models::{ErrorResponse, TokenResponse, TokenRequest};
 )]
 struct ApiDoc;
 
-/// Endpoint to provide OpenAPI specification
+/// Отдаёт OpenAPI-спецификацию в формате JSON.
+///
+/// Обслуживает `GET /api-docs/openapi.json`; используется внешним Swagger UI
+/// (см. `deployments/dev/docker-compose.yml`).
 pub async fn openapi_spec() -> impl Responder {
     HttpResponse::Ok()
         .content_type("application/json")
         .body(ApiDoc::openapi().to_json().unwrap())
 }
 
+/// Инициализирует и запускает HTTP-сервер.
+///
+/// Порядок действий:
+/// 1. Читает алгоритм подписи из `TOKEN_ALGORITHM` (по умолчанию `RS256`).
+/// 2. Настраивает `tracing`-логирование (pretty, с фильтром из окружения).
+/// 3. Читает `HOST`/`PORT` для привязки.
+/// 4. Создаёт Redis-клиент и менеджер ключей (падает с паникой, если Redis
+///    недоступен на старте).
+/// 5. Поднимает `HttpServer` с CORS (открыт для всех источников) и регистрирует
+///    маршруты, включая выдачу OpenAPI.
+///
+/// # Panics
+///
+/// Паникует, если `PORT` не парсится в `u16`, если не удалось подключиться к
+/// Redis или установить глобальный subscriber `tracing`.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let algorithm = env::var("TOKEN_ALGORITHM")

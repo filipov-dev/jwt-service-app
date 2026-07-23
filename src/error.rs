@@ -1,3 +1,10 @@
+//! Общий тип ошибки HTTP-слоя.
+//!
+//! [`Error`] агрегирует ошибки нижележащих слоёв (JWT, Redis, HTTP-клиент) и
+//! реализует [`ResponseError`], сопоставляя каждый вариант с HTTP-статусом.
+//! Внутренние причины (Redis/reqwest/JWT) наружу не раскрываются — клиент
+//! получает обобщённое «Internal server error».
+
 use actix_web::{HttpResponse, ResponseError};
 use redis::RedisError;
 use reqwest::Error as ReqwestError;
@@ -6,6 +13,7 @@ use thiserror::Error;
 
 use crate::models::jwt::JwtError;
 
+/// Ошибка уровня приложения, преобразуемая в HTTP-ответ.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Validation error: {0}")]
@@ -25,6 +33,11 @@ pub enum Error {
 }
 
 impl ResponseError for Error {
+    /// Отображает вариант ошибки в HTTP-ответ.
+    ///
+    /// `Validation` → 400, `Unauthorized` → 401, `NotFound` → 404. Остальные
+    /// варианты (`Jwt`, `Redis`, `Reqwest`, `Internal`) считаются внутренними и
+    /// возвращают 500 без деталей.
     fn error_response(&self) -> HttpResponse {
         match self {
             Error::Validation(msg) => HttpResponse::BadRequest().json(json!({ "error": msg })),
