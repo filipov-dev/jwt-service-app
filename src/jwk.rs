@@ -1,4 +1,11 @@
-//! Реализация методов работы с JWK сервисом
+//! HTTP-клиент к внешнему сервису ключей `jwks-service-app`.
+//!
+//! [`JwkService`] инкапсулирует все обращения к сервису ключей:
+//! - `GET /.well-known/jwks.json` — список публичных ключей;
+//! - `GET /jwks/{id}` — конкретный ключ (с приватной частью);
+//! - `POST /jwks` — создание нового ключа под заданный алгоритм.
+//!
+//! Базовый URL берётся из `JWKS_SERVICE_URL`.
 
 use std::env;
 use reqwest::Client;
@@ -7,6 +14,7 @@ use thiserror::Error;
 use tracing::{error, debug, info};
 use crate::models::{Jwk, JwkData, Jwks};
 
+/// Ошибки взаимодействия с сервисом ключей.
 #[derive(Error, Debug)]
 pub enum JwkError {
     #[error("Bad connection")]
@@ -17,13 +25,17 @@ pub enum JwkError {
     NotFound,
 }
 
+/// Клиент сервиса ключей на базе `reqwest`.
 #[derive(Clone)]
 pub struct JwkService {
     client: Client,
+    /// Базовый URL сервиса (`JWKS_SERVICE_URL`).
     url: String,
 }
 
 impl JwkService {
+    /// Создаёт клиент; базовый URL берётся из `JWKS_SERVICE_URL`
+    /// (по умолчанию `http://jwks-service-app:8080`).
     pub fn new() -> Self {
         let url = env::var("JWKS_SERVICE_URL")
             .unwrap_or("http://jwks-service-app:8080".into());
@@ -78,7 +90,8 @@ impl JwkService {
         Err(JwkError::NotFound)
     }
 
-    /// Получаем, либо создаем ключ
+    /// Возвращает приватный ключ по `id`, создавая новый под алгоритм `alg`,
+    /// если ключа с таким `id` нет (или `id` пуст).
     pub async fn private_key(&self, id: &str, alg: &str) -> Result<JwkData, JwkError> {
         match self.get_key(id).await {
             Ok(v) => { Ok(v) }
@@ -86,7 +99,10 @@ impl JwkService {
         }
     }
 
-    /// Создаем новый ключ в сервисе
+    /// Создаёт новый ключ в сервисе под указанный алгоритм.
+    ///
+    /// Для `EdDSA` сервису передаётся конкретная кривая `Ed25519` (сервис ключей
+    /// оперирует именем кривой, а не общим именем алгоритма).
     async fn create_key(&self, alg: &str) -> Result<JwkData, JwkError> {
         let url = format!("{}/jwks", self.url);
 
