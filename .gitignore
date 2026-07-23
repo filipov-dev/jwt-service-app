@@ -1,2 +1,6 @@
 /target
 /.idea
+
+# Внутренние заметки для агентов; каноничная копия — на Вики
+# (homepage/projects/jwt-service-app/agents-internal)
+AGENTS_INTERNAL.md
