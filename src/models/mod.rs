@@ -24,6 +24,15 @@ pub struct TokenRequest {
 
     #[schema(example = json!(["api1", "api2"]))]
     pub aud: Vec<String>,
+
+    /// Необязательное кастомное время жизни токена в секундах.
+    ///
+    /// Если не задано, используется `TOKEN_EXPIRATION_SECONDS`. При наличии
+    /// значение проверяется на границы `TOKEN_TTL_MIN_SECONDS` /
+    /// `TOKEN_TTL_MAX_SECONDS`; выход за них — `422 Unprocessable Entity`.
+    #[schema(example = 3600, nullable = true)]
+    #[serde(default)]
+    pub ttl: Option<u64>,
 }
 
 /// Тело запроса на проверку токена (`POST /tokens/verify`).

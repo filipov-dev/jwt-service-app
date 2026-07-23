@@ -18,6 +18,8 @@ impl JwtManager {
     /// - `issuer` — значение claim `iss` (берётся из заголовка `Host`);
     /// - `subject` — значение claim `sub`;
     /// - `audience` — список получателей (`aud`); не должен быть пустым;
+    /// - `ttl` — необязательное кастомное время жизни токена (секунды); при
+    ///   `None` берётся `TOKEN_EXPIRATION_SECONDS`;
     /// - `key_manager` — источник приватного ключа и его `kid`;
     /// - `store` — хранилище `jti` (Redis), куда пишется идентификатор токена.
     ///
@@ -34,6 +36,7 @@ impl JwtManager {
         issuer: &str,
         subject: &str,
         audience: &[String],
+        ttl: Option<u64>,
         key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<String, JwtError> {
@@ -43,6 +46,7 @@ impl JwtManager {
             issuer,
             subject,
             audience,
+            ttl,
             store,
         ).await?;
 

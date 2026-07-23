@@ -33,14 +33,16 @@ use crate::models::jwt::{JtiStore, JwtError};
 )]
 /// Выпускает новый JWT.
 ///
-/// Тело запроса — [`TokenRequest`] с `sub` (subject) и `aud` (audience).
-/// Issuer (`iss`) подставляется из заголовка `Host`. При выпуске генерируется
-/// `jti` и сохраняется в Redis с TTL, равным времени жизни токена.
+/// Тело запроса — [`TokenRequest`] с `sub` (subject), `aud` (audience) и
+/// необязательным `ttl` (кастомное время жизни в секундах). Issuer (`iss`)
+/// подставляется из заголовка `Host`. При выпуске генерируется `jti` и
+/// сохраняется в Redis с TTL, равным времени жизни токена.
 ///
 /// # Ответы
 /// - `200 OK` — [`TokenResponse`] с подписанным токеном;
 /// - `422 Unprocessable Entity` — некорректные входные данные (например, пустой
-///   `aud` или невалидный `TOKEN_EXPIRATION_SECONDS`);
+///   `aud`, невалидный `TOKEN_EXPIRATION_SECONDS` или `ttl` вне допустимых
+///   границ);
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`;
 /// - `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).
 #[post("/tokens")]
@@ -59,6 +61,7 @@ pub async fn create_token(
         &host_header,
         &req.sub,
         &req.aud,
+        req.ttl,
         &keys,
         redis,
     ).await {
