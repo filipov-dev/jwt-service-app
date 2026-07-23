@@ -426,3 +426,236 @@ impl JsonWebToken<Public> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Тесты сборки/разбора JWT и проверки claims.
+    //!
+    //! Хранилище `jti` подменяется in-memory моком [`MockStore`] — Redis и сеть
+    //! не нужны. Полный round-trip проверки токена (`from_string`) требует
+    //! публичного ключа из `jwks-service-app`, поэтому здесь проверяется всё, что
+    //! от сети не зависит: жизненный цикл claims, кодирование сегментов и
+    //! корректность подписи, которую ставит [`JsonWebToken::to_string`].
+
+    use super::*;
+    use openssl::pkey::Id;
+    use std::collections::HashSet;
+    use parking_lot::Mutex;
+
+    /// In-memory реализация [`JtiStore`] для тестов.
+    struct MockStore {
+        jtis: Mutex<HashSet<String>>,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            Self { jtis: Mutex::new(HashSet::new()) }
+        }
+
+        fn insert(&self, jti: &str) {
+            self.jtis.lock().insert(jti.to_string());
+        }
+    }
+
+    impl JtiStore for MockStore {
+        async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            self.jtis.lock().insert(jti.to_string());
+            Ok(())
+        }
+
+        async fn check_jti(&self, jti: &str) -> Result<bool, JtiError> {
+            Ok(self.jtis.lock().contains(jti))
+        }
+
+        async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
+            self.jtis.lock().remove(jti);
+            Ok(())
+        }
+    }
+
+    /// Заведомо валидные claims: выпущены «сейчас», живут ещё час.
+    fn sample_claims() -> TokenClaims {
+        let now = Utc::now().timestamp() as usize;
+        TokenClaims {
+            iss: "issuer".to_string(),
+            sub: "subject".to_string(),
+            aud: vec!["api1".to_string(), "api2".to_string()],
+            exp: now + 3600,
+            iat: now,
+            nbf: now,
+            jti: "jti-1".to_string(),
+        }
+    }
+
+    // --- Кодирование/декодирование сегментов ---
+
+    #[test]
+    fn claims_base64_roundtrip() {
+        let claims = sample_claims();
+        let decoded = TokenClaims::from_base64(claims.to_base64()).unwrap();
+
+        assert_eq!(decoded.iss, claims.iss);
+        assert_eq!(decoded.sub, claims.sub);
+        assert_eq!(decoded.aud, claims.aud);
+        assert_eq!(decoded.exp, claims.exp);
+        assert_eq!(decoded.iat, claims.iat);
+        assert_eq!(decoded.nbf, claims.nbf);
+        assert_eq!(decoded.jti, claims.jti);
+    }
+
+    #[test]
+    fn claims_from_base64_rejects_invalid_base64() {
+        // '!' не входит в алфавит base64url — ошибка декодирования.
+        assert!(matches!(
+            TokenClaims::from_base64("!!!not-base64!!!".to_string()),
+            Err(JwtError::Broken)
+        ));
+    }
+
+    #[test]
+    fn claims_from_base64_rejects_non_json() {
+        // Валидный base64url, но за ним не JSON claims.
+        let payload = BASE64_URL_SAFE_NO_PAD.encode("just a string");
+        assert!(matches!(
+            TokenClaims::from_base64(payload),
+            Err(JwtError::Broken)
+        ));
+    }
+
+    #[test]
+    fn header_roundtrip_and_verify() {
+        let header = TokenHeaders::create_new("kid-1".to_string());
+        let decoded = TokenHeaders::from_base64(header.to_base64());
+
+        assert_eq!(decoded.kid, "kid-1");
+        assert_eq!(decoded.typ, "JWT");
+        // alg по умолчанию RS256 (входит в SUPPORTED_ALGORITHMS), jku не задан.
+        assert!(decoded.is_verify());
+    }
+
+    // --- Проверка claims (iss/aud/nbf/iat/exp, jti) ---
+
+    #[actix_web::test]
+    async fn is_verify_accepts_valid_claims() {
+        let store = Data::new(MockStore::new());
+        store.insert("jti-1");
+
+        let claims = sample_claims();
+        assert!(claims.is_verify("issuer", "api2", store).await);
+    }
+
+    #[actix_web::test]
+    async fn is_verify_rejects_wrong_issuer() {
+        let store = Data::new(MockStore::new());
+        store.insert("jti-1");
+
+        let claims = sample_claims();
+        assert!(!claims.is_verify("other-issuer", "api1", store).await);
+    }
+
+    #[actix_web::test]
+    async fn is_verify_rejects_wrong_audience() {
+        let store = Data::new(MockStore::new());
+        store.insert("jti-1");
+
+        let claims = sample_claims();
+        assert!(!claims.is_verify("issuer", "unknown-aud", store).await);
+    }
+
+    #[actix_web::test]
+    async fn is_verify_rejects_expired_token() {
+        let store = Data::new(MockStore::new());
+        store.insert("jti-1");
+
+        let now = Utc::now().timestamp() as usize;
+        let mut claims = sample_claims();
+        claims.iat = now - 7200;
+        claims.nbf = now - 7200;
+        claims.exp = now - 3600; // истёк час назад
+
+        assert!(!claims.is_verify("issuer", "api1", store).await);
+    }
+
+    #[actix_web::test]
+    async fn is_verify_rejects_not_yet_valid_token() {
+        let store = Data::new(MockStore::new());
+        store.insert("jti-1");
+
+        let now = Utc::now().timestamp() as usize;
+        let mut claims = sample_claims();
+        claims.nbf = now + 3600; // станет валиден только через час
+
+        assert!(!claims.is_verify("issuer", "api1", store).await);
+    }
+
+    #[actix_web::test]
+    async fn is_verify_rejects_missing_jti() {
+        // Хранилище пустое: `jti` отозван/протух.
+        let store = Data::new(MockStore::new());
+
+        let claims = sample_claims();
+        assert!(!claims.is_verify("issuer", "api1", store).await);
+    }
+
+    // --- Выпуск claims (create_new) ---
+
+    #[actix_web::test]
+    async fn create_new_builds_valid_claims_and_stores_jti() {
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let claims = TokenClaims::create_new("issuer", "subject", &audience, store.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(claims.iss, "issuer");
+        assert_eq!(claims.sub, "subject");
+        assert_eq!(claims.aud, audience);
+        assert_eq!(claims.iat, claims.nbf);
+        assert!(claims.exp > claims.iat);
+        assert!(Uuid::parse_str(&claims.jti).is_ok());
+        // jti должен быть зарегистрирован в хранилище.
+        assert!(store.check_jti(&claims.jti).await.unwrap());
+    }
+
+    #[actix_web::test]
+    async fn create_new_rejects_empty_audience() {
+        let store = Data::new(MockStore::new());
+        let result = TokenClaims::create_new("issuer", "subject", &[], store).await;
+        assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
+    }
+
+    // --- Подпись токена (JsonWebToken::to_string) ---
+
+    #[test]
+    fn to_string_produces_verifiable_signature() {
+        // Ключ Ed25519: подпись/проверка без явного дайджеста — как в `to_string`.
+        let private = PKey::generate_ed25519().unwrap();
+        let public =
+            PKey::public_key_from_raw_bytes(&private.raw_public_key().unwrap(), Id::ED25519)
+                .unwrap();
+
+        let headers = TokenHeaders::create_new("kid-1".to_string());
+        let claims = sample_claims();
+        let jwt = JsonWebToken::create_new(headers, claims, private);
+
+        let token = jwt.to_string();
+
+        // Ровно три сегмента header.payload.signature.
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        // Подпись действительно покрывает "header.payload".
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let mut verifier = Verifier::new_without_digest(&public).unwrap();
+        let signed_data = format!("{}.{}", parts[0], parts[1]);
+        assert!(verifier
+            .verify_oneshot(&signature, signed_data.as_bytes())
+            .unwrap());
+
+        // Сегмент claims декодируется обратно без потерь.
+        let decoded_claims = TokenClaims::from_base64(parts[1].to_string()).unwrap();
+        assert_eq!(decoded_claims.jti, "jti-1");
+        assert_eq!(decoded_claims.iss, "issuer");
+    }
+}
