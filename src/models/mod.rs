@@ -75,6 +75,22 @@ impl ErrorResponse {
     }
 }
 
+/// Ответ readiness-проверки (`GET /readyz`).
+///
+/// `status` — агрегированное состояние (`"ok"`/`"unavailable"`), поля `redis` и
+/// `jwks` отражают доступность соответствующей зависимости.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReadinessResponse {
+    /// Агрегированный статус: `"ok"`, если все зависимости доступны, иначе
+    /// `"unavailable"`.
+    #[schema(example = "ok")]
+    pub status: String,
+    /// Доступность Redis.
+    pub redis: bool,
+    /// Доступность сервиса ключей (`jwks-service-app`).
+    pub jwks: bool,
+}
+
 /// Полное представление ключа, включая приватную часть.
 ///
 /// Возвращается сервисом `jwks-service-app` при запросе/создании ключа и

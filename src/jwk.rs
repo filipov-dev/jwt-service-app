@@ -46,6 +46,18 @@ impl JwkService {
         }
     }
 
+    /// Проверяет доступность сервиса ключей (`GET /.well-known/jwks.json`).
+    ///
+    /// Используется в readiness-проверке (`GET /readyz`): достаточно, что список
+    /// публичных ключей успешно запросился и распарсился.
+    ///
+    /// # Errors
+    /// - [`JwkError::BadConnection`] — сервис недоступен;
+    /// - [`JwkError::BadResponse`] — некорректный ответ.
+    pub async fn health_check(&self) -> Result<(), JwkError> {
+        self.public_keys().await.map(|_| ())
+    }
+
     /// Получаем все ключи
     async fn public_keys(&self) -> Result<Jwks, JwkError> {
         let url = format!("{}/.well-known/jwks.json", self.url);

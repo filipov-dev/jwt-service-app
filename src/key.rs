@@ -65,6 +65,20 @@ impl KeyManager {
         }
     }
 
+    /// Проверяет доступность сервиса ключей для readiness-проверки (`GET /readyz`).
+    ///
+    /// Делегирует в [`JwkService::health_check`] — запрашивает публичные ключи
+    /// (`GET /.well-known/jwks.json`).
+    ///
+    /// # Errors
+    /// [`KeyError::NotFound`] — сервис ключей недоступен или вернул некорректный ответ.
+    pub async fn check_jwks(&self) -> Result<(), KeyError> {
+        self.service.health_check().await.map_err(|e| {
+            error!("{}", e);
+            KeyError::NotFound
+        })
+    }
+
     /// Получает данные текущего ключа (с приватной частью), при необходимости
     /// создавая новый через сервис, и обновляет кэш `current_key_id`.
     async fn get_jwk_data(&self) -> Result<JwkData, KeyError> {

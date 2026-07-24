@@ -10,7 +10,7 @@
 //! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации.
 
 use std::env;
-use actix_web::{web, HttpResponse, post, delete};
+use actix_web::{web, HttpResponse, get, post, delete};
 use chrono::Utc;
 use tracing::error;
 use utoipa::path;
@@ -19,7 +19,7 @@ use crate::jwt::JwtManager;
 use crate::key::KeyManager;
 use crate::redis::RedisClient;
 use crate::error::*;
-use crate::models::{ErrorResponse, TokenRequest, TokenResponse, TokenVerifyRequest};
+use crate::models::{ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse, TokenVerifyRequest};
 use crate::models::jwt::{JtiStore, JwtError};
 
 #[utoipa::path(
@@ -157,4 +157,104 @@ pub async fn revoke_token(
     };
 
     Ok(HttpResponse::NoContent().finish())
+}
+
+#[utoipa::path(
+    get,
+    path = "/livez",
+    responses(
+        (status = 200, description = "Процесс жив")
+    )
+)]
+/// Liveness-проба: подтверждает, что процесс жив.
+///
+/// Всегда возвращает `200 OK` без тела. Зависимости не проверяются — для этого
+/// служит [`readyz`]. Предназначен для liveness-проверки оркестратора.
+#[get("/livez")]
+pub async fn livez() -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses(
+        (status = 200, body = ReadinessResponse, description = "Все зависимости доступны"),
+        (status = 503, body = ReadinessResponse, description = "Одна из зависимостей недоступна")
+    )
+)]
+/// Readiness-проба: проверяет доступность зависимостей.
+///
+/// Пингует Redis и запрашивает JWKS у `jwks-service-app`
+/// (`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обе зависимости
+/// доступны, иначе `503 Service Unavailable`. В обоих случаях тело —
+/// [`ReadinessResponse`] с детализацией по каждой зависимости.
+#[get("/readyz")]
+pub async fn readyz(
+    redis: web::Data<RedisClient>,
+    keys: web::Data<KeyManager>,
+) -> HttpResponse {
+    let redis_ok = redis.ping().await.is_ok();
+    let jwks_ok = keys.check_jwks().await.is_ok();
+
+    let body = ReadinessResponse {
+        status: if redis_ok && jwks_ok { "ok" } else { "unavailable" }.into(),
+        redis: redis_ok,
+        jwks: jwks_ok,
+    };
+
+    if redis_ok && jwks_ok {
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::ServiceUnavailable().json(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Тесты health/readiness-эндпоинтов.
+    //!
+    //! `livez` не зависит от окружения. Для `readyz` зависимости (Redis и
+    //! `jwks-service-app`) направляются на заведомо недоступные адреса, чтобы
+    //! детерминированно проверить ветку `503` без реальной инфраструктуры.
+
+    use super::*;
+    use actix_web::{test, App};
+    use actix_web::http::StatusCode;
+
+    #[actix_web::test]
+    async fn livez_returns_200() {
+        let app = test::init_service(App::new().service(livez)).await;
+        let req = test::TestRequest::get().uri("/livez").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn readyz_reports_503_when_dependencies_unavailable() {
+        // Порт 1 гарантированно недоступен — и Redis, и JWKS быстро падают с
+        // «connection refused» независимо от окружения.
+        env::set_var("REDIS_URL", "redis://127.0.0.1:1");
+        env::set_var("JWKS_SERVICE_URL", "http://127.0.0.1:1");
+
+        let redis = RedisClient::new().unwrap();
+        let keys = KeyManager::new("RS256".to_string());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(redis))
+                .app_data(web::Data::new(keys))
+                .service(readyz),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body: ReadinessResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "unavailable");
+        assert!(!body.redis);
+        assert!(!body.jwks);
+    }
 }
