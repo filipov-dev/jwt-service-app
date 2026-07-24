@@ -26,9 +26,11 @@ use crate::models::jwt::{JtiStore, JwtError};
     post,
     path = "/tokens",
     request_body = TokenRequest,
+    security(("totp" = [])),
     responses(
         (status = 200, body = TokenResponse),
         (status = 400, body = ErrorResponse),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
         (status = 422, body = ErrorResponse),
         (status = 500, body = ErrorResponse)
     )
@@ -103,10 +105,11 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
     post,
     path = "/tokens/verify",
     request_body = TokenVerifyRequest,
+    security(("proxy_secret" = [])),
     responses(
         (status = 200),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse)
+        (status = 401, body = ErrorResponse, description = "Уровень 2: нет proxy-secret, либо токен невалиден/истёк")
     )
 )]
 /// Проверяет валидность JWT.
@@ -156,8 +159,10 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
 #[utoipa::path(
     delete,
     path = "/tokens/{jti}",
+    security(("totp" = [])),
     responses(
         (status = 204),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
         (status = 404, body = ErrorResponse)
     )
 )]
