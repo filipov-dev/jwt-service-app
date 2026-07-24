@@ -25,12 +25,14 @@ mod auth;
 mod error;
 mod handlers;
 mod key;
+mod rate_limit;
 mod redis;
 mod models;
 mod jwk;
 mod jwt;
 
 use crate::auth::{Auth, AuthConfig, AuthLevel};
+use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::handlers::{
     create_token_impl, verify_token_impl, revoke_token_impl, livez, readyz,
 };
@@ -152,6 +154,18 @@ async fn main() -> std::io::Result<()> {
     let auth_config = AuthConfig::from_env()
         .unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
 
+    // Конфигурация rate limiting. В отличие от auth, ошибки не фатальны —
+    // деградируем к безопасным дефолтам с предупреждением (см. `rate_limit.rs`).
+    // Лимитеры строятся один раз и общие на все worker-потоки (внутри `Arc`).
+    let rate_limit_config = RateLimitConfig::from_env();
+    rate_limit_config.log_summary();
+    let verify_limiter = rate_limit_config.build_verify();
+    let internal_limiter = rate_limit_config.build_internal();
+    // Фоновая чистка устаревших per-IP записей — один поток на процесс.
+    if let Some(limiter) = &verify_limiter {
+        limiter.spawn_cleanup();
+    }
+
     info!("Starting server on {}:{}", host, port);
 
     HttpServer::new(move || {
@@ -167,21 +181,28 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
-            // Уровень 3 (TOTP): выпуск и отзыв токенов.
+            // Уровень 3 (TOTP): выпуск и отзыв токенов. Глобальный cap — внутри auth
+            // (последний `.wrap` — внешний), поэтому потолок расходуют только
+            // запросы, прошедшие TOTP: неаутентифицированный флуд не исчерпает cap.
             .service(
                 web::resource("/tokens")
+                    .wrap(RateLimit::global(internal_limiter.clone()))
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
                     .route(web::post().to(create_token_impl::<RedisClient>)),
             )
             // Уровень 2 (proxy-secret): проверка токена. Регистрируется до
             // `/tokens/{jti}`, чтобы путь `/tokens/verify` не поглотился шаблоном.
+            // Per-IP лимит — снаружи auth (последний `.wrap` — внешний), чтобы флуд
+            // отсекался ещё до проверки proxy-secret.
             .service(
                 web::resource("/tokens/verify")
                     .wrap(Auth::new(AuthLevel::ProxySecret, auth.clone()))
+                    .wrap(RateLimit::per_ip(verify_limiter.clone()))
                     .route(web::post().to(verify_token_impl::<RedisClient>)),
             )
             .service(
                 web::resource("/tokens/{jti}")
+                    .wrap(RateLimit::global(internal_limiter.clone()))
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
             )
