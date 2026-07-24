@@ -1,0 +1,27 @@
+# Traefik (dynamic config, file provider). Секрет — из окружения через
+# шаблонизацию (Traefik сам env не разворачивает в значениях middleware; используйте
+# генерацию файла из шаблона или label с подстановкой при деплое).
+#
+# customRequestHeaders одновременно ЗАДАЁТ заголовок и тем самым ПЕРЕЗАПИСЫВАЕТ
+# любую клиентскую версию — Traefik заменяет значение целиком.
+
+http:
+  middlewares:
+    inject-proxy-secret:
+      headers:
+        customRequestHeaders:
+          # Перезаписывает клиентский X-Proxy-Secret значением секрета.
+          X-Proxy-Secret: "{{ env "PROXY_SECRET" }}"
+
+  routers:
+    jwt:
+      rule: "Host(`api.example.com`)"
+      middlewares:
+        - inject-proxy-secret
+      service: jwt-service
+
+  services:
+    jwt-service:
+      loadBalancer:
+        servers:
+          - url: "http://jwt_service:8080"

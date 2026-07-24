@@ -1,0 +1,11 @@
+# Caddy — секрет из окружения через {env.PROXY_SECRET}.
+# header_up с "-" удаляет заголовок, затем set ставит секрет.
+
+api.example.com {
+    reverse_proxy jwt_service:8080 {
+        # (1) Удаляем клиентскую версию заголовка.
+        header_up -X-Proxy-Secret
+        # (2) Ставим секрет из окружения (перезапись, т.к. заголовок уже удалён).
+        header_up X-Proxy-Secret {env.PROXY_SECRET}
+    }
+}

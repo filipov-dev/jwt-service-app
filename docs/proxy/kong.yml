@@ -1,0 +1,24 @@
+# Kong (declarative config). Плагин request-transformer:
+#   - remove.headers удаляет клиентскую версию;
+#   - add.headers (при отсутствии) / replace.headers ставит секрет.
+# Значение секрета подставляется при рендере конфига из env KONG_PROXY_SECRET
+# (Kong не разворачивает env внутри значений плагина сам).
+
+_format_version: "3.0"
+services:
+  - name: jwt-service
+    url: http://jwt_service:8080
+    routes:
+      - name: jwt-route
+        hosts: ["api.example.com"]
+    plugins:
+      - name: request-transformer
+        config:
+          # (1) Удаляем входящий заголовок от клиента.
+          remove:
+            headers: ["X-Proxy-Secret"]
+          # (2) Ставим секрет (replace гарантирует перезапись).
+          replace:
+            headers: ["X-Proxy-Secret:${PROXY_SECRET}"]
+          add:
+            headers: ["X-Proxy-Secret:${PROXY_SECRET}"]
