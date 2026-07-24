@@ -28,7 +28,9 @@ use crate::models::jwt::{JtiStore, JwtError};
     request_body = TokenRequest,
     responses(
         (status = 200, body = TokenResponse),
-        (status = 400, body = ErrorResponse)
+        (status = 400, body = ErrorResponse),
+        (status = 422, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
     )
 )]
 /// Выпускает новый JWT.
@@ -69,15 +71,15 @@ pub async fn create_token(
             Ok(HttpResponse::Ok().json(TokenResponse { token }))
         }
         Err(e) => {
-            error!("Error: {}", e);
+            error!("Не удалось выпустить токен: {}", e);
 
+            // Внутреннюю причину не раскрываем: `UnprocessableEntity` → 422 с
+            // осмысленным сообщением, всё остальное → 500 с обобщённым текстом.
             match e {
-                JwtError::UnprocessableEntity => {
-                    Ok(HttpResponse::UnprocessableEntity().finish())
-                }
-                _ => {
-                    Ok(HttpResponse::InternalServerError().finish())
-                }
+                JwtError::UnprocessableEntity => Err(Error::Unprocessable(
+                    "Invalid token request parameters".into(),
+                )),
+                _ => Err(Error::Internal(e.to_string())),
             }
         }
     }
@@ -89,6 +91,7 @@ pub async fn create_token(
     request_body = TokenVerifyRequest,
     responses(
         (status = 200),
+        (status = 400, body = ErrorResponse),
         (status = 401, body = ErrorResponse)
     )
 )]
@@ -115,8 +118,13 @@ pub async fn verify_token(
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
     match JwtManager::verify_token(&request.token, host_header, &request.audience, redis).await {
-        Ok(v) => { Ok(HttpResponse::Ok().json(v)) }
-        Err(_) => { Ok(HttpResponse::Unauthorized().finish()) }
+        Ok(v) => Ok(HttpResponse::Ok().json(v)),
+        Err(e) => {
+            // Детали проверки наружу намеренно не раскрываем, чтобы не давать
+            // подсказок атакующему — единый ответ на любую причину.
+            error!("Проверка токена не удалась: {}", e);
+            Err(Error::Unauthorized("Invalid or expired token".into()))
+        }
     }
 }
 
