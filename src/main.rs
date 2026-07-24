@@ -118,7 +118,9 @@ pub async fn openapi_spec() -> impl Responder {
 /// # Panics
 ///
 /// Паникует, если `PORT` не парсится в `u16`, если не удалось подключиться к
-/// Redis или установить глобальный subscriber `tracing`.
+/// Redis, установить глобальный subscriber `tracing` или если не заданы
+/// обязательные секреты уровней доступа (`AUTH_PROXY_SECRET`/`AUTH_TOTP_SECRET`,
+/// см. [`AuthConfig::from_env`]).
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let algorithm = env::var("TOKEN_ALGORITHM")
@@ -144,10 +146,11 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to Redis");
     let key_manager = KeyManager::new(algorithm);
 
-    // Конфигурация уровней доступа собирается один раз (здесь же логируются
-    // предупреждения об отсутствующих секретах); копия оборачивается в `Rc`
-    // внутри фабрики приложения на каждый worker-поток.
-    let auth_config = AuthConfig::from_env();
+    // Конфигурация уровней доступа собирается один раз. Секреты уровней 2 и 3
+    // обязательны: без них сервис не стартует (fail-fast). Копия оборачивается в
+    // `Rc` внутри фабрики приложения на каждый worker-поток.
+    let auth_config = AuthConfig::from_env()
+        .unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
 
     info!("Starting server on {}:{}", host, port);
 

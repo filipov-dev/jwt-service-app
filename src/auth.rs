@@ -14,8 +14,12 @@
 //!
 //! Крипта (HMAC для TOTP, constant-time сравнение) — через `openssl`, уже
 //! присутствующий в зависимостях. Конфигурация целиком из окружения
-//! ([`AuthConfig::from_env`]); при отсутствии секретов поведение осознанно
-//! определено — см. `AUTH_ENFORCE_WHEN_SECRET_MISSING`.
+//! ([`AuthConfig::from_env`]).
+//!
+//! **Защиты обязательны.** Секреты уровней 2 и 3 (`AUTH_PROXY_SECRET`,
+//! `AUTH_TOTP_SECRET`) — обязательны: если хотя бы один не задан, [`AuthConfig::from_env`]
+//! возвращает ошибку и сервис **не стартует** (fail-fast на старте, как и с прочей
+//! критичной конфигурацией). Отключить уровень нельзя.
 //!
 //! ## Замечание о replay (уровень 3)
 //!
@@ -38,7 +42,6 @@ use chrono::Utc;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
-use tracing::warn;
 
 use crate::models::ErrorResponse;
 
@@ -59,14 +62,6 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
-}
-
-/// Читает булев флаг из окружения (`true`/`1`/`yes` → `true`), иначе `default`.
-fn env_bool(key: &str, default: bool) -> bool {
-    match env::var(key) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => default,
-    }
 }
 
 /// Декодирует строку base32 (RFC 4648, алфавит `A–Z2–7`) в байты.
@@ -132,31 +127,27 @@ fn hotp(secret: &[u8], counter: u64, digits: u32, digest: MessageDigest) -> Resu
 }
 
 /// Валидатор уровня 2: статический секрет-заголовок от обратного прокси.
+///
+/// Секрет обязателен и гарантированно задан (см. [`AuthConfig::from_env`], которая
+/// не даст сервису стартовать без него).
 #[derive(Clone)]
 pub struct ProxyValidator {
     /// Имя заголовка (по умолчанию `X-Proxy-Secret`).
     header: String,
-    /// Ожидаемый секрет; `None` — секрет не сконфигурирован.
-    secret: Option<Vec<u8>>,
-    /// Если секрет не сконфигурирован: `true` — отклонять все запросы (fail-closed),
-    /// `false` — пропускать (disabled + warn на старте).
-    enforce_when_missing: bool,
+    /// Ожидаемый секрет.
+    secret: Vec<u8>,
 }
 
 impl ProxyValidator {
     /// Проверяет заголовок запроса. Сравнение секрета — constant-time
     /// (`openssl::memcmp::eq`, поверх предварительной проверки длины).
     pub fn validate(&self, headers: &HeaderMap) -> bool {
-        let Some(secret) = &self.secret else {
-            return !self.enforce_when_missing;
-        };
-
         match headers.get(self.header.as_str()) {
             Some(provided) => {
                 let provided = provided.as_bytes();
                 // `openssl::memcmp::eq` паникует на разной длине — сначала длина,
                 // затем constant-time сравнение содержимого.
-                provided.len() == secret.len() && openssl::memcmp::eq(provided, secret)
+                provided.len() == self.secret.len() && openssl::memcmp::eq(provided, &self.secret)
             }
             None => false,
         }
@@ -164,6 +155,9 @@ impl ProxyValidator {
 }
 
 /// Валидатор уровня 3: TOTP (RFC 6238).
+///
+/// Активные секреты обязательны и гарантированно непусты (см.
+/// [`AuthConfig::from_env`], которая не даст сервису стартовать без них).
 #[derive(Clone)]
 pub struct TotpValidator {
     /// Имя заголовка с кодом (по умолчанию `X-TOTP-Code`).
@@ -178,8 +172,6 @@ pub struct TotpValidator {
     skew: u64,
     /// Хеш HMAC (SHA-1/256/512).
     digest: MessageDigest,
-    /// Поведение при отсутствии секретов (см. [`ProxyValidator`]).
-    enforce_when_missing: bool,
 }
 
 impl TotpValidator {
@@ -190,10 +182,6 @@ impl TotpValidator {
     /// идёт без раннего выхода — чтобы не давать таймингового сигнала о том, какое
     /// окно/секрет совпали. Сравнение кодов — constant-time.
     pub fn validate(&self, headers: &HeaderMap, now: u64) -> bool {
-        if self.secrets.is_empty() {
-            return !self.enforce_when_missing;
-        }
-
         let Some(provided) = headers.get(self.header.as_str()) else {
             return false;
         };
@@ -229,64 +217,54 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Собирает конфигурацию из переменных окружения и логирует предупреждения
-    /// об отсутствующих секретах (единожды, на старте).
+    /// Собирает конфигурацию из переменных окружения.
+    ///
+    /// Секреты уровней 2 и 3 **обязательны**: если `AUTH_PROXY_SECRET` или
+    /// `AUTH_TOTP_SECRET` не заданы (либо TOTP-секрет не парсится как base32),
+    /// возвращается `Err` с перечнем проблем, и сервис не должен стартовать
+    /// (см. вызов в `main.rs`). Отключить уровень нельзя.
     ///
     /// Переменные:
+    /// - `AUTH_PROXY_SECRET` — секрет уровня 2 (обязателен; сравнивается по байтам);
     /// - `AUTH_PROXY_SECRET_HEADER` (дефолт `X-Proxy-Secret`);
-    /// - `AUTH_PROXY_SECRET` — секрет уровня 2 (как есть, сравнивается по байтам);
+    /// - `AUTH_TOTP_SECRET` — base32-секрет уровня 3 (обязателен);
+    /// - `AUTH_TOTP_SECRET_NEXT` — второй base32-секрет на время ротации (опционально);
     /// - `AUTH_TOTP_HEADER` (дефолт `X-TOTP-Code`);
-    /// - `AUTH_TOTP_SECRET`, `AUTH_TOTP_SECRET_NEXT` — base32-секреты (второй для ротации);
     /// - `AUTH_TOTP_STEP_SECONDS` (дефолт 30), `AUTH_TOTP_DIGITS` (6–8, дефолт 6),
     ///   `AUTH_TOTP_ALGORITHM` (SHA1/SHA256/SHA512, дефолт SHA1),
-    ///   `AUTH_TOTP_SKEW_STEPS` (дефолт 1);
-    /// - `AUTH_ENFORCE_WHEN_SECRET_MISSING` (дефолт `false`): при `false` уровень
-    ///   без секрета отключён и пропускает запросы (с предупреждением на старте);
-    ///   при `true` — fail-closed, все запросы к уровню без секрета отклоняются 401.
-    pub fn from_env() -> Self {
-        let enforce = env_bool("AUTH_ENFORCE_WHEN_SECRET_MISSING", false);
+    ///   `AUTH_TOTP_SKEW_STEPS` (дефолт 1).
+    ///
+    /// # Errors
+    /// Строка с перечислением всех проблем конфигурации (через `; `), если хотя бы
+    /// один обязательный секрет отсутствует или некорректен.
+    pub fn from_env() -> Result<Self, String> {
+        let mut errors: Vec<String> = Vec::new();
 
-        // --- Уровень 2: proxy-secret ---
+        // --- Уровень 2: proxy-secret (обязателен) ---
         let proxy_header = env::var("AUTH_PROXY_SECRET_HEADER").unwrap_or_else(|_| "X-Proxy-Secret".into());
-        let proxy_secret = env::var("AUTH_PROXY_SECRET").ok().and_then(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.into_bytes())
-            }
-        });
+        let proxy_secret = env::var("AUTH_PROXY_SECRET").ok().filter(|s| !s.is_empty());
         if proxy_secret.is_none() {
-            if enforce {
-                warn!(
-                    "AUTH_PROXY_SECRET не задан — уровень 2 (proxy-secret) в режиме enforce: все запросы будут отклонены (401)"
-                );
-            } else {
-                warn!(
-                    "AUTH_PROXY_SECRET не задан — уровень 2 (proxy-secret) ОТКЛЮЧЁН, эндпоинты уровня 2 пропускают запросы без проверки"
-                );
-            }
+            errors.push("AUTH_PROXY_SECRET не задан (обязателен для уровня 2 — proxy-secret)".into());
         }
 
-        // --- Уровень 3: TOTP ---
+        // --- Уровень 3: TOTP (хотя бы один секрет обязателен) ---
         let totp_header = env::var("AUTH_TOTP_HEADER").unwrap_or_else(|_| "X-TOTP-Code".into());
         let mut secrets = Vec::new();
         for var in ["AUTH_TOTP_SECRET", "AUTH_TOTP_SECRET_NEXT"] {
-            if let Ok(raw) = env::var(var) {
-                if raw.trim().is_empty() {
-                    continue;
-                }
-                match base32_decode(&raw) {
+            match env::var(var) {
+                Ok(raw) if !raw.trim().is_empty() => match base32_decode(&raw) {
                     Some(bytes) if !bytes.is_empty() => secrets.push(bytes),
-                    _ => warn!("{var} не является корректным base32 — секрет проигнорирован"),
-                }
+                    _ => errors.push(format!("{var} не является корректным base32")),
+                },
+                _ => {}
             }
         }
         if secrets.is_empty() {
-            if enforce {
-                warn!("AUTH_TOTP_SECRET не задан — уровень 3 (TOTP) в режиме enforce: все запросы будут отклонены (401)");
-            } else {
-                warn!("AUTH_TOTP_SECRET не задан — уровень 3 (TOTP) ОТКЛЮЧЁН, эндпоинты уровня 3 пропускают запросы без проверки");
-            }
+            errors.push("AUTH_TOTP_SECRET не задан (обязателен для уровня 3 — TOTP)".into());
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
         }
 
         let digits = env_u64("AUTH_TOTP_DIGITS", 6).clamp(6, 8) as u32;
@@ -294,11 +272,11 @@ impl AuthConfig {
         let skew = env_u64("AUTH_TOTP_SKEW_STEPS", 1);
         let digest = digest_by_name(&env::var("AUTH_TOTP_ALGORITHM").unwrap_or_else(|_| "SHA1".into()));
 
-        Self {
+        Ok(Self {
             proxy: ProxyValidator {
                 header: proxy_header,
-                secret: proxy_secret,
-                enforce_when_missing: enforce,
+                // Проверено выше: при `None` мы бы уже вернули `Err`.
+                secret: proxy_secret.expect("proxy secret present").into_bytes(),
             },
             totp: TotpValidator {
                 header: totp_header,
@@ -307,9 +285,8 @@ impl AuthConfig {
                 digits,
                 skew,
                 digest,
-                enforce_when_missing: enforce,
             },
-        }
+        })
     }
 
     /// Разрешает или отклоняет запрос для заданного уровня по его заголовкам.
@@ -453,39 +430,31 @@ mod tests {
 
     // --- ProxyValidator ---
 
-    fn proxy(secret: Option<&str>, enforce: bool) -> ProxyValidator {
+    fn proxy(secret: &str) -> ProxyValidator {
         ProxyValidator {
             header: "X-Proxy-Secret".into(),
-            secret: secret.map(|s| s.as_bytes().to_vec()),
-            enforce_when_missing: enforce,
+            secret: secret.as_bytes().to_vec(),
         }
     }
 
     #[test]
     fn proxy_accepts_correct_secret() {
-        let v = proxy(Some("s3cr3t"), false);
+        let v = proxy("s3cr3t");
         assert!(v.validate(&headers_with("X-Proxy-Secret", "s3cr3t")));
     }
 
     #[test]
     fn proxy_rejects_wrong_and_missing_secret() {
-        let v = proxy(Some("s3cr3t"), false);
+        let v = proxy("s3cr3t");
         assert!(!v.validate(&headers_with("X-Proxy-Secret", "nope")));
         assert!(!v.validate(&HeaderMap::new()));
         // Другая длина — не должно паниковать в memcmp.
         assert!(!v.validate(&headers_with("X-Proxy-Secret", "short")));
     }
 
-    #[test]
-    fn proxy_missing_secret_respects_enforce_flag() {
-        // Без секрета: enforce=false → пропускает, enforce=true → отклоняет.
-        assert!(proxy(None, false).validate(&HeaderMap::new()));
-        assert!(!proxy(None, true).validate(&HeaderMap::new()));
-    }
-
     // --- TotpValidator ---
 
-    fn totp(secrets: Vec<&[u8]>, skew: u64, enforce: bool) -> TotpValidator {
+    fn totp(secrets: Vec<&[u8]>, skew: u64) -> TotpValidator {
         TotpValidator {
             header: "X-TOTP-Code".into(),
             secrets: secrets.into_iter().map(|s| s.to_vec()).collect(),
@@ -493,7 +462,6 @@ mod tests {
             digits: 6,
             skew,
             digest: MessageDigest::sha1(),
-            enforce_when_missing: enforce,
         }
     }
 
@@ -504,7 +472,7 @@ mod tests {
 
     #[test]
     fn totp_accepts_current_code() {
-        let v = totp(vec![RFC_SECRET], 1, false);
+        let v = totp(vec![RFC_SECRET], 1);
         let now = 1_700_000_000;
         let code = code_at(RFC_SECRET, now, 30);
         // Валидатор берёт своё «сейчас», поэтому проверяем через прямой вызов с `now`.
@@ -513,7 +481,7 @@ mod tests {
 
     #[test]
     fn totp_rejects_wrong_and_missing_code() {
-        let v = totp(vec![RFC_SECRET], 1, false);
+        let v = totp(vec![RFC_SECRET], 1);
         let now = 1_700_000_000;
         assert!(!v.validate(&headers_with("X-TOTP-Code", "000000"), now));
         assert!(!v.validate(&HeaderMap::new(), now));
@@ -521,7 +489,7 @@ mod tests {
 
     #[test]
     fn totp_accepts_within_skew_and_rejects_outside() {
-        let v = totp(vec![RFC_SECRET], 1, false);
+        let v = totp(vec![RFC_SECRET], 1);
         let now = 1_700_000_000;
         // Код предыдущего окна принимается при skew=1.
         let prev = code_at(RFC_SECRET, now - 30, 30);
@@ -536,18 +504,93 @@ mod tests {
         // Два активных секрета: код от любого из них принимается.
         let old = b"old-secret-000000000".as_slice();
         let new = b"new-secret-111111111".as_slice();
-        let v = totp(vec![old, new], 1, false);
+        let v = totp(vec![old, new], 1);
         let now = 1_700_000_000;
 
         assert!(v.validate(&headers_with("X-TOTP-Code", &code_at(old, now, 30)), now));
         assert!(v.validate(&headers_with("X-TOTP-Code", &code_at(new, now, 30)), now));
     }
 
+    // --- AuthConfig::from_env: секреты обязательны ---
+
+    /// Сериализует тесты, трогающие процесс-глобальные `AUTH_*` переменные, и
+    /// вычищает их до и после (восстановление после «отравления» лока паникой).
+    fn with_clean_auth_env<T>(f: impl FnOnce() -> T) -> T {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        const VARS: &[&str] = &[
+            "AUTH_PROXY_SECRET", "AUTH_PROXY_SECRET_HEADER", "AUTH_TOTP_SECRET",
+            "AUTH_TOTP_SECRET_NEXT", "AUTH_TOTP_HEADER", "AUTH_TOTP_DIGITS",
+            "AUTH_TOTP_STEP_SECONDS", "AUTH_TOTP_ALGORITHM", "AUTH_TOTP_SKEW_STEPS",
+        ];
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in VARS {
+            env::remove_var(v);
+        }
+        let result = f();
+        for v in VARS {
+            env::remove_var(v);
+        }
+        result
+    }
+
     #[test]
-    fn totp_missing_secret_respects_enforce_flag() {
-        let now = 1_700_000_000;
-        assert!(totp(vec![], 1, false).validate(&HeaderMap::new(), now));
-        assert!(!totp(vec![], 1, true).validate(&HeaderMap::new(), now));
+    fn from_env_errors_when_both_secrets_missing() {
+        with_clean_auth_env(|| {
+            // `let-else` вместо `unwrap_err()`, чтобы не требовать `Debug` на
+            // `AuthConfig` (в нём лежат секреты — им не место в Debug-выводе).
+            let Err(err) = AuthConfig::from_env() else {
+                panic!("ожидалась ошибка конфигурации");
+            };
+            assert!(err.contains("AUTH_PROXY_SECRET"), "{err}");
+            assert!(err.contains("AUTH_TOTP_SECRET"), "{err}");
+        });
+    }
+
+    #[test]
+    fn from_env_errors_when_only_totp_missing() {
+        with_clean_auth_env(|| {
+            env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
+            let Err(err) = AuthConfig::from_env() else {
+                panic!("ожидалась ошибка конфигурации");
+            };
+            assert!(err.contains("AUTH_TOTP_SECRET"), "{err}");
+            assert!(!err.contains("AUTH_PROXY_SECRET"), "{err}");
+        });
+    }
+
+    #[test]
+    fn from_env_ok_with_both_secrets() {
+        with_clean_auth_env(|| {
+            env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
+            env::set_var("AUTH_TOTP_SECRET", "MZXW6"); // base32("foo")
+            let cfg = AuthConfig::from_env().expect("config должна собраться");
+            assert_eq!(cfg.proxy.secret, b"s3cr3t");
+            assert_eq!(cfg.totp.secrets, vec![b"foo".to_vec()]);
+        });
+    }
+
+    #[test]
+    fn from_env_errors_on_invalid_base32() {
+        with_clean_auth_env(|| {
+            env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
+            env::set_var("AUTH_TOTP_SECRET", "10108"); // 0,1,8 вне алфавита base32
+            let Err(err) = AuthConfig::from_env() else {
+                panic!("ожидалась ошибка конфигурации");
+            };
+            assert!(err.contains("base32"), "{err}");
+        });
+    }
+
+    #[test]
+    fn from_env_supports_two_secrets_for_rotation() {
+        with_clean_auth_env(|| {
+            env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
+            env::set_var("AUTH_TOTP_SECRET", "MZXW6");
+            env::set_var("AUTH_TOTP_SECRET_NEXT", "MZXW6");
+            let cfg = AuthConfig::from_env().expect("config должна собраться");
+            assert_eq!(cfg.totp.secrets.len(), 2);
+        });
     }
 
     // --- Интеграция: middleware поверх полного HTTP-стека actix ---
@@ -567,12 +610,11 @@ mod tests {
         const SECRET: &[u8] = b"12345678901234567890";
 
         /// Конфигурация с явными валидаторами (env не задействуется).
-        fn config(proxy_secret: Option<&str>, totp_secrets: Vec<&[u8]>, enforce: bool) -> AuthConfig {
+        fn config(proxy_secret: &str, totp_secrets: Vec<&[u8]>) -> AuthConfig {
             AuthConfig {
                 proxy: ProxyValidator {
                     header: "X-Proxy-Secret".into(),
-                    secret: proxy_secret.map(|s| s.as_bytes().to_vec()),
-                    enforce_when_missing: enforce,
+                    secret: proxy_secret.as_bytes().to_vec(),
                 },
                 totp: TotpValidator {
                     header: "X-TOTP-Code".into(),
@@ -581,7 +623,6 @@ mod tests {
                     digits: 6,
                     skew: 1,
                     digest: MessageDigest::sha1(),
-                    enforce_when_missing: enforce,
                 },
             }
         }
@@ -608,14 +649,14 @@ mod tests {
 
         #[actix_web::test]
         async fn open_level_passes_without_credentials() {
-            let app = guarded_app!(AuthLevel::Open, config(None, vec![], false));
+            let app = guarded_app!(AuthLevel::Open, config("s3cr3t", vec![SECRET]));
             let req = test::TestRequest::get().uri("/x").to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
         }
 
         #[actix_web::test]
         async fn proxy_level_accepts_valid_secret() {
-            let app = guarded_app!(AuthLevel::ProxySecret, config(Some("s3cr3t"), vec![], false));
+            let app = guarded_app!(AuthLevel::ProxySecret, config("s3cr3t", vec![SECRET]));
             let req = test::TestRequest::get()
                 .uri("/x")
                 .insert_header(("X-Proxy-Secret", "s3cr3t"))
@@ -625,7 +666,7 @@ mod tests {
 
         #[actix_web::test]
         async fn proxy_level_rejects_missing_and_wrong_secret() {
-            let app = guarded_app!(AuthLevel::ProxySecret, config(Some("s3cr3t"), vec![], false));
+            let app = guarded_app!(AuthLevel::ProxySecret, config("s3cr3t", vec![SECRET]));
 
             let req = test::TestRequest::get().uri("/x").to_request();
             assert_eq!(
@@ -645,7 +686,7 @@ mod tests {
 
         #[actix_web::test]
         async fn totp_level_accepts_valid_code() {
-            let app = guarded_app!(AuthLevel::Totp, config(None, vec![SECRET], false));
+            let app = guarded_app!(AuthLevel::Totp, config("s3cr3t", vec![SECRET]));
             let req = test::TestRequest::get()
                 .uri("/x")
                 .insert_header(("X-TOTP-Code", current_code(SECRET)))
@@ -655,7 +696,7 @@ mod tests {
 
         #[actix_web::test]
         async fn totp_level_rejects_missing_and_wrong_code() {
-            let app = guarded_app!(AuthLevel::Totp, config(None, vec![SECRET], false));
+            let app = guarded_app!(AuthLevel::Totp, config("s3cr3t", vec![SECRET]));
 
             let req = test::TestRequest::get().uri("/x").to_request();
             assert_eq!(
@@ -671,25 +712,6 @@ mod tests {
                 test::call_service(&app, req).await.status(),
                 StatusCode::UNAUTHORIZED
             );
-        }
-
-        #[actix_web::test]
-        async fn enforce_without_secret_rejects_all() {
-            // Секрет не задан + enforce=true → fail-closed на защищённых уровнях.
-            let app = guarded_app!(AuthLevel::Totp, config(None, vec![], true));
-            let req = test::TestRequest::get().uri("/x").to_request();
-            assert_eq!(
-                test::call_service(&app, req).await.status(),
-                StatusCode::UNAUTHORIZED
-            );
-        }
-
-        #[actix_web::test]
-        async fn disabled_without_secret_passes() {
-            // Секрет не задан + enforce=false → уровень отключён, запрос проходит.
-            let app = guarded_app!(AuthLevel::ProxySecret, config(None, vec![], false));
-            let req = test::TestRequest::get().uri("/x").to_request();
-            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
         }
     }
 }

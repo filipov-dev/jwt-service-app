@@ -17,6 +17,11 @@ services:
       TOKEN_EXPIRATION_SECONDS: 3600
       REDIS_URL: redis://redis:6379
       JWKS_SERVICE_URL: http://jwks-service-app:8082
+      # Секреты уровней доступа обязательны — без них сервис не стартует.
+      # Значения ниже — ТОЛЬКО для локального dev-стенда, не для боевого окружения.
+      AUTH_PROXY_SECRET: dev-proxy-secret
+      # Произвольный валидный base32-секрет для dev (замените в проде).
+      AUTH_TOTP_SECRET: MRSWGYLSMUQGO33WNFXGO4ZAOBWGKYLSFVRW63LOMNXW2ZI
     depends_on:
       - redis
       - jwks-service-app

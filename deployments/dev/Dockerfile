@@ -1,5 +1,7 @@
-# Dev image for development
-FROM rust:1.84 as dev
+# Dev image for development.
+# Rust 1.85+ обязателен: транзитивная зависимость `time-core` (edition 2024) не
+# парсится более старым cargo.
+FROM rust:1.90 as dev
 
 # Install cargo-watch for hot reload during development
 RUN cargo install cargo-watch

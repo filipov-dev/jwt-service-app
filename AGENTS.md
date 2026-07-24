@@ -57,10 +57,10 @@
   (`AUTH_TOTP_SECRET` + `AUTH_TOTP_SECRET_NEXT`) на время перекладки. Крипта
   (HMAC) — через `openssl`. Клиентские примеры на 30 языков —
   в [`docs/clients/`](docs/clients/README.md).
-- **Поведение без секретов** осознанно определено: при незаданном секрете уровень
-  по умолчанию **отключён** (пропускает запросы, с предупреждением в логах на
-  старте). Флаг `AUTH_ENFORCE_WHEN_SECRET_MISSING=true` переводит в fail-closed —
-  все запросы к уровню без секрета отклоняются `401`.
+- **Защиты обязательны.** Секреты уровней 2 и 3 (`AUTH_PROXY_SECRET`,
+  `AUTH_TOTP_SECRET`) — обязательны: без них `AuthConfig::from_env` возвращает
+  ошибку и сервис **не стартует** (fail-fast на старте, как и с прочей критичной
+  конфигурацией). Отключить уровень нельзя.
 - **Replay (уровень 3):** TOTP-код переигрываем в пределах окна действия. Мы
   **осознанно не** закрываем это на сервисе — валидатор остаётся stateless (без
   обращения к Redis), полагаясь на короткий шаг окна и внутренний (app-to-app)
@@ -125,10 +125,9 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
 | `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |
 | `RUST_LOG` | — | Фильтр логов (`tracing-subscriber`, `EnvFilter`). |
-| `AUTH_ENFORCE_WHEN_SECRET_MISSING` | `false` | Общий для уровней 2/3: при `false` уровень без секрета отключён (пропускает + warn), при `true` — fail-closed (`401`). |
-| `AUTH_PROXY_SECRET` | — (нет) | Уровень 2: ожидаемый секрет заголовка. |
+| `AUTH_PROXY_SECRET` | — (**обязателен**) | Уровень 2: ожидаемый секрет заголовка. Без него сервис не стартует. |
 | `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Уровень 2: имя заголовка с секретом. |
-| `AUTH_TOTP_SECRET` | — (нет) | Уровень 3: основной TOTP-секрет (base32). |
+| `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
 | `AUTH_TOTP_SECRET_NEXT` | — (нет) | Уровень 3: второй активный секрет на время ротации (base32). |
 | `AUTH_TOTP_HEADER` | `X-TOTP-Code` | Уровень 3: имя заголовка с TOTP-кодом. |
 | `AUTH_TOTP_STEP_SECONDS` | `30` | Уровень 3: шаг окна TOTP. |
