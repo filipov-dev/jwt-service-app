@@ -65,6 +65,16 @@ pub struct ErrorResponse {
     pub details: Option<String>,
 }
 
+impl ErrorResponse {
+    /// Создаёт тело ошибки только с сообщением, без деталей.
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            details: None,
+        }
+    }
+}
+
 /// Полное представление ключа, включая приватную часть.
 ///
 /// Возвращается сервисом `jwks-service-app` при запросе/создании ключа и
