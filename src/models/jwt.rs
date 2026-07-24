@@ -394,8 +394,13 @@ impl JsonWebToken<Private> {
     /// Сериализует и подписывает токен в форму `header.payload.signature`.
     ///
     /// Заголовок и claims кодируются в base64url, подпись считается по строке
-    /// `header.payload` приватным ключом (без явного дайджеста — алгоритм задан
-    /// самим ключом) и также кодируется в base64url.
+    /// `header.payload` приватным ключом и также кодируется в base64url.
+    ///
+    /// Дайджест выбирается по `alg` **тем же образом, что и при проверке**
+    /// ([`JsonWebToken::from_string`]): `RS*`/`ES*` подписываются поверх
+    /// соответствующего SHA-2 (256/384/512), `EdDSA` — без явного дайджеста
+    /// (алгоритм задан самим ключом). Схемы подписи и проверки обязаны совпадать,
+    /// иначе выпущенный токен не пройдёт собственную верификацию.
     ///
     /// # Errors
     /// - [`JwtError::Serialization`] — не удалось сериализовать заголовок/claims;
@@ -405,7 +410,13 @@ impl JsonWebToken<Private> {
         let headers = self.headers.to_base64()?;
         let claims = self.claims.to_base64()?;
 
-        let mut signer = Signer::new_without_digest(&self.key).map_err(|e| {
+        let mut signer = match self.headers.alg.as_str() {
+            "RS256" | "ES256" => Signer::new(MessageDigest::sha256(), &self.key),
+            "RS384" | "ES384" => Signer::new(MessageDigest::sha384(), &self.key),
+            "RS512" | "ES512" => Signer::new(MessageDigest::sha512(), &self.key),
+            _ => Signer::new_without_digest(&self.key),
+        }
+        .map_err(|e| {
             error!("{}", e);
             JwtError::BadSignature
         })?;
@@ -523,6 +534,9 @@ mod tests {
 
     use super::*;
     use openssl::pkey::Id;
+    use openssl::rsa::Rsa;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::nid::Nid;
     use std::collections::HashSet;
     use parking_lot::Mutex;
 
@@ -827,5 +841,117 @@ mod tests {
         let decoded_claims = TokenClaims::from_base64(parts[1].to_string()).unwrap();
         assert_eq!(decoded_claims.jti, "jti-1");
         assert_eq!(decoded_claims.iss, "issuer");
+    }
+
+    // --- Согласованность подписи и проверки для всех алгоритмов (JWT-13) ---
+
+    /// Генерирует пару (приватный, публичный) ключ, подходящую под `alg`.
+    fn keypair_for(alg: &str) -> (PKey<Private>, PKey<Public>) {
+        match alg {
+            "RS256" | "RS384" | "RS512" => {
+                let rsa = Rsa::generate(2048).unwrap();
+                let public = PKey::from_rsa(
+                    Rsa::from_public_components(
+                        rsa.n().to_owned().unwrap(),
+                        rsa.e().to_owned().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                (PKey::from_rsa(rsa).unwrap(), public)
+            }
+            "ES256" | "ES384" | "ES512" => {
+                let nid = match alg {
+                    "ES256" => Nid::X9_62_PRIME256V1,
+                    "ES384" => Nid::SECP384R1,
+                    _ => Nid::SECP521R1,
+                };
+                let group = EcGroup::from_curve_name(nid).unwrap();
+                let ec = EcKey::generate(&group).unwrap();
+                let public =
+                    PKey::from_ec_key(EcKey::from_public_key(&group, ec.public_key()).unwrap())
+                        .unwrap();
+                (PKey::from_ec_key(ec).unwrap(), public)
+            }
+            "EdDSA" => {
+                let private = PKey::generate_ed25519().unwrap();
+                let public =
+                    PKey::public_key_from_raw_bytes(&private.raw_public_key().unwrap(), Id::ED25519)
+                        .unwrap();
+                (private, public)
+            }
+            other => panic!("нет генератора ключа для alg {other} в тесте"),
+        }
+    }
+
+    /// Заголовок с явным `alg` — минует зависимость `create_new` от env
+    /// `TOKEN_ALGORITHM` (важно для параллельного прогона тестов).
+    fn headers_with_alg(alg: &str) -> TokenHeaders {
+        TokenHeaders {
+            alg: alg.to_string(),
+            kid: "kid-1".to_string(),
+            typ: "JWT".to_string(),
+            jku: None,
+        }
+    }
+
+    /// Проверяет подпись токена ровно так же, как это делает
+    /// [`JsonWebToken::from_string`]: дайджест выбирается по `alg`. Это тот же
+    /// путь верификации, что и на боевом `POST /tokens/verify`, поэтому успешная
+    /// проверка здесь эквивалентна прохождению round-trip выпуск→проверка.
+    fn verify_signature(token: &str, alg: &str, public: &PKey<Public>) -> bool {
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "токен должен состоять из трёх сегментов");
+
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let signed = format!("{}.{}", parts[0], parts[1]);
+
+        let mut verifier = match alg {
+            "RS256" | "ES256" => Verifier::new(MessageDigest::sha256(), public),
+            "RS384" | "ES384" => Verifier::new(MessageDigest::sha384(), public),
+            "RS512" | "ES512" => Verifier::new(MessageDigest::sha512(), public),
+            _ => Verifier::new_without_digest(public),
+        }
+        .unwrap();
+
+        verifier.verify_oneshot(&signature, signed.as_bytes()).unwrap()
+    }
+
+    /// Round-trip выпуск→проверка для дефолтного `RS256` (регресс на JWT-13:
+    /// раньше подпись ставилась без дайджеста и не проходила собственную проверку).
+    #[test]
+    fn sign_verify_roundtrip_rs256() {
+        let (private, public) = keypair_for("RS256");
+        let jwt = JsonWebToken::create_new(headers_with_alg("RS256"), sample_claims(), private);
+        let token = jwt.to_string().unwrap();
+
+        assert!(verify_signature(&token, "RS256", &public));
+    }
+
+    /// Round-trip выпуск→проверка для `ES256` (представитель семейства `ES*`).
+    #[test]
+    fn sign_verify_roundtrip_es256() {
+        let (private, public) = keypair_for("ES256");
+        let jwt = JsonWebToken::create_new(headers_with_alg("ES256"), sample_claims(), private);
+        let token = jwt.to_string().unwrap();
+
+        assert!(verify_signature(&token, "ES256", &public));
+    }
+
+    /// Round-trip для **всех** алгоритмов из [`SUPPORTED_ALGORITHMS`]: подпись,
+    /// поставленная `to_string`, обязана сходиться с проверкой из `from_string`.
+    /// Именно рассогласование дайджестов было багом JWT-13.
+    #[test]
+    fn sign_verify_roundtrip_all_supported_algorithms() {
+        for &alg in SUPPORTED_ALGORITHMS {
+            let (private, public) = keypair_for(alg);
+            let jwt = JsonWebToken::create_new(headers_with_alg(alg), sample_claims(), private);
+            let token = jwt.to_string().unwrap();
+
+            assert!(
+                verify_signature(&token, alg, &public),
+                "подпись {alg} не прошла проверку тем же дайджестом (рассогласование sign/verify)"
+            );
+        }
     }
 }
