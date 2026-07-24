@@ -177,9 +177,10 @@ impl KeyManager {
     /// Собирает EC-публичный ключ из аффинных координат `x`/`y` на кривой,
     /// выбранной по `alg` (P-256/P-384/P-521).
     ///
-    /// # Panics
-    /// Текущая реализация паникует при ошибках OpenSSL (создание группы/точки,
-    /// установка координат) — используются `.unwrap()`.
+    /// # Errors
+    /// - [`KeyError::Unsupported`] — `alg` не соответствует поддерживаемой кривой;
+    /// - [`KeyError::InvalidKey`] — компоненты `x`/`y` некорректны или OpenSSL не
+    ///   смог собрать ключ из них.
     fn get_public_key_from_es(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
         let curve = match jwk.alg.as_str() {
             "ES256" => { Nid::X9_62_PRIME256V1 }
@@ -188,16 +189,32 @@ impl KeyManager {
             _ => { return Err(KeyError::Unsupported) }
         };
 
-        let group = EcGroup::from_curve_name(curve).unwrap();
+        let group = EcGroup::from_curve_name(curve).map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
 
         let jwk_x = Self::get_big_num_from_option_string(jwk.x)?;
         let jwk_y = Self::get_big_num_from_option_string(jwk.y)?;
 
-        let mut ctx = BigNumContext::new().unwrap();
-        let mut point = EcPoint::new(&group).unwrap();
-        point.set_affine_coordinates_gfp(&group, &jwk_x, &jwk_y, &mut ctx).unwrap();
+        let mut ctx = BigNumContext::new().map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
+        let mut point = EcPoint::new(&group).map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
+        point.set_affine_coordinates_gfp(&group, &jwk_x, &jwk_y, &mut ctx)
+            .map_err(|e| {
+                error!("{}", e);
+                KeyError::InvalidKey
+            })?;
 
-        let ec_key_public = EcKey::from_public_key(&group, &point).unwrap();
+        let ec_key_public = EcKey::from_public_key(&group, &point).map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
 
         match PKey::from_ec_key(ec_key_public) {
             Ok(v) => { Ok(v) }
@@ -212,10 +229,16 @@ impl KeyManager {
     ///
     /// Кривая определяется полем `crv`.
     ///
-    /// # Panics
-    /// Паникует, если `x` отсутствует или некорректен как base64url (`.unwrap()`).
+    /// # Errors
+    /// - [`KeyError::InvalidKey`] — `x` отсутствует или не декодируется как
+    ///   base64url;
+    /// - [`KeyError::Unsupported`] — `crv` не является Ed25519/Ed448.
     fn get_public_key_from_dsa(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
-        let jwk_x = &*URL_SAFE_NO_PAD.decode(jwk.x.unwrap()).unwrap();
+        let encoded_x = jwk.x.ok_or(KeyError::InvalidKey)?;
+        let jwk_x = URL_SAFE_NO_PAD.decode(encoded_x).map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
 
         let id = match jwk.crv {
             None => { return Err(KeyError::InvalidKey) }
@@ -239,12 +262,17 @@ impl KeyManager {
 
     /// Декодирует base64url-строку в [`BigNum`] (для компонентов RSA/EC).
     ///
-    /// # Panics
-    /// Паникует, если `str` — `None` или не является корректным base64url.
+    /// # Errors
+    /// [`KeyError::InvalidKey`] — `str` равен `None`, не является корректным
+    /// base64url или не парсится как [`BigNum`].
     fn get_big_num_from_option_string(str: Option<String>) -> Result<BigNum, KeyError> {
-        match BigNum::from_slice(
-            &*URL_SAFE_NO_PAD.decode(str.unwrap()).unwrap()
-        ) {
+        let encoded = str.ok_or(KeyError::InvalidKey)?;
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
+            error!("{}", e);
+            KeyError::InvalidKey
+        })?;
+
+        match BigNum::from_slice(&bytes) {
             Ok(v) => { Ok(v) }
             Err(e) => {
                 error!("{}", e);
@@ -351,6 +379,36 @@ mod tests {
         let jwk = jwk("ES999");
         let result = KeyManager::get_public_key_from_es(jwk);
         assert!(matches!(result, Err(KeyError::Unsupported)));
+    }
+
+    #[test]
+    fn es_rejects_missing_coordinates() {
+        // `x`/`y` отсутствуют — раньше был бы panic на `.unwrap()`, теперь InvalidKey.
+        let jwk = jwk("ES256");
+        let result = KeyManager::get_public_key_from_es(jwk);
+        assert!(matches!(result, Err(KeyError::InvalidKey)));
+    }
+
+    #[test]
+    fn es_rejects_invalid_base64_coordinate() {
+        // `x` невалиден как base64url — ждём InvalidKey вместо паники.
+        let mut jwk = jwk("ES256");
+        jwk.x = Some("!!!not-base64!!!".to_string());
+        jwk.y = Some(b64(&[1, 2, 3]));
+
+        let result = KeyManager::get_public_key_from_es(jwk);
+        assert!(matches!(result, Err(KeyError::InvalidKey)));
+    }
+
+    #[test]
+    fn dsa_rejects_missing_x() {
+        // `x` отсутствует — раньше был бы panic на `jwk.x.unwrap()`, теперь InvalidKey.
+        let mut jwk = jwk("EdDSA");
+        jwk.crv = Some("Ed25519".to_string());
+        jwk.x = None;
+
+        let result = KeyManager::get_public_key_from_dsa(jwk);
+        assert!(matches!(result, Err(KeyError::InvalidKey)));
     }
 
     #[test]

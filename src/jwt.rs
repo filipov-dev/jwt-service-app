@@ -5,6 +5,7 @@
 //! предоставляя обработчикам два высокоуровневых метода: генерацию и проверку.
 
 use actix_web::web::Data;
+use tracing::error;
 use crate::models::jwt::{JsonWebToken, JtiStore, JwtError, TokenClaims, TokenHeaders};
 use crate::key::KeyManager;
 
@@ -26,12 +27,9 @@ impl JwtManager {
     /// Возвращает сериализованный токен в формате `header.payload.signature`.
     ///
     /// # Errors
-    /// Возвращает [`JwtError`], если не удалось сформировать claims (например,
-    /// пустой `audience`) или сохранить/проверить состояние в хранилище.
-    ///
-    /// # Panics
-    /// Паникует, если [`KeyManager::get_private_key`] вернул ошибку (текущая
-    /// реализация использует `.unwrap()`).
+    /// Возвращает [`JwtError`], если не удалось получить приватный ключ
+    /// ([`JwtError::KeyError`]), сформировать claims (например, пустой `audience`)
+    /// или сохранить/проверить состояние в хранилище.
     pub async fn generate_token<T: JtiStore>(
         issuer: &str,
         subject: &str,
@@ -40,7 +38,10 @@ impl JwtManager {
         key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<String, JwtError> {
-        let (jwk, private_key) = key_manager.get_private_key().await.unwrap();
+        let (jwk, private_key) = key_manager.get_private_key().await.map_err(|e| {
+            error!("{}", e);
+            JwtError::KeyError
+        })?;
 
         let claims = TokenClaims::create_new(
             issuer,
@@ -58,7 +59,7 @@ impl JwtManager {
             private_key,
         );
 
-        Ok(token.to_string())
+        token.to_string()
     }
 
     /// Проверяет токен и возвращает его claims при успехе.
