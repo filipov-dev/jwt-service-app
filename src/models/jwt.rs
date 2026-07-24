@@ -113,12 +113,13 @@ impl TokenClaims {
     /// - [`JwtError::UnprocessableEntity`] — пустой `audience`, невалидное
     ///   значение `TOKEN_EXPIRATION_SECONDS` или кастомный `ttl` вне границ
     ///   `[TOKEN_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS]`;
-    /// - [`JwtError::StoreError`] — сформированные claims не прошли
-    ///   самопроверку [`TokenClaims::is_verify`].
+    /// - [`JwtError::StoreError`] — не удалось записать `jti` в хранилище либо
+    ///   сформированные claims не прошли самопроверку [`TokenClaims::is_verify`].
     ///
     /// # Замечание
-    /// Ошибка записи `jti` в хранилище логируется, но **не** прерывает выпуск —
-    /// это осознанное поведение текущей реализации.
+    /// Выпуск устроен по принципу fail-fast: если `jti` не удалось сохранить в
+    /// хранилище, токен **не** отдаётся ([`JwtError::StoreError`]) — это гарантирует
+    /// консистентность с последующей проверкой (`is_verify` требует наличия `jti`).
     pub async fn create_new<T: JtiStore>(
         issuer: &str,
         subject: &str,
@@ -161,12 +162,13 @@ impl TokenClaims {
 
         let jti = Uuid::new_v4().to_string();
 
-        match store.store_jti(&jti, expiration_seconds).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("JTI Store: {}", e);
-            }
-        };
+        // Fail-fast: если `jti` не записался в хранилище, токен выпускать нельзя —
+        // иначе его последующая проверка провалится (jti отсутствует → считается
+        // отозванным). Пробрасываем ошибку наверх, обработчик вернёт 500.
+        store.store_jti(&jti, expiration_seconds).await.map_err(|e| {
+            error!("JTI Store: {}", e);
+            JwtError::StoreError
+        })?;
 
         let jwt = Self {
             iss: issuer.to_string(),
@@ -555,6 +557,24 @@ mod tests {
         }
     }
 
+    /// [`JtiStore`], у которого запись `jti` всегда падает — имитирует
+    /// недоступный Redis для проверки fail-fast при выпуске.
+    struct FailingStore;
+
+    impl JtiStore for FailingStore {
+        async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn check_jti(&self, _jti: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn delete_jti(&self, _jti: &str) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+    }
+
     /// Заведомо валидные claims: выпущены «сейчас», живут ещё час.
     fn sample_claims() -> TokenClaims {
         let now = Utc::now().timestamp() as usize;
@@ -762,6 +782,17 @@ mod tests {
         let result =
             TokenClaims::create_new("issuer", "subject", &audience, Some(86401), store).await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
+    }
+
+    #[actix_web::test]
+    async fn create_new_fails_when_store_unavailable() {
+        // Redis недоступен: запись `jti` падает, токен выпускать нельзя (fail-fast).
+        let store = Data::new(FailingStore);
+        let audience = vec!["api1".to_string()];
+
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
+        assert!(matches!(result, Err(JwtError::StoreError)));
     }
 
     // --- Подпись токена (JsonWebToken::to_string) ---
