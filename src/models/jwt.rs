@@ -73,6 +73,10 @@ pub enum JwtError {
     NotValid,
     #[error("Broken")]
     Broken,
+    #[error("Key error")]
+    KeyError,
+    #[error("Serialization failed")]
+    Serialization,
 }
 
 /// Полезная нагрузка токена (registered claims по RFC 7519).
@@ -148,9 +152,9 @@ impl TokenClaims {
                 },
         };
 
-        if audience.is_empty() {
+        let Some(first_audience) = audience.first() else {
             return Err(JwtError::UnprocessableEntity);
-        }
+        };
 
         let now = Utc::now();
         let exp = now + Duration::seconds(expiration_seconds as i64);
@@ -174,7 +178,7 @@ impl TokenClaims {
             jti,
         };
 
-        if !jwt.is_verify(issuer, audience.first().unwrap(), store).await {
+        if !jwt.is_verify(issuer, first_audience, store).await {
             return Err(JwtError::StoreError);
         }
 
@@ -219,9 +223,8 @@ impl TokenClaims {
     /// выполнены временные границы (`nbf <= now`, `iat <= now`, `exp > now`) и
     /// `jti` найден в [`JtiStore`].
     ///
-    /// # Panics
-    /// Паникует, если обращение к хранилищу вернуло ошибку (используется
-    /// `.unwrap()` на результате `check_jti`).
+    /// Ошибка обращения к хранилищу логируется и трактуется как «не валиден»
+    /// (возвращается `false`).
     pub async fn is_verify<T: JtiStore>(
         &self,
         issuer: &str,
@@ -230,22 +233,43 @@ impl TokenClaims {
     ) -> bool {
         let now = Utc::now().timestamp() as usize;
 
-        self.iss == issuer &&
+        let claims_valid = self.iss == issuer &&
             self.aud.contains(&audience.to_owned()) &&
             self.nbf <= now &&
             self.iat <= now &&
-            self.exp > now &&
-            store.check_jti(&self.jti).await.unwrap()
+            self.exp > now;
+
+        if !claims_valid {
+            return false;
+        }
+
+        match store.check_jti(&self.jti).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                error!("JTI check: {}", e);
+                false
+            }
+        }
     }
 
     /// Сериализует claims в JSON-строку.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    ///
+    /// # Errors
+    /// [`JwtError::Serialization`] — сериализация не удалась (практически
+    /// недостижимо для этого типа).
+    pub fn to_json(&self) -> Result<String, JwtError> {
+        serde_json::to_string(self).map_err(|e| {
+            error!("{}", e);
+            JwtError::Serialization
+        })
     }
 
     /// Кодирует claims в base64url-сегмент (JSON → base64url без паддинга).
-    pub fn to_base64(&self) -> String {
-        BASE64_URL_SAFE_NO_PAD.encode(self.to_json())
+    ///
+    /// # Errors
+    /// [`JwtError::Serialization`] — не удалось сериализовать claims в JSON.
+    pub fn to_base64(&self) -> Result<String, JwtError> {
+        Ok(BASE64_URL_SAFE_NO_PAD.encode(self.to_json()?))
     }
 }
 
@@ -287,12 +311,24 @@ impl TokenHeaders {
 
     /// Декодирует заголовок из base64url-сегмента токена.
     ///
-    /// # Panics
-    /// Паникует на некорректном base64url/UTF-8/JSON (используется `.unwrap()`).
-    pub fn from_base64(str: String) -> Self {
-        let json = BASE64_URL_SAFE_NO_PAD.decode(str).unwrap();
+    /// # Errors
+    /// [`JwtError::Broken`] — сегмент не является корректным base64url, не
+    /// декодируется в UTF-8 или не парсится как JSON-заголовок.
+    pub fn from_base64(str: String) -> Result<Self, JwtError> {
+        let bytes = BASE64_URL_SAFE_NO_PAD.decode(str).map_err(|e| {
+            error!("{}", e);
+            JwtError::Broken
+        })?;
 
-        serde_json::from_str(&*String::from_utf8(json).unwrap()).unwrap()
+        let json = String::from_utf8(bytes).map_err(|e| {
+            error!("{}", e);
+            JwtError::Broken
+        })?;
+
+        serde_json::from_str(&json).map_err(|e| {
+            error!("{}", e);
+            JwtError::Broken
+        })
     }
 
     /// Проверяет корректность заголовка при верификации токена.
@@ -311,13 +347,23 @@ impl TokenHeaders {
     }
 
     /// Сериализует заголовок в JSON-строку.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    ///
+    /// # Errors
+    /// [`JwtError::Serialization`] — сериализация не удалась (практически
+    /// недостижимо для этого типа).
+    pub fn to_json(&self) -> Result<String, JwtError> {
+        serde_json::to_string(self).map_err(|e| {
+            error!("{}", e);
+            JwtError::Serialization
+        })
     }
 
     /// Кодирует заголовок в base64url-сегмент.
-    pub fn to_base64(&self) -> String {
-        BASE64_URL_SAFE_NO_PAD.encode(self.to_json())
+    ///
+    /// # Errors
+    /// [`JwtError::Serialization`] — не удалось сериализовать заголовок в JSON.
+    pub fn to_base64(&self) -> Result<String, JwtError> {
+        Ok(BASE64_URL_SAFE_NO_PAD.encode(self.to_json()?))
     }
 }
 
@@ -349,18 +395,28 @@ impl JsonWebToken<Private> {
     /// `header.payload` приватным ключом (без явного дайджеста — алгоритм задан
     /// самим ключом) и также кодируется в base64url.
     ///
-    /// # Panics
-    /// Паникует при ошибке инициализации `Signer` или вычисления подписи.
-    pub fn to_string(&self) -> String {
-        let headers = self.headers.to_base64();
-        let claims= self.claims.to_base64();
+    /// # Errors
+    /// - [`JwtError::Serialization`] — не удалось сериализовать заголовок/claims;
+    /// - [`JwtError::BadSignature`] — не удалось инициализировать `Signer` или
+    ///   вычислить подпись.
+    pub fn to_string(&self) -> Result<String, JwtError> {
+        let headers = self.headers.to_base64()?;
+        let claims = self.claims.to_base64()?;
 
-        let mut signer = Signer::new_without_digest(&self.key).unwrap();
-        let signature_bytes = signer.sign_oneshot_to_vec(format!("{}.{}", headers, claims).as_bytes()).unwrap();
+        let mut signer = Signer::new_without_digest(&self.key).map_err(|e| {
+            error!("{}", e);
+            JwtError::BadSignature
+        })?;
+        let signature_bytes = signer
+            .sign_oneshot_to_vec(format!("{}.{}", headers, claims).as_bytes())
+            .map_err(|e| {
+                error!("{}", e);
+                JwtError::BadSignature
+            })?;
 
         let signature = URL_SAFE_NO_PAD.encode(signature_bytes);
 
-        format!("{}.{}.{}", headers, claims, signature)
+        Ok(format!("{}.{}.{}", headers, claims, signature))
     }
 }
 
@@ -379,47 +435,30 @@ impl JsonWebToken<Public> {
     /// - [`JwtError::Broken`] — некорректная подпись в base64url;
     /// - [`JwtError::BadSignature`] — подпись не сошлась или не построился verifier;
     /// - [`JwtError::NotValid`] — заголовок или claims не прошли проверку.
-    ///
-    /// # Panics
-    /// Текущая реализация паникует на токене неверной структуры (меньше трёх
-    /// сегментов) и при ошибке получения публичного ключа (`.unwrap()`).
     pub async fn from_string<T: JtiStore>(
         token: &str,
         issuer: &str,
         audience: &str,
         store: Data<T>,
     ) -> Result<Self, JwtError> {
-        let mut parts = token.split(".");
-        let headers = parts.next().unwrap();
-        let claims = parts.next().unwrap();
-        let signature = parts.next().unwrap();
-
-        let key = {
-            let headers = TokenHeaders::from_base64(headers.to_string());
-
-            KeyManager::get_public_key(headers.kid.as_str()).await.unwrap()
-        };
-
-        let mut verifier = {
-            let headers = TokenHeaders::from_base64(headers.to_string());
-
-            let verifier = match headers.alg.as_str() {
-                "RS256" | "ES256" => Verifier::new(MessageDigest::sha256(), &key),
-                "RS384" | "ES384" => Verifier::new(MessageDigest::sha384(), &key),
-                "RS512" | "ES512" => Verifier::new(MessageDigest::sha512(), &key),
-                _ => Verifier::new_without_digest(&key),
+        let mut parts = token.split('.');
+        let (headers_segment, claims_segment, signature_segment) =
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(h), Some(c), Some(s)) => (h, c, s),
+                _ => return Err(JwtError::Broken),
             };
 
-            match verifier {
-                Ok(verifier) => verifier,
-                Err(e) => {
-                    error!("{}", e);
-                    return Err(JwtError::BadSignature);
-                }
+        let headers = TokenHeaders::from_base64(headers_segment.to_string())?;
+
+        let key = match KeyManager::get_public_key(headers.kid.as_str()).await {
+            Ok(key) => key,
+            Err(e) => {
+                error!("{}", e);
+                return Err(JwtError::BadSignature);
             }
         };
 
-        let signature_decoded = match URL_SAFE_NO_PAD.decode(signature) {
+        let signature_decoded = match URL_SAFE_NO_PAD.decode(signature_segment) {
             Ok(decoded) => decoded,
             Err(e) => {
                 error!("{}", e);
@@ -427,24 +466,36 @@ impl JsonWebToken<Public> {
             }
         };
 
-        let is_success = match verifier
-            .verify_oneshot(
-                &signature_decoded,
-                format!("{}.{}", headers, claims).as_bytes(),
-            ) {
-            Ok(is_success) => is_success,
-            Err(e) => {
-                error!("{}", e);
-                return Err(JwtError::BadSignature);
+        // Verifier заимствует `key`, поэтому держим его в отдельной области —
+        // иначе `key` нельзя было бы переместить в возвращаемый токен.
+        let is_success = {
+            let mut verifier = match headers.alg.as_str() {
+                "RS256" | "ES256" => Verifier::new(MessageDigest::sha256(), &key),
+                "RS384" | "ES384" => Verifier::new(MessageDigest::sha384(), &key),
+                "RS512" | "ES512" => Verifier::new(MessageDigest::sha512(), &key),
+                _ => Verifier::new_without_digest(&key),
             }
+            .map_err(|e| {
+                error!("{}", e);
+                JwtError::BadSignature
+            })?;
+
+            verifier
+                .verify_oneshot(
+                    &signature_decoded,
+                    format!("{}.{}", headers_segment, claims_segment).as_bytes(),
+                )
+                .map_err(|e| {
+                    error!("{}", e);
+                    JwtError::BadSignature
+                })?
         };
 
         if !is_success {
             return Err(JwtError::BadSignature);
         }
 
-        let headers = TokenHeaders::from_base64(headers.to_string());
-        let claims = TokenClaims::from_base64(claims.to_string()).unwrap();
+        let claims = TokenClaims::from_base64(claims_segment.to_string())?;
 
         if !headers.is_verify() || !claims.is_verify(issuer, audience, store).await {
             return Err(JwtError::NotValid);
@@ -453,7 +504,7 @@ impl JsonWebToken<Public> {
         Ok(Self {
             headers,
             claims,
-            key: key.clone(),
+            key,
         })
     }
 }
@@ -523,7 +574,7 @@ mod tests {
     #[test]
     fn claims_base64_roundtrip() {
         let claims = sample_claims();
-        let decoded = TokenClaims::from_base64(claims.to_base64()).unwrap();
+        let decoded = TokenClaims::from_base64(claims.to_base64().unwrap()).unwrap();
 
         assert_eq!(decoded.iss, claims.iss);
         assert_eq!(decoded.sub, claims.sub);
@@ -554,9 +605,27 @@ mod tests {
     }
 
     #[test]
+    fn header_from_base64_rejects_invalid() {
+        // Битый base64url — раньше был бы panic, теперь Err(Broken).
+        assert!(matches!(
+            TokenHeaders::from_base64("!!!not-base64!!!".to_string()),
+            Err(JwtError::Broken)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn from_string_rejects_malformed_token() {
+        // Меньше трёх сегментов — раньше был бы panic на `parts.next().unwrap()`.
+        let store = Data::new(MockStore::new());
+        let result =
+            JsonWebToken::<Public>::from_string("not-a-jwt", "issuer", "api1", store).await;
+        assert!(matches!(result, Err(JwtError::Broken)));
+    }
+
+    #[test]
     fn header_roundtrip_and_verify() {
         let header = TokenHeaders::create_new("kid-1".to_string());
-        let decoded = TokenHeaders::from_base64(header.to_base64());
+        let decoded = TokenHeaders::from_base64(header.to_base64().unwrap()).unwrap();
 
         assert_eq!(decoded.kid, "kid-1");
         assert_eq!(decoded.typ, "JWT");
@@ -709,7 +778,7 @@ mod tests {
         let claims = sample_claims();
         let jwt = JsonWebToken::create_new(headers, claims, private);
 
-        let token = jwt.to_string();
+        let token = jwt.to_string().unwrap();
 
         // Ровно три сегмента header.payload.signature.
         let parts: Vec<&str> = token.split('.').collect();
