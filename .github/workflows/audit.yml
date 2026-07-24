@@ -1,0 +1,42 @@
+name: Security audit
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Еженедельно, чтобы ловить новые CVE без изменений в коде.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Уязвимость в зависимостях блокирует PR (ненулевой код возврата).
+      # Ложные срабатывания и неисправимые advisory заносятся в .cargo/audit.toml.
+      - name: Run cargo audit
+        run: cargo audit

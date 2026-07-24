@@ -1,0 +1,10 @@
+# Конфигурация cargo-audit (https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example).
+#
+# Сюда заносятся advisory, которые осознанно игнорируются: неисправимые
+# (нет патча/замены) или неприменимые к сервису. Каждый ignore комментируйте
+# причиной и, по возможности, ссылкой на issue для отслеживания.
+
+[advisories]
+ignore = [
+    # "RUSTSEC-0000-0000", # причина игнорирования
+]
