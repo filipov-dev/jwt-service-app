@@ -1,5 +1,7 @@
-# Dev image for development
-FROM rust:1.84.1-slim-bullseye as builder
+# Builder image.
+# Rust 1.85+ обязателен: транзитивная зависимость `time-core` (edition 2024) не
+# парсится более старым cargo. Bookworm — чтобы линковаться с libssl3, как в runner.
+FROM rust:1.90-slim-bookworm as builder
 
 # Install dependencies for PostgreSQL
 RUN apt-get update --fix-missing && \
@@ -17,13 +19,13 @@ COPY . .
 # Build the project in release mode
 RUN cargo build --release
 
-# Final stage: use the latest version of Debian Slim
-FROM debian:bullseye-slim as runner
+# Final stage: Debian Slim (bookworm — совпадает с builder по версии OpenSSL 3).
+FROM debian:bookworm-slim as runner
 
 # Install runtime dependencies
 RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \
-        libssl1.1 \
+        libssl3 \
         ca-certificates \
         && rm -rf /var/lib/apt/lists/*
 
