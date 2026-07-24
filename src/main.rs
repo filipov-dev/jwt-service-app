@@ -27,10 +27,10 @@ mod models;
 mod jwk;
 mod jwt;
 
-use crate::handlers::{create_token, verify_token, revoke_token};
+use crate::handlers::{create_token, verify_token, revoke_token, livez, readyz};
 use crate::key::KeyManager;
 use crate::redis::RedisClient;
-use crate::models::{ErrorResponse, TokenResponse, TokenRequest};
+use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenRequest};
 
 /// Корневой описатель OpenAPI-документации.
 ///
@@ -43,12 +43,15 @@ use crate::models::{ErrorResponse, TokenResponse, TokenRequest};
     paths(
         handlers::create_token,
         handlers::verify_token,
-        handlers::revoke_token
+        handlers::revoke_token,
+        handlers::livez,
+        handlers::readyz
     ),
     components(schemas(
         TokenRequest,
         TokenResponse,
-        ErrorResponse
+        ErrorResponse,
+        ReadinessResponse
     ))
 )]
 struct ApiDoc;
@@ -120,6 +123,8 @@ async fn main() -> std::io::Result<()> {
             .service(create_token)
             .service(verify_token)
             .service(revoke_token)
+            .service(livez)
+            .service(readyz)
     })
         .bind((host, port))?
         .run()

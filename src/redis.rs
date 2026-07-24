@@ -45,6 +45,26 @@ impl RedisClient {
             }
         }
     }
+
+    /// Проверяет доступность Redis командой `PING`.
+    ///
+    /// Используется в readiness-проверке (`GET /readyz`): открывает соединение и
+    /// выполняет `PING`, ожидая ответ `PONG`.
+    ///
+    /// # Errors
+    /// - [`JtiError::BadConnection`] — не удалось открыть соединение;
+    /// - [`JtiError::WrongOperation`] — команда `PING` не выполнилась.
+    pub async fn ping(&self) -> Result<(), JtiError> {
+        let mut conn = self.get_connection().await?;
+
+        match redis::cmd("PING").query_async::<String>(&mut conn).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("{}", e);
+                Err(JtiError::WrongOperation)
+            }
+        }
+    }
 }
 
 impl JtiStore for RedisClient {
