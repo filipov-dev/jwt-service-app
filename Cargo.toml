@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
@@ -19,3 +19,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"] }
 openssl = "0.10.70"
 base64 = "0.22.1"
+
+[dev-dependencies]
+# HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов
+# HTTP-слоя — эндпоинты выпуска/проверки токенов ходят к JWKS по сети.
+wiremock = "0.6"
