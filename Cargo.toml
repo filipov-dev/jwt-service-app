@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 
 [dependencies]
@@ -29,6 +29,25 @@ governor = "0.10"
 # через actix на `/metrics` (см. `metrics.rs`).
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# Распределённый трейсинг: OTLP-экспорт в OpenTelemetry Collector (через него
+# трейсы забирает Monium). Лицензии permissive (Apache-2.0 / MIT). Включается
+# только при заданном OTEL_EXPORTER_OTLP_ENDPOINT — см. `tracing.rs`.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# Транспорт OTLP — HTTP/protobuf (порт 4318 у коллектора), а не gRPC: `reqwest`
+# уже есть в зависимостях, поэтому весь tonic/gRPC-стек не тянем.
+# Клиент — БЛОКИРУЮЩИЙ намеренно: batch-процессор экспортирует span'ы на своём
+# выделенном потоке, где нет tokio-рантайма, и асинхронный клиент там паникует
+# («there is no reactor running»). Основной async-рантайм сервиса это не задевает.
+# `internal-logs` — чтобы ошибки самого экспортёра были видны в логе.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "internal-logs",
+] }
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
 # HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов

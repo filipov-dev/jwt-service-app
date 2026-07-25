@@ -114,6 +114,7 @@
 | `main.rs` | Точка входа, конфиг HTTP-сервера, логирование, CORS, роуты (с уровнями доступа), OpenAPI (`ApiDoc`). |
 | `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret, TOTP (RFC 6238) и Bearer-токена метрик. |
 | `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP); отсюда же пишется метрика запроса. |
+| `tracing_otel.rs` | Распределённый трейсинг OpenTelemetry: OTLP-экспорт (вкл. по env), W3C-propagation (`traceparent`) на входе и в исходящих запросах к JWKS. |
 | `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
 | `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
@@ -172,6 +173,9 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |
 | `RUST_LOG` | — | Фильтр логов по уровням (`tracing-subscriber`, `EnvFilter`; дефолт `jwt_service_app=info`). |
 | `LOG_FORMAT` | `pretty` | Формат логов: `json` — построчный JSON (для сборщиков: Monium/ELK); иначе человекочитаемый `pretty` с ANSI. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL OTLP-коллектора (напр. `http://otel-collector:4318`); к нему добавляется `/v1/traces`. Не задан — трейсинг выключен. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (нет) | **Полный** URL для трейсов; используется как есть и имеет приоритет над базовым. |
+| `OTEL_SERVICE_NAME` | `jwt-service-app` | Имя сервиса в трейсах (атрибут `service.name`). |
 | `AUTH_PROXY_SECRET` | — (**обязателен**) | Уровень 2: ожидаемый секрет заголовка. Без него сервис не стартует. |
 | `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Уровень 2: имя заголовка с секретом. |
 | `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
@@ -233,6 +237,26 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   поднимал бы ложные алерты в проде. Ошибку логирует слой, который знает
   **причину** (например `jwk.rs` — отказ JWKS на `ERROR`); вышестоящие слои пишут
   исход на `DEBUG`, чтобы не было дублей.
+- **Трейсинг (`tracing_otel.rs`).** Включается **только** при заданном
+  `OTEL_EXPORTER_OTLP_ENDPOINT` — span'ы уходят по OTLP/HTTP в OpenTelemetry
+  Collector, откуда их забирает Monium (либо Jaeger/Tempo). Слой поверх той же
+  `tracing`-шины, что и логи, поэтому span `http_request` и вложенные
+  `jwks.*`/`redis.*` попадают и в логи, и в трейсы.
+  - **Путь сигнала обязателен.** `OTEL_EXPORTER_OTLP_ENDPOINT` — это **базовый**
+    URL, к которому добавляется `/v1/traces`. Если послать базовый URL как есть,
+    коллектор ответит `404` и трейсы будут **молча теряться** (см. `traces_endpoint`).
+  - **Клиент экспортёра — блокирующий, намеренно.** Batch-процессор работает на
+    своём выделенном потоке без tokio-рантайма; асинхронный HTTP-клиент там
+    паникует («there is no reactor running»). Основной async-рантайм это не задевает.
+  - **Propagation (W3C).** Входящий `traceparent` подхватывается и делает наш span
+    потомком чужой трассы; исходящие запросы к JWKS получают свой `traceparent` —
+    трасса склеивается сквозь сервисы.
+  - **Не fail-fast**, как и rate limiting: ошибка настройки экспортёра не роняет
+    сервис, только предупреждение в лог. Телеметрия не должна быть причиной
+    недоступности.
+  - Статус трейсинга логируется **после** установки subscriber'а: до неё писать
+    некуда, сообщение было бы потеряно (поэтому `init_tracer_provider` возвращает
+    [`Status`], а не логирует сам).
 - **Метрики (`metrics.rs`).** Экспозиция Prometheus на `GET /metrics` — **уровень
   доступа 4** (Bearer-токен `AUTH_METRICS_TOKEN`). Ручку скрейпят Prometheus/Yandex
   Managed Prometheus, Zabbix (`agent2` с prometheus-плагином) и Monium (через

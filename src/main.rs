@@ -29,6 +29,7 @@ mod key;
 mod logging;
 mod metrics;
 mod rate_limit;
+mod tracing_otel;
 mod redis;
 mod models;
 mod jwk;
@@ -161,8 +162,11 @@ async fn main() -> std::io::Result<()> {
     let algorithm = env::var("TOKEN_ALGORITHM")
         .unwrap_or("RS256".into());
 
-    // Логирование: формат (`LOG_FORMAT=json|pretty`) и фильтр уровней (`RUST_LOG`).
-    init_subscriber();
+    // Логирование и трейсинг: формат (`LOG_FORMAT`), уровни (`RUST_LOG`) и
+    // опциональный OTLP-экспорт (`OTEL_EXPORTER_OTLP_ENDPOINT`). Провайдер держим
+    // живым до конца работы и завершаем после остановки сервера — иначе последние
+    // span'ы не досылаются.
+    let tracer_provider = init_subscriber();
 
     // Prometheus-recorder ставится один раз на процесс; handle рендерит текст
     // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
@@ -291,5 +295,12 @@ async fn main() -> std::io::Result<()> {
     })
         .bind((host, port))?
         .run()
-        .await
+        .await?;
+
+    // Сервер остановлен — досылаем накопленные span'ы (если трейсинг включён).
+    if let Some(provider) = tracer_provider {
+        crate::tracing_otel::shutdown(provider);
+    }
+
+    Ok(())
 }

@@ -59,6 +59,7 @@ impl RedisClient {
     /// # Errors
     /// - [`JtiError::BadConnection`] — не удалось открыть соединение;
     /// - [`JtiError::WrongOperation`] — команда `PING` не выполнилась.
+    #[tracing::instrument(name = "redis.ping", skip_all, err(level = "debug"))]
     pub async fn ping(&self) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
 
@@ -80,6 +81,7 @@ impl RedisClient {
 
 impl JtiStore for RedisClient {
     /// Записывает `jti` со значением-заглушкой `1` и TTL `ttl` секунд (`SETEX`).
+    #[tracing::instrument(name = "redis.store_jti", skip_all, err(level = "debug"))]
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
         let started = Instant::now();
@@ -98,6 +100,7 @@ impl JtiStore for RedisClient {
     }
 
     /// Проверяет существование ключа `jti` (`EXISTS`).
+    #[tracing::instrument(name = "redis.check_jti", skip_all, err(level = "debug"))]
     async fn check_jti(&self, jti: &str) -> Result<bool, JtiError> {
         let mut conn = self.get_connection().await?;
         let started = Instant::now();
@@ -116,6 +119,7 @@ impl JtiStore for RedisClient {
     }
 
     /// Удаляет ключ `jti` (`DEL`); отзыв токена. Идемпотентна.
+    #[tracing::instrument(name = "redis.delete_jti", skip_all, err(level = "debug"))]
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
         let started = Instant::now();
