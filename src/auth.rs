@@ -381,6 +381,7 @@ where
                 // TOTP, забытый заголовок у клиента). Уровень WARN: не сбой
                 // сервиса, но повод смотреть. Сам секрет/код НЕ логируем.
                 tracing::warn!(access_level = level.as_str(), "Отказ в доступе");
+                crate::metrics::record_auth_denied(level.as_str());
 
                 // Единый скупой ответ без деталей — как и на остальных ручках.
                 let (req, _payload) = req.into_parts();

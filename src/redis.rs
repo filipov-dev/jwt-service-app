@@ -8,7 +8,11 @@
 use std::env;
 use redis::{AsyncCommands, RedisError};
 use redis::aio::MultiplexedConnection;
+use std::time::Instant;
+
 use tracing::error;
+
+use crate::metrics::record_redis_command;
 use crate::models::jwt::{JtiError, JtiStore};
 
 /// Клиент Redis. Дёшево клонируется; соединения берутся по требованию
@@ -58,10 +62,16 @@ impl RedisClient {
     pub async fn ping(&self) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
 
+        let started = Instant::now();
+
         match redis::cmd("PING").query_async::<String>(&mut conn).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                record_redis_command("ping", true, started.elapsed());
+                Ok(())
+            }
             Err(e) => {
                 error!("Redis: PING не выполнился: {}", e);
+                record_redis_command("ping", false, started.elapsed());
                 Err(JtiError::WrongOperation)
             }
         }
@@ -72,11 +82,16 @@ impl JtiStore for RedisClient {
     /// Записывает `jti` со значением-заглушкой `1` и TTL `ttl` секунд (`SETEX`).
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
+        let started = Instant::now();
 
         match conn.set_ex::<&str, u8, ()>(jti, 1, ttl).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                record_redis_command("store_jti", true, started.elapsed());
+                Ok(())
+            }
             Err(e) => {
-                error!("{}", e);
+                error!("Redis: SETEX не выполнился: {}", e);
+                record_redis_command("store_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
             },
         }
@@ -85,11 +100,16 @@ impl JtiStore for RedisClient {
     /// Проверяет существование ключа `jti` (`EXISTS`).
     async fn check_jti(&self, jti: &str) -> Result<bool, JtiError> {
         let mut conn = self.get_connection().await?;
+        let started = Instant::now();
 
         match conn.exists(jti).await {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                record_redis_command("check_jti", true, started.elapsed());
+                Ok(v)
+            }
             Err(e) => {
-                error!("{}", e);
+                error!("Redis: EXISTS не выполнился: {}", e);
+                record_redis_command("check_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
             },
         }
@@ -98,11 +118,16 @@ impl JtiStore for RedisClient {
     /// Удаляет ключ `jti` (`DEL`); отзыв токена. Идемпотентна.
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
         let mut conn = self.get_connection().await?;
+        let started = Instant::now();
 
         match conn.del::<&str, ()>(jti).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                record_redis_command("delete_jti", true, started.elapsed());
+                Ok(())
+            }
             Err(e) => {
-                error!("{}", e);
+                error!("Redis: DEL не выполнился: {}", e);
+                record_redis_command("delete_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
             },
         }

@@ -25,6 +25,7 @@ mod error;
 mod handlers;
 mod key;
 mod logging;
+mod metrics;
 mod rate_limit;
 mod redis;
 mod models;
@@ -37,6 +38,7 @@ use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::handlers::{
     create_token_impl, verify_token_impl, revoke_token_impl, livez, readyz,
 };
+use crate::handlers::metrics as metrics_handler;
 use crate::key::KeyManager;
 use crate::redis::RedisClient;
 use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenRequest};
@@ -54,7 +56,8 @@ use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenReques
         handlers::verify_token,
         handlers::revoke_token,
         handlers::livez,
-        handlers::readyz
+        handlers::readyz,
+        handlers::metrics
     ),
     components(schemas(
         TokenRequest,
@@ -147,6 +150,10 @@ async fn main() -> std::io::Result<()> {
     // Логирование: формат (`LOG_FORMAT=json|pretty`) и фильтр уровней (`RUST_LOG`).
     init_subscriber();
 
+    // Prometheus-recorder ставится один раз на процесс; handle рендерит текст
+    // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
+    let metrics_handle = crate::metrics::init_recorder();
+
     let host = env::var("HOST")
         .unwrap_or("127.0.0.1".into());
     let port = env::var("PORT")
@@ -215,6 +222,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(RequestLog)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
+            .app_data(web::Data::new(metrics_handle.clone()))
             // Уровень 3 (TOTP): выпуск и отзыв токенов. Глобальный cap — внутри auth
             // (последний `.wrap` — внешний), поэтому потолок расходуют только
             // запросы, прошедшие TOTP: неаутентифицированный флуд не исчерпает cap.
@@ -255,7 +263,10 @@ async fn main() -> std::io::Result<()> {
                     .wrap(deny_cors())
                     .route("/api-docs/openapi.json", web::get().to(openapi_spec))
                     .service(livez)
-                    .service(readyz),
+                    .service(readyz)
+                    // `/metrics` — тот же уровень 1: ручку скрейпит Prometheus/
+                    // Zabbix/Monium. Наружу её публиковать не нужно (см. `metrics`).
+                    .service(metrics_handler),
             )
     })
         .bind((host, port))?

@@ -43,7 +43,7 @@
 
 | Уровень | Эндпоинты | Валидатор |
 |--------:|-----------|-----------|
-| **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет (пропускает всё) |
+| **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /metrics`, `GET /api-docs/openapi.json` | нет (пропускает всё) |
 | **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от прокси, сравнение constant-time |
 | **3 — TOTP** | `POST /tokens`, `DELETE /tokens/{jti}` | TOTP (RFC 6238), internal app-to-app |
 
@@ -105,7 +105,8 @@
 |------|-----------|
 | `main.rs` | Точка входа, конфиг HTTP-сервера, логирование, CORS, роуты (с уровнями доступа), OpenAPI (`ApiDoc`). |
 | `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret и TOTP (RFC 6238). |
-| `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP). |
+| `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP); отсюда же пишется метрика запроса. |
+| `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
 | `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
 | `jwt.rs` | `JwtManager` — фасад для генерации и проверки токенов. |
@@ -223,6 +224,27 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   поднимал бы ложные алерты в проде. Ошибку логирует слой, который знает
   **причину** (например `jwk.rs` — отказ JWKS на `ERROR`); вышестоящие слои пишут
   исход на `DEBUG`, чтобы не было дублей.
+- **Метрики (`metrics.rs`).** Экспозиция Prometheus на `GET /metrics` (уровень
+  доступа 1, без auth) — её скрейпят Prometheus/Yandex Managed Prometheus, Zabbix
+  (`agent2` с prometheus-плагином) и Monium (через Prometheus-совместимость);
+  отдельный экспортёр под Zabbix не нужен. **Ручку не публикуют наружу** —
+  прокси должен оставить её доступной только из внутренней сети (метрики
+  раскрывают операционную картину).
+
+  | Метрика | Тип | Лейблы |
+  |---------|-----|--------|
+  | `http_requests_total` | counter | `method`, `endpoint`, `status` |
+  | `http_request_duration_seconds` | histogram | `method`, `endpoint` |
+  | `jwt_tokens_issued_total` / `jwt_tokens_revoked_total` | counter | — |
+  | `jwt_tokens_verified_total` | counter | `result` (`success`/`failure`) |
+  | `jwt_auth_denied_total` | counter | `level` (`open`/`proxy_secret`/`totp`) |
+  | `jwt_rate_limit_exceeded_total` | counter | — |
+  | `jwks_request_duration_seconds` | histogram | `operation`, `success` |
+  | `redis_command_duration_seconds` | histogram | `command`, `success` |
+
+  **Кардинальность:** в лейбл `endpoint` идёт **шаблон роута** (`/tokens/{jti}`),
+  а не фактический путь — иначе каждый `jti` порождал бы свою серию. Ничего
+  клиентского (токены, секреты, IP) в лейблы не кладите.
 - Комментарии в коде местами на русском — это норма для проекта, продолжайте
   в том же стиле, если правите соседний код.
 - Версия в `Cargo.toml` — это **триггер релиза**: пуш в `master` с изменением

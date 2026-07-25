@@ -11,7 +11,11 @@ use std::env;
 use reqwest::Client;
 use serde_json::json;
 use thiserror::Error;
+use std::time::Instant;
+
 use tracing::{error, debug, info};
+
+use crate::metrics::record_jwks_request;
 use crate::models::{Jwk, JwkData, Jwks};
 
 /// Ошибки взаимодействия с сервисом ключей.
@@ -62,6 +66,7 @@ impl JwkService {
     async fn public_keys(&self) -> Result<Jwks, JwkError> {
         let url = format!("{}/.well-known/jwks.json", self.url);
         debug!("JWKS: запрашиваю публичные ключи ({})", url);
+        let started = Instant::now();
 
         let response = match self.client.get(&url)
             .send()
@@ -70,14 +75,19 @@ impl JwkService {
             Err(e) => {
                 // Отказ внешней зависимости — ERROR.
                 error!("JWKS недоступен ({}): {}", url, e);
+                record_jwks_request("public_keys", false, started.elapsed());
                 return Err(JwkError::BadConnection);
             }
         };
 
         match response.json().await {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                record_jwks_request("public_keys", true, started.elapsed());
+                Ok(v)
+            }
             Err(e) => {
                 error!("JWKS вернул некорректный ответ ({}): {}", url, e);
+                record_jwks_request("public_keys", false, started.elapsed());
                 Err(JwkError::BadResponse)
             }
         }
@@ -124,6 +134,7 @@ impl JwkService {
         let alg = if alg == "EdDSA" {  "Ed25519" } else { alg };
 
         debug!("JWKS: запрашиваю приватный ключ (alg={})", alg);
+        let started = Instant::now();
 
         let response = match self.client.post(&url)
             .json(&json!({
@@ -134,14 +145,19 @@ impl JwkService {
             Ok(v) => v,
             Err(e) => {
                 error!("JWKS недоступен при запросе приватного ключа: {}", e);
+                record_jwks_request("private_key", false, started.elapsed());
                 return Err(JwkError::BadConnection);
             }
         };
 
         match response.json().await {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                record_jwks_request("private_key", true, started.elapsed());
+                Ok(v)
+            }
             Err(e) => {
                 error!("JWKS вернул некорректный приватный ключ: {}", e);
+                record_jwks_request("private_key", false, started.elapsed());
                 Err(JwkError::BadResponse)
             }
         }
