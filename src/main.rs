@@ -96,6 +96,19 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// Рестриктивный CORS для НЕ-публичных ручек.
+///
+/// Не «отключённый», а именно запрещающий: список разрешённых origin'ов пуст,
+/// поэтому любой кросс-доменный запрос из браузера отклоняется CORS'ом (preflight
+/// `OPTIONS` получает отказ, у простых запросов нет `Access-Control-Allow-Origin`).
+/// Запросы без заголовка `Origin` (internal app-to-app, `curl`) проходят как
+/// обычно. Вешается на все ручки, кроме `POST /tokens/verify` — единственной
+/// публичной ручки под «разрешающим» CORS. `Cors` не `Clone`, поэтому строим
+/// свежий экземпляр на каждый `.wrap`.
+fn deny_cors() -> Cors {
+    Cors::default()
+}
+
 /// Отдаёт OpenAPI-спецификацию в формате JSON.
 ///
 /// Обслуживает `GET /api-docs/openapi.json`; используется внешним Swagger UI
@@ -114,9 +127,9 @@ pub async fn openapi_spec() -> impl Responder {
 /// 3. Читает `HOST`/`PORT` для привязки.
 /// 4. Создаёт Redis-клиент и менеджер ключей (падает с паникой, если Redis
 ///    недоступен на старте).
-/// 5. Поднимает `HttpServer`, навешивает CORS точечно только на публичную
-///    ручку `/tokens/verify` (см. ниже) и регистрирует маршруты, включая
-///    выдачу OpenAPI.
+/// 5. Поднимает `HttpServer`: на публичную ручку `/tokens/verify` навешивает
+///    разрешающий CORS, на остальные — запрещающий (`deny_cors`), и регистрирует
+///    маршруты, включая выдачу OpenAPI.
 ///
 /// # Panics
 ///
@@ -179,12 +192,12 @@ async fn main() -> std::io::Result<()> {
     info!("Starting server on {}:{}", host, port);
 
     HttpServer::new(move || {
-        // ВАЖНО: CORS навешивается ТОЧЕЧНО только на `/tokens/verify` (см. ниже) —
-        // это ЕДИНСТВЕННАЯ публичная ручка, которую имеет смысл дёргать из
-        // браузера. Остальные ручки (health, OpenAPI, выпуск/отзыв токенов) —
-        // internal, CORS им не нужен. При добавлении новых ручек НЕ расширяйте на
-        // них CORS без явного решения: под CORS должна оставаться ровно одна
-        // публичная ручка.
+        // ВАЖНО: «разрешающий» CORS навешивается ТОЧЕЧНО только на `/tokens/verify`
+        // (см. ниже) — это ЕДИНСТВЕННАЯ публичная ручка, которую имеет смысл дёргать
+        // из браузера. На все остальные ручки (health, OpenAPI, выпуск/отзыв токенов)
+        // вешается `deny_cors()` — он не отключён, а запрещает кросс-доменные запросы
+        // из браузера. При добавлении новых ручек НЕ вешайте на них разрешающий CORS
+        // без явного решения: под ним должна оставаться ровно одна публичная ручка.
         let cors = {
             let base = Cors::default()
                 .allowed_methods(vec!["POST"])
@@ -211,6 +224,7 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/tokens")
                     .wrap(RateLimit::global(internal_limiter.clone()))
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                    .wrap(deny_cors())
                     .route(web::post().to(create_token_impl::<RedisClient>)),
             )
             // Уровень 2 (proxy-secret): проверка токена. Регистрируется до
@@ -230,6 +244,7 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/tokens/{jti}")
                     .wrap(RateLimit::global(internal_limiter.clone()))
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                    .wrap(deny_cors())
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
             )
             // Уровень 1 (открыто): health-пробы и OpenAPI. Тот же middleware, но
@@ -239,6 +254,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("")
                     .wrap(Auth::new(AuthLevel::Open, auth.clone()))
+                    .wrap(deny_cors())
                     .route("/api-docs/openapi.json", web::get().to(openapi_spec))
                     .service(livez)
                     .service(readyz),
