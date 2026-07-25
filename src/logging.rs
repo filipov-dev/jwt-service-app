@@ -51,8 +51,12 @@ use std::time::Instant;
 use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::Error;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Instrument;
-use tracing_subscriber::EnvFilter;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use uuid::Uuid;
 
 /// Имя заголовка сквозного идентификатора запроса (в нижнем регистре — требование
@@ -64,14 +68,22 @@ const REQUEST_ID_MAX_LEN: usize = 128;
 
 /// Инициализирует глобальный `tracing`-subscriber.
 ///
-/// Формат выбирается по `LOG_FORMAT` (`json` → построчный JSON, иначе `pretty`).
-/// Фильтр уровней — из `RUST_LOG` с дефолтом `jwt_service_app=info`.
+/// Собирается из слоёв поверх общего `Registry` — это и есть «единая шина»
+/// телеметрии:
+/// - фильтр уровней (`RUST_LOG`, дефолт `jwt_service_app=info`);
+/// - вывод логов (`LOG_FORMAT`: `json` → построчный JSON, иначе `pretty`);
+/// - опциональный слой OpenTelemetry, если задан `OTEL_EXPORTER_OTLP_ENDPOINT`
+///   (см. [`crate::tracing_otel`]).
+///
+/// Возвращает провайдер трейсов, если экспорт включён: его нужно держать живым и
+/// завершить через [`crate::tracing_otel::shutdown`] при остановке сервиса, иначе
+/// последние span'ы не досылаются.
 ///
 /// # Panics
 ///
 /// Паникует, если глобальный subscriber уже установлен (вызывать один раз на
 /// старте — fail-fast).
-pub fn init_subscriber() {
+pub fn init_subscriber() -> Option<SdkTracerProvider> {
     // ВАЖНО: дефолт применяется, только если `RUST_LOG` не задан. Нельзя делать
     // `from_default_env().add_directive("jwt_service_app=info")` — добавленная
     // директива перекрывает одноимённый таргет из `RUST_LOG`, и уровень крейта
@@ -79,12 +91,25 @@ pub fn init_subscriber() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("jwt_service_app=info"));
 
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Слои json/pretty различаются по типу — приводим к общему через `.boxed()`.
+    let fmt_layer = match env::var("LOG_FORMAT").unwrap_or_default().to_lowercase().as_str() {
+        "json" => tracing_subscriber::fmt::layer().json().boxed(),
+        _ => tracing_subscriber::fmt::layer().pretty().with_ansi(true).boxed(),
+    };
 
-    match env::var("LOG_FORMAT").unwrap_or_default().to_lowercase().as_str() {
-        "json" => builder.json().init(),
-        _ => builder.pretty().with_ansi(true).init(),
-    }
+    let (provider, otel_status) = crate::tracing_otel::init_tracer_provider();
+    let otel_layer = provider.as_ref().map(crate::tracing_otel::layer);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(otel_layer)
+        .init();
+
+    // Статус трейсинга печатаем только теперь: до `.init()` писать было некуда.
+    otel_status.log();
+
+    provider
 }
 
 /// Проверяет, что пришедший извне `X-Request-Id` безопасен для повторного
@@ -171,6 +196,14 @@ where
             status = tracing::field::Empty,
             latency_ms = tracing::field::Empty,
         );
+
+        // Если вызывающий сервис прислал `traceparent`, продолжаем его трассу —
+        // иначе span станет корнем новой (см. `tracing_otel`). Неудача склейки не
+        // повод отказывать в запросе: пишем в DEBUG и продолжаем без родителя.
+        if let Err(e) = span.set_parent(crate::tracing_otel::extract_parent_context(req.headers()))
+        {
+            tracing::debug!("Не удалось связать span с входящей трассой: {e}");
+        }
 
         let response_id = request_id;
 
