@@ -29,6 +29,7 @@ mod key;
 mod logging;
 mod metrics;
 mod rate_limit;
+mod sentry_glitchtip;
 mod tracing_otel;
 mod redis;
 mod models;
@@ -166,7 +167,7 @@ async fn main() -> std::io::Result<()> {
     // опциональный OTLP-экспорт (`OTEL_EXPORTER_OTLP_ENDPOINT`). Провайдер держим
     // живым до конца работы и завершаем после остановки сервера — иначе последние
     // span'ы не досылаются.
-    let tracer_provider = init_subscriber();
+    let telemetry = init_subscriber();
 
     // Prometheus-recorder ставится один раз на процесс; handle рендерит текст
     // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
@@ -298,7 +299,8 @@ async fn main() -> std::io::Result<()> {
         .await?;
 
     // Сервер остановлен — досылаем накопленные span'ы (если трейсинг включён).
-    if let Some(provider) = tracer_provider {
+    // Guard GlitchTip досылает свои события сам при уничтожении `telemetry`.
+    if let Some(provider) = telemetry.tracer_provider {
         crate::tracing_otel::shutdown(provider);
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 
 [dependencies]
@@ -48,6 +48,11 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 ] }
 opentelemetry-semantic-conventions = "0.32"
 tracing-opentelemetry = "0.33"
+# GlitchTip (Sentry-совместимый): ошибки/паники, performance-транзакции и
+# структурные логи. Лицензия MIT. Все три канала включаются по DSN — см.
+# `sentry_glitchtip.rs`. Фичи: `tracing` — мост из `tracing`-шины (события → issues,
+# span-ы → транзакции), `logs` — структурные логи.
+sentry = { version = "0.48", features = ["tracing", "logs"] }
 
 [dev-dependencies]
 # HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов

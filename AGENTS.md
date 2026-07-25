@@ -115,6 +115,7 @@
 | `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret, TOTP (RFC 6238) и Bearer-токена метрик. |
 | `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP); отсюда же пишется метрика запроса. |
 | `tracing_otel.rs` | Распределённый трейсинг OpenTelemetry: OTLP-экспорт (вкл. по env), W3C-propagation (`traceparent`) на входе и в исходящих запросах к JWKS. |
+| `sentry_glitchtip.rs` | Интеграция с GlitchTip (Sentry-совместимый): ошибки/паники → Issues, span-ы → Performance, структурные логи → Logs. Включается по DSN. |
 | `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
 | `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
@@ -176,6 +177,10 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL OTLP-коллектора (напр. `http://otel-collector:4318`); к нему добавляется `/v1/traces`. Не задан — трейсинг выключен. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (нет) | **Полный** URL для трейсов; используется как есть и имеет приоритет над базовым. |
 | `OTEL_SERVICE_NAME` | `jwt-service-app` | Имя сервиса в трейсах (атрибут `service.name`). |
+| `GLITCHTIP_DSN` | — (нет) | DSN GlitchTip. Не задан — интеграция выключена. Принимается и `SENTRY_DSN`. **Секрет, не коммитить.** |
+| `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | Доля span-ов в Performance (0.0–1.0). `0.0` — performance выключен. |
+| `GLITCHTIP_ENABLE_LOGS` | `false` | Слать ли структурные логи в канал Logs. |
+| `GLITCHTIP_ENVIRONMENT` | — (нет) | Окружение (`prod`/`stage`) для группировки в GlitchTip. |
 | `AUTH_PROXY_SECRET` | — (**обязателен**) | Уровень 2: ожидаемый секрет заголовка. Без него сервис не стартует. |
 | `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Уровень 2: имя заголовка с секретом. |
 | `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
@@ -257,6 +262,23 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   - Статус трейсинга логируется **после** установки subscriber'а: до неё писать
     некуда, сообщение было бы потеряно (поэтому `init_tracer_provider` возвращает
     [`Status`], а не логирует сам).
+- **GlitchTip (`sentry_glitchtip.rs`).** Включается **только** при заданном
+  `GLITCHTIP_DSN` (принимается и `SENTRY_DSN`). Закрывает **три** канала, а не
+  только ошибки — всё поверх той же `tracing`-шины:
+
+  | Канал | Что уходит | Включение |
+  |-------|-----------|-----------|
+  | **Issues** | паники и события уровня `ERROR` | всегда при DSN |
+  | **Performance** | span-ы → транзакции (`http_request` и вложенные) | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
+  | **Logs** | структурные логи `DEBUG`/`INFO`/`WARN` | `GLITCHTIP_ENABLE_LOGS=true` |
+
+  - Разложение по каналам задаёт `event_filter` слоя: `ERROR` → issue,
+    `WARN`/`INFO` → лог + breadcrumb, `DEBUG` → лог, `TRACE` → игнор.
+  - **Логи батчатся** и досылаются пачкой (в т.ч. при завершении процесса) —
+    в отличие от issues, они появляются в UI не мгновенно.
+  - **Не fail-fast**: некорректный DSN не роняет сервис. **DSN не логируется.**
+  - Performance по умолчанию **выключен** (`0.0`): транзакции стоят объёма,
+    включайте осознанно.
 - **Метрики (`metrics.rs`).** Экспозиция Prometheus на `GET /metrics` — **уровень
   доступа 4** (Bearer-токен `AUTH_METRICS_TOKEN`). Ручку скрейпят Prometheus/Yandex
   Managed Prometheus, Zabbix (`agent2` с prometheus-плагином) и Monium (через
