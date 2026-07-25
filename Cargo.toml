@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 
 [dependencies]
@@ -19,6 +19,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"] }
 openssl = "0.10.70"
 base64 = "0.22.1"
+# Token-bucket rate limiting (алгоритм GCRA). Берём только core-crate `governor`
+# (MIT); actix-обёртку (`actix-governor`, GPL-3.0) не тянем из-за копилефта на
+# публично раздаваемые Docker-образы — middleware реализован свой (см. `rate_limit.rs`).
+governor = "0.10"
 
 [dev-dependencies]
 # HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов

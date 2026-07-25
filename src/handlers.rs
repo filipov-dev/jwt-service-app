@@ -32,6 +32,7 @@ use crate::models::jwt::{JtiStore, JwtError};
         (status = 400, body = ErrorResponse),
         (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
         (status = 422, body = ErrorResponse),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
         (status = 500, body = ErrorResponse)
     )
 )]
@@ -109,7 +110,8 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
     responses(
         (status = 200),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 2: нет proxy-secret, либо токен невалиден/истёк")
+        (status = 401, body = ErrorResponse, description = "Уровень 2: нет proxy-secret, либо токен невалиден/истёк"),
+        (status = 429, body = ErrorResponse, description = "Превышен per-IP лимит запросов")
     )
 )]
 /// Проверяет валидность JWT.
@@ -163,7 +165,8 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
     responses(
         (status = 204),
         (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 404, body = ErrorResponse)
+        (status = 404, body = ErrorResponse),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)")
     )
 )]
 /// Отзывает токен по его идентификатору `jti`.
