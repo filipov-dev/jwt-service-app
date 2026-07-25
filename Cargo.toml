@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 
 [dependencies]
@@ -23,6 +23,12 @@ base64 = "0.22.1"
 # (MIT); actix-обёртку (`actix-governor`, GPL-3.0) не тянем из-за копилефта на
 # публично раздаваемые Docker-образы — middleware реализован свой (см. `rate_limit.rs`).
 governor = "0.10"
+# Метрики: фасад `metrics` + Prometheus-рендерер. Лицензии permissive (MIT /
+# MIT+Apache-2.0). `default-features = false` — дефолт тянет собственный
+# HTTP-listener и push-gateway (hyper/rustls), а мы отдаём текст экспозиции
+# через actix на `/metrics` (см. `metrics.rs`).
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 # HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов

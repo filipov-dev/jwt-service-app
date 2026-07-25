@@ -18,13 +18,16 @@ use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::info;
 use utoipa::{Modify, OpenApi};
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+};
 
 mod auth;
 mod error;
 mod handlers;
 mod key;
 mod logging;
+mod metrics;
 mod rate_limit;
 mod redis;
 mod models;
@@ -37,6 +40,7 @@ use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::handlers::{
     create_token_impl, verify_token_impl, revoke_token_impl, livez, readyz,
 };
+use crate::handlers::metrics as metrics_handler;
 use crate::key::KeyManager;
 use crate::redis::RedisClient;
 use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenRequest};
@@ -54,7 +58,8 @@ use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenReques
         handlers::verify_token,
         handlers::revoke_token,
         handlers::livez,
-        handlers::readyz
+        handlers::readyz,
+        handlers::metrics
     ),
     components(schemas(
         TokenRequest,
@@ -92,6 +97,18 @@ impl Modify for SecurityAddon {
                     "X-TOTP-Code",
                     "Уровень 3: текущий TOTP-код (RFC 6238) на общем секрете.",
                 ))),
+            );
+            components.add_security_scheme(
+                "metrics_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .description(Some(
+                            "Уровень 4: статический Bearer-токен для скрейпа /metrics \
+                             (AUTH_METRICS_TOKEN).",
+                        ))
+                        .build(),
+                ),
             );
         }
     }
@@ -146,6 +163,10 @@ async fn main() -> std::io::Result<()> {
 
     // Логирование: формат (`LOG_FORMAT=json|pretty`) и фильтр уровней (`RUST_LOG`).
     init_subscriber();
+
+    // Prometheus-recorder ставится один раз на процесс; handle рендерит текст
+    // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
+    let metrics_handle = crate::metrics::init_recorder();
 
     let host = env::var("HOST")
         .unwrap_or("127.0.0.1".into());
@@ -215,6 +236,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(RequestLog)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
+            .app_data(web::Data::new(metrics_handle.clone()))
             // Уровень 3 (TOTP): выпуск и отзыв токенов. Глобальный cap — внутри auth
             // (последний `.wrap` — внешний), поэтому потолок расходуют только
             // запросы, прошедшие TOTP: неаутентифицированный флуд не исчерпает cap.
@@ -244,6 +266,15 @@ async fn main() -> std::io::Result<()> {
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
                     .wrap(deny_cors())
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
+            )
+            // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
+            // scope, иначе тот перехватил бы путь. Токен обязателен — без него
+            // сервис не стартует (см. `AuthConfig::from_env`).
+            .service(
+                web::resource("/metrics")
+                    .wrap(Auth::new(AuthLevel::MetricsToken, auth.clone()))
+                    .wrap(deny_cors())
+                    .route(web::get().to(metrics_handler)),
             )
             // Уровень 1 (открыто): health-пробы и OpenAPI. Тот же middleware, но
             // валидатор `Open` пропускает всё. Регистрируется последним — scope с

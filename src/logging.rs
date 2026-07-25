@@ -178,12 +178,23 @@ where
             async move {
                 let start = Instant::now();
                 let mut res = service.call(req).await?;
+                let elapsed = start.elapsed();
                 let status = res.status().as_u16();
-                let latency_ms = start.elapsed().as_millis() as u64;
+                let latency_ms = elapsed.as_millis() as u64;
 
                 let span = tracing::Span::current();
                 span.record("status", status);
                 span.record("latency_ms", latency_ms);
+
+                // Метрика запроса пишется здесь же: статус и латентность уже
+                // посчитаны, второй проход middleware не нужен. В лейбл идёт
+                // ШАБЛОН роута (`/tokens/{jti}`), а не фактический путь — иначе
+                // каждый `jti` порождал бы свою серию (см. `metrics.rs`).
+                let endpoint = res
+                    .request()
+                    .match_pattern()
+                    .unwrap_or_else(|| "unmatched".to_string());
+                crate::metrics::record_http_request(&method, &endpoint, status, elapsed);
 
                 // Эхо-заголовок `X-Request-Id` в ответ для сквозной трассировки.
                 if let Ok(value) = HeaderValue::from_str(&response_id) {

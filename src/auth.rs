@@ -1,6 +1,6 @@
 //! Многоуровневый контроль доступа к эндпоинтам.
 //!
-//! Реализует единый auth-middleware ([`Auth`]) с тремя уровнями
+//! Реализует единый auth-middleware ([`Auth`]) с четырьмя уровнями
 //! ([`AuthLevel`]); уровень задаётся при регистрации роута в `main.rs`, а разница
 //! между уровнями — только в валидаторе:
 //!
@@ -11,15 +11,18 @@
 //!   ([`ProxyValidator`]).
 //! - **Уровень 3 — [`AuthLevel::Totp`]**: internal app-to-app по TOTP
 //!   (RFC 6238, [`TotpValidator`]).
+//! - **Уровень 4 — [`AuthLevel::MetricsToken`]**: скрейп `/metrics` по статическому
+//!   Bearer-токену ([`MetricsValidator`]).
 //!
 //! Крипта (HMAC для TOTP, constant-time сравнение) — через `openssl`, уже
 //! присутствующий в зависимостях. Конфигурация целиком из окружения
 //! ([`AuthConfig::from_env`]).
 //!
-//! **Защиты обязательны.** Секреты уровней 2 и 3 (`AUTH_PROXY_SECRET`,
-//! `AUTH_TOTP_SECRET`) — обязательны: если хотя бы один не задан, [`AuthConfig::from_env`]
-//! возвращает ошибку и сервис **не стартует** (fail-fast на старте, как и с прочей
-//! критичной конфигурацией). Отключить уровень нельзя.
+//! **Защиты обязательны.** Секреты уровней 2, 3 и 4 (`AUTH_PROXY_SECRET`,
+//! `AUTH_TOTP_SECRET`, `AUTH_METRICS_TOKEN`) — обязательны: если хотя бы один не
+//! задан, [`AuthConfig::from_env`] возвращает ошибку и сервис **не стартует**
+//! (fail-fast на старте, как и с прочей критичной конфигурацией). Отключить
+//! уровень нельзя.
 //!
 //! ## Замечание о replay (уровень 3)
 //!
@@ -54,6 +57,14 @@ pub enum AuthLevel {
     ProxySecret,
     /// Уровень 3 — internal app-to-app по TOTP.
     Totp,
+    /// Уровень 4 — скрейп метрик по статическому Bearer-токену.
+    ///
+    /// Отдельный уровень, а не переиспользование уровня 2/3: TOTP системам
+    /// мониторинга не по силам (они не считают одноразовые коды), а `X-Proxy-Secret`
+    /// по контракту затирается прокси. Bearer же нативно поддержан и Prometheus
+    /// (`authorization: {credentials_file}`), и Zabbix `agent2`, и OTel Collector
+    /// (через него метрики забирает Monium).
+    MetricsToken,
 }
 
 impl AuthLevel {
@@ -63,6 +74,7 @@ impl AuthLevel {
             AuthLevel::Open => "open",
             AuthLevel::ProxySecret => "proxy_secret",
             AuthLevel::Totp => "totp",
+            AuthLevel::MetricsToken => "metrics_token",
         }
     }
 }
@@ -165,6 +177,38 @@ impl ProxyValidator {
     }
 }
 
+/// Валидатор уровня 4: статический Bearer-токен для скрейпа метрик.
+#[derive(Clone)]
+pub struct MetricsValidator {
+    /// Ожидаемый токен (без префикса `Bearer `).
+    token: Vec<u8>,
+}
+
+impl MetricsValidator {
+    /// Проверяет заголовок `Authorization: Bearer <токен>`.
+    ///
+    /// Схема (`Bearer`) сравнивается регистронезависимо — так требует RFC 7235;
+    /// сам токен — constant-time (`openssl::memcmp::eq` поверх проверки длины).
+    pub fn validate(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers.get("Authorization") else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+
+        let Some((scheme, provided)) = value.split_once(' ') else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            return false;
+        }
+
+        let provided = provided.trim().as_bytes();
+        provided.len() == self.token.len() && openssl::memcmp::eq(provided, &self.token)
+    }
+}
+
 /// Валидатор уровня 3: TOTP (RFC 6238).
 ///
 /// Активные секреты обязательны и гарантированно непусты (см.
@@ -225,6 +269,7 @@ impl TotpValidator {
 pub struct AuthConfig {
     proxy: ProxyValidator,
     totp: TotpValidator,
+    metrics: MetricsValidator,
 }
 
 impl AuthConfig {
@@ -274,6 +319,14 @@ impl AuthConfig {
             errors.push("AUTH_TOTP_SECRET не задан (обязателен для уровня 3 — TOTP)".into());
         }
 
+        // --- Уровень 4: токен метрик (обязателен) ---
+        let metrics_token = env::var("AUTH_METRICS_TOKEN").ok().filter(|s| !s.trim().is_empty());
+        if metrics_token.is_none() {
+            errors.push(
+                "AUTH_METRICS_TOKEN не задан (обязателен для уровня 4 — скрейп /metrics)".into(),
+            );
+        }
+
         if !errors.is_empty() {
             return Err(errors.join("; "));
         }
@@ -297,6 +350,14 @@ impl AuthConfig {
                 skew,
                 digest,
             },
+            metrics: MetricsValidator {
+                // Проверено выше: при `None` мы бы уже вернули `Err`.
+                token: metrics_token
+                    .expect("metrics token present")
+                    .trim()
+                    .to_string()
+                    .into_bytes(),
+            },
         })
     }
 
@@ -306,6 +367,7 @@ impl AuthConfig {
             AuthLevel::Open => true,
             AuthLevel::ProxySecret => self.proxy.validate(headers),
             AuthLevel::Totp => self.totp.validate(headers, Utc::now().timestamp().max(0) as u64),
+            AuthLevel::MetricsToken => self.metrics.validate(headers),
         }
     }
 }
@@ -381,6 +443,7 @@ where
                 // TOTP, забытый заголовок у клиента). Уровень WARN: не сбой
                 // сервиса, но повод смотреть. Сам секрет/код НЕ логируем.
                 tracing::warn!(access_level = level.as_str(), "Отказ в доступе");
+                crate::metrics::record_auth_denied(level.as_str());
 
                 // Единый скупой ответ без деталей — как и на остальных ручках.
                 let (req, _payload) = req.into_parts();
@@ -416,6 +479,45 @@ mod tests {
             HeaderValue::from_str(value).unwrap(),
         );
         h
+    }
+
+    /// Валидатор уровня 4 с известным токеном.
+    fn metrics_validator() -> MetricsValidator {
+        MetricsValidator {
+            token: b"scrape-token".to_vec(),
+        }
+    }
+
+    #[test]
+    fn metrics_accepts_valid_bearer_token() {
+        let v = metrics_validator();
+        assert!(v.validate(&headers_with("Authorization", "Bearer scrape-token")));
+    }
+
+    #[test]
+    fn metrics_scheme_is_case_insensitive() {
+        // RFC 7235: имя схемы регистронезависимо.
+        let v = metrics_validator();
+        assert!(v.validate(&headers_with("Authorization", "bearer scrape-token")));
+        assert!(v.validate(&headers_with("Authorization", "BEARER scrape-token")));
+    }
+
+    #[test]
+    fn metrics_rejects_wrong_or_missing_token() {
+        let v = metrics_validator();
+        assert!(!v.validate(&HeaderMap::new()));
+        assert!(!v.validate(&headers_with("Authorization", "Bearer wrong-token")));
+        // Верный префикс токена не должен проходить (сравнение по полной длине).
+        assert!(!v.validate(&headers_with("Authorization", "Bearer scrape")));
+        assert!(!v.validate(&headers_with("Authorization", "Bearer ")));
+    }
+
+    #[test]
+    fn metrics_rejects_other_schemes_and_raw_token() {
+        let v = metrics_validator();
+        // Basic-схема и «голый» токен без схемы не принимаются.
+        assert!(!v.validate(&headers_with("Authorization", "Basic scrape-token")));
+        assert!(!v.validate(&headers_with("Authorization", "scrape-token")));
     }
 
     // --- HOTP: контрольные векторы RFC 4226 (Appendix D) ---
@@ -543,6 +645,7 @@ mod tests {
             "AUTH_PROXY_SECRET", "AUTH_PROXY_SECRET_HEADER", "AUTH_TOTP_SECRET",
             "AUTH_TOTP_SECRET_NEXT", "AUTH_TOTP_HEADER", "AUTH_TOTP_DIGITS",
             "AUTH_TOTP_STEP_SECONDS", "AUTH_TOTP_ALGORITHM", "AUTH_TOTP_SKEW_STEPS",
+            "AUTH_METRICS_TOKEN",
         ];
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in VARS {
@@ -581,13 +684,29 @@ mod tests {
     }
 
     #[test]
+    fn from_env_errors_when_only_metrics_token_missing() {
+        // Уровень 4 обязателен так же, как уровни 2 и 3: без токена сервис не
+        // стартует (fail-fast), чтобы `/metrics` не оказалась случайно открытой.
+        with_clean_auth_env(|| {
+            env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
+            env::set_var("AUTH_TOTP_SECRET", "MZXW6");
+            let Err(err) = AuthConfig::from_env() else {
+                panic!("ожидалась ошибка конфигурации");
+            };
+            assert!(err.contains("AUTH_METRICS_TOKEN"), "{err}");
+        });
+    }
+
+    #[test]
     fn from_env_ok_with_both_secrets() {
         with_clean_auth_env(|| {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             env::set_var("AUTH_TOTP_SECRET", "MZXW6"); // base32("foo")
+            env::set_var("AUTH_METRICS_TOKEN", "m3trics");
             let cfg = AuthConfig::from_env().expect("config должна собраться");
             assert_eq!(cfg.proxy.secret, b"s3cr3t");
             assert_eq!(cfg.totp.secrets, vec![b"foo".to_vec()]);
+            assert_eq!(cfg.metrics.token, b"m3trics");
         });
     }
 
@@ -609,6 +728,7 @@ mod tests {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             env::set_var("AUTH_TOTP_SECRET", "MZXW6");
             env::set_var("AUTH_TOTP_SECRET_NEXT", "MZXW6");
+            env::set_var("AUTH_METRICS_TOKEN", "m3trics");
             let cfg = AuthConfig::from_env().expect("config должна собраться");
             assert_eq!(cfg.totp.secrets.len(), 2);
         });
@@ -644,6 +764,9 @@ mod tests {
                     digits: 6,
                     skew: 1,
                     digest: MessageDigest::sha1(),
+                },
+                metrics: MetricsValidator {
+                    token: b"metrics-token".to_vec(),
                 },
             }
         }

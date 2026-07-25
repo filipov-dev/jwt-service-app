@@ -1,9 +1,11 @@
 //! HTTP-обработчики публичного API.
 //!
-//! Модуль содержит три эндпоинта:
+//! Модуль содержит эндпоинты:
 //! - `POST /tokens` — выпуск токена ([`create_token`]);
 //! - `POST /tokens/verify` — проверка токена ([`verify_token`]);
-//! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]).
+//! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]);
+//! - `GET /livez`, `GET /readyz` — пробы ([`livez`], [`readyz`]);
+//! - `GET /metrics` — метрики Prometheus ([`metrics`]).
 //!
 //! Обработчики намеренно тонкие: вся доменная логика вынесена в
 //! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
@@ -12,6 +14,7 @@
 use std::env;
 use actix_web::{web, HttpResponse, get, post, delete};
 use chrono::Utc;
+use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::{debug, error, info};
 use utoipa::path;
 
@@ -85,6 +88,7 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
         store,
     ).await {
         Ok(token) => {
+            crate::metrics::record_token_issued();
             Ok(HttpResponse::Ok().json(TokenResponse { token }))
         }
         Err(e) => {
@@ -152,8 +156,12 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
     match JwtManager::verify_token(&request.token, host_header, &request.audience, store).await {
-        Ok(v) => Ok(HttpResponse::Ok().json(v)),
+        Ok(v) => {
+            crate::metrics::record_token_verified(true);
+            Ok(HttpResponse::Ok().json(v))
+        }
         Err(e) => {
+            crate::metrics::record_token_verified(false);
             // Детали проверки наружу намеренно не раскрываем, чтобы не давать
             // подсказок атакующему — единый ответ на любую причину.
             //
@@ -201,7 +209,10 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
     store: web::Data<S>,
 ) -> Result<HttpResponse, Error> {
     match store.delete_jti(&jti).await {
-        Ok(_) => info!("Токен отозван"),
+        Ok(_) => {
+            crate::metrics::record_token_revoked();
+            info!("Токен отозван");
+        }
         Err(e) => {
             // Отказ хранилища — наша вина, ERROR.
             error!("Не удалось отозвать токен: {}", e);
@@ -209,6 +220,31 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
     };
 
     Ok(HttpResponse::NoContent().finish())
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses(
+        (status = 200, description = "Метрики в текстовом формате Prometheus", content_type = "text/plain")
+    )
+)]
+/// Отдаёт метрики в формате экспозиции Prometheus.
+///
+/// Уровень доступа 4: статический Bearer-токен (`AUTH_METRICS_TOKEN`) — его
+/// нативно умеют слать Prometheus (`authorization: {credentials_file}`), Zabbix
+/// `agent2` и OTel Collector, через который метрики забирает Monium.
+///
+/// Токен — не замена сетевой изоляции: ручку всё равно не стоит публиковать
+/// наружу, метрики раскрывают операционную картину (объём трафика, доли отказов,
+/// латентности зависимостей).
+///
+/// Роут регистрируется в `main.rs` (не через атрибут-макрос), потому что ручка
+/// оборачивается auth-middleware уровня 4.
+pub async fn metrics(handle: web::Data<PrometheusHandle>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(handle.render())
 }
 
 #[utoipa::path(
@@ -433,6 +469,39 @@ mod tests {
         let req = test::TestRequest::get().uri("/livez").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn metrics_returns_prometheus_exposition() {
+        // Локальный recorder: глобальный ставится один раз на процесс и в тестах
+        // недоступен (см. `metrics.rs`).
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::record_token_issued();
+        });
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(handle))
+                .route("/metrics", web::get().to(super::metrics)),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/plain"));
+
+        let body = test::read_body(resp).await;
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("jwt_tokens_issued_total"));
     }
 
     #[actix_web::test]
