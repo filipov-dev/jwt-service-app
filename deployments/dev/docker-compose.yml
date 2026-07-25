@@ -22,6 +22,8 @@ services:
       AUTH_PROXY_SECRET: dev-proxy-secret
       # Произвольный валидный base32-секрет для dev (замените в проде).
       AUTH_TOTP_SECRET: MRSWGYLSMUQGO33WNFXGO4ZAOBWGKYLSFVRW63LOMNXW2ZI
+      # Уровень 4: Bearer-токен для скрейпа /metrics (замените в проде).
+      AUTH_METRICS_TOKEN: dev-metrics-token
     depends_on:
       - redis
       - jwks-service-app

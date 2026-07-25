@@ -18,7 +18,9 @@ use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::info;
 use utoipa::{Modify, OpenApi};
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+};
 
 mod auth;
 mod error;
@@ -95,6 +97,18 @@ impl Modify for SecurityAddon {
                     "X-TOTP-Code",
                     "Уровень 3: текущий TOTP-код (RFC 6238) на общем секрете.",
                 ))),
+            );
+            components.add_security_scheme(
+                "metrics_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .description(Some(
+                            "Уровень 4: статический Bearer-токен для скрейпа /metrics \
+                             (AUTH_METRICS_TOKEN).",
+                        ))
+                        .build(),
+                ),
             );
         }
     }
@@ -253,6 +267,15 @@ async fn main() -> std::io::Result<()> {
                     .wrap(deny_cors())
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
             )
+            // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
+            // scope, иначе тот перехватил бы путь. Токен обязателен — без него
+            // сервис не стартует (см. `AuthConfig::from_env`).
+            .service(
+                web::resource("/metrics")
+                    .wrap(Auth::new(AuthLevel::MetricsToken, auth.clone()))
+                    .wrap(deny_cors())
+                    .route(web::get().to(metrics_handler)),
+            )
             // Уровень 1 (открыто): health-пробы и OpenAPI. Тот же middleware, но
             // валидатор `Open` пропускает всё. Регистрируется последним — scope с
             // пустым префиксом матчит любой путь, поэтому ресурсы токенов выше
@@ -263,10 +286,7 @@ async fn main() -> std::io::Result<()> {
                     .wrap(deny_cors())
                     .route("/api-docs/openapi.json", web::get().to(openapi_spec))
                     .service(livez)
-                    .service(readyz)
-                    // `/metrics` — тот же уровень 1: ручку скрейпит Prometheus/
-                    // Zabbix/Monium. Наружу её публиковать не нужно (см. `metrics`).
-                    .service(metrics_handler),
+                    .service(readyz),
             )
     })
         .bind((host, port))?

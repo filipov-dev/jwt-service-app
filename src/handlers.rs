@@ -231,11 +231,16 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
 )]
 /// Отдаёт метрики в формате экспозиции Prometheus.
 ///
-/// Уровень доступа 1 (без auth) — так ручку скрейпит Prometheus/Zabbix/Monium.
-/// **Наружу её публиковать не нужно**: обратный прокси должен оставить `/metrics`
-/// доступной только из внутренней сети (метрики раскрывают операционную картину —
-/// объём трафика, доли отказов, латентности зависимостей).
-#[get("/metrics")]
+/// Уровень доступа 4: статический Bearer-токен (`AUTH_METRICS_TOKEN`) — его
+/// нативно умеют слать Prometheus (`authorization: {credentials_file}`), Zabbix
+/// `agent2` и OTel Collector, через который метрики забирает Monium.
+///
+/// Токен — не замена сетевой изоляции: ручку всё равно не стоит публиковать
+/// наружу, метрики раскрывают операционную картину (объём трафика, доли отказов,
+/// латентности зависимостей).
+///
+/// Роут регистрируется в `main.rs` (не через атрибут-макрос), потому что ручка
+/// оборачивается auth-middleware уровня 4.
 pub async fn metrics(handle: web::Data<PrometheusHandle>) -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
@@ -479,7 +484,7 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(handle))
-                .service(super::metrics),
+                .route("/metrics", web::get().to(super::metrics)),
         )
         .await;
         let req = test::TestRequest::get().uri("/metrics").to_request();
