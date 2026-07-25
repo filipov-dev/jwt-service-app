@@ -103,8 +103,9 @@
 
 | Файл | Назначение |
 |------|-----------|
-| `main.rs` | Точка входа, конфиг HTTP-сервера, CORS, роуты (с уровнями доступа), OpenAPI (`ApiDoc`). |
+| `main.rs` | Точка входа, конфиг HTTP-сервера, логирование, CORS, роуты (с уровнями доступа), OpenAPI (`ApiDoc`). |
 | `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret и TOTP (RFC 6238). |
+| `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP). |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
 | `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
 | `jwt.rs` | `JwtManager` — фасад для генерации и проверки токенов. |
@@ -160,7 +161,8 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `TOKEN_JKU` | — (нет) | Если задан, кладётся в заголовок `jku` и проверяется при верификации. |
 | `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
 | `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |
-| `RUST_LOG` | — | Фильтр логов (`tracing-subscriber`, `EnvFilter`). |
+| `RUST_LOG` | — | Фильтр логов по уровням (`tracing-subscriber`, `EnvFilter`; дефолт `jwt_service_app=info`). |
+| `LOG_FORMAT` | `pretty` | Формат логов: `json` — построчный JSON (для сборщиков: Monium/ELK); иначе человекочитаемый `pretty` с ANSI. |
 | `AUTH_PROXY_SECRET` | — (**обязателен**) | Уровень 2: ожидаемый секрет заголовка. Без него сервис не стартует. |
 | `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Уровень 2: имя заголовка с секретом. |
 | `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
@@ -199,6 +201,12 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   требует наличия `jti`. Сохраняйте это поведение при изменениях.
 - Ошибки наружу отдаются скупо: многие обработчики возвращают пустые
   `500`/`401`/`422` без тела. Не считайте, что клиент получает детали.
+- **Логирование (`logging.rs`).** Каждый запрос оборачивается span'ом
+  `http_request` с `request_id` (заголовок `X-Request-Id`: берётся входящий, если
+  валиден, иначе генерируется UUID и возвращается в ответе). По завершении — одна
+  строка `request completed` с методом/путём/статусом/латентностью. **Не логируйте
+  заголовки и тело** — там секреты (`X-Proxy-Secret`, `X-TOTP-Code`) и токены.
+  Уровень доступа пишется в span из `auth.rs` (`Span::current().record`).
 - Комментарии в коде местами на русском — это норма для проекта, продолжайте
   в том же стиле, если правите соседний код.
 - Версия в `Cargo.toml` — это **триггер релиза**: пуш в `master` с изменением

@@ -56,6 +56,17 @@ pub enum AuthLevel {
     Totp,
 }
 
+impl AuthLevel {
+    /// Строковое имя уровня для логов/трейсинга (пишется в span запроса).
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthLevel::Open => "open",
+            AuthLevel::ProxySecret => "proxy_secret",
+            AuthLevel::Totp => "totp",
+        }
+    }
+}
+
 /// Читает `u64` из переменной окружения с откатом на `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
@@ -353,6 +364,10 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
+        // Пишем уровень доступа в span запроса (поле объявлено в `RequestLog`;
+        // если span'а нет — no-op, безопасно в юнит-тестах).
+        tracing::Span::current().record("access_level", self.level.as_str());
+
         let authorized = self.config.authorize(self.level, req.headers());
         let service = self.service.clone();
 
