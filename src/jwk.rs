@@ -61,12 +61,15 @@ impl JwkService {
     /// Получаем все ключи
     async fn public_keys(&self) -> Result<Jwks, JwkError> {
         let url = format!("{}/.well-known/jwks.json", self.url);
+        debug!("JWKS: запрашиваю публичные ключи ({})", url);
+
         let response = match self.client.get(&url)
             .send()
             .await {
             Ok(v) => v,
             Err(e) => {
-                error!("{}", e);
+                // Отказ внешней зависимости — ERROR.
+                error!("JWKS недоступен ({}): {}", url, e);
                 return Err(JwkError::BadConnection);
             }
         };
@@ -74,7 +77,7 @@ impl JwkService {
         match response.json().await {
             Ok(v) => Ok(v),
             Err(e) => {
-                error!("{}", e);
+                error!("JWKS вернул некорректный ответ ({}): {}", url, e);
                 Err(JwkError::BadResponse)
             }
         }
@@ -120,6 +123,8 @@ impl JwkService {
 
         let alg = if alg == "EdDSA" {  "Ed25519" } else { alg };
 
+        debug!("JWKS: запрашиваю приватный ключ (alg={})", alg);
+
         let response = match self.client.post(&url)
             .json(&json!({
                 "alg": alg
@@ -128,7 +133,7 @@ impl JwkService {
             .await {
             Ok(v) => v,
             Err(e) => {
-                error!("{}", e);
+                error!("JWKS недоступен при запросе приватного ключа: {}", e);
                 return Err(JwkError::BadConnection);
             }
         };
@@ -136,7 +141,7 @@ impl JwkService {
         match response.json().await {
             Ok(v) => Ok(v),
             Err(e) => {
-                error!("{}", e);
+                error!("JWKS вернул некорректный приватный ключ: {}", e);
                 Err(JwkError::BadResponse)
             }
         }

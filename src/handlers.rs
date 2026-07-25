@@ -12,7 +12,7 @@
 use std::env;
 use actix_web::{web, HttpResponse, get, post, delete};
 use chrono::Utc;
-use tracing::error;
+use tracing::{debug, error, info};
 use utoipa::path;
 
 use crate::jwt::JwtManager;
@@ -88,15 +88,19 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
             Ok(HttpResponse::Ok().json(TokenResponse { token }))
         }
         Err(e) => {
-            error!("Не удалось выпустить токен: {}", e);
-
-            // Внутреннюю причину не раскрываем: `UnprocessableEntity` → 422 с
-            // осмысленным сообщением, всё остальное → 500 с обобщённым текстом.
+            // Уровень по вине: некорректный запрос клиента (422) — DEBUG,
+            // отказ зависимости/внутренний сбой (500) — ERROR.
             match e {
-                JwtError::UnprocessableEntity => Err(Error::Unprocessable(
-                    "Invalid token request parameters".into(),
-                )),
-                _ => Err(Error::Internal(e.to_string())),
+                JwtError::UnprocessableEntity => {
+                    debug!("Некорректные параметры запроса токена: {}", e);
+                    Err(Error::Unprocessable(
+                        "Invalid token request parameters".into(),
+                    ))
+                }
+                _ => {
+                    error!("Не удалось выпустить токен: {}", e);
+                    Err(Error::Internal(e.to_string()))
+                }
             }
         }
     }
@@ -152,7 +156,11 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
         Err(e) => {
             // Детали проверки наружу намеренно не раскрываем, чтобы не давать
             // подсказок атакующему — единый ответ на любую причину.
-            error!("Проверка токена не удалась: {}", e);
+            //
+            // Уровень DEBUG: протухший/отозванный/подделанный токен — штатное
+            // событие публичной ручки, а не сбой сервиса. Иначе любой такой
+            // запрос поднимал бы ERROR-алерты в проде.
+            debug!("Проверка токена не удалась: {}", e);
             Err(Error::Unauthorized("Invalid or expired token".into()))
         }
     }
@@ -193,9 +201,10 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
     store: web::Data<S>,
 ) -> Result<HttpResponse, Error> {
     match store.delete_jti(&jti).await {
-        Ok(_) => (),
+        Ok(_) => info!("Токен отозван"),
         Err(e) => {
-            error!("{}", e);
+            // Отказ хранилища — наша вина, ERROR.
+            error!("Не удалось отозвать токен: {}", e);
         }
     };
 

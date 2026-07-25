@@ -17,7 +17,6 @@ use std::rc::Rc;
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::info;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use utoipa::{Modify, OpenApi};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 
@@ -25,6 +24,7 @@ mod auth;
 mod error;
 mod handlers;
 mod key;
+mod logging;
 mod rate_limit;
 mod redis;
 mod models;
@@ -32,6 +32,7 @@ mod jwk;
 mod jwt;
 
 use crate::auth::{Auth, AuthConfig, AuthLevel};
+use crate::logging::{init_subscriber, RequestLog};
 use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::handlers::{
     create_token_impl, verify_token_impl, revoke_token_impl, livez, readyz,
@@ -123,7 +124,8 @@ pub async fn openapi_spec() -> impl Responder {
 ///
 /// Порядок действий:
 /// 1. Читает алгоритм подписи из `TOKEN_ALGORITHM` (по умолчанию `RS256`).
-/// 2. Настраивает `tracing`-логирование (pretty, с фильтром из окружения).
+/// 2. Настраивает `tracing`-логирование (формат из `LOG_FORMAT`, фильтр из
+///    `RUST_LOG`; см. [`logging::init_subscriber`]).
 /// 3. Читает `HOST`/`PORT` для привязки.
 /// 4. Создаёт Redis-клиент и менеджер ключей (падает с паникой, если Redis
 ///    недоступен на старте).
@@ -142,15 +144,8 @@ async fn main() -> std::io::Result<()> {
     let algorithm = env::var("TOKEN_ALGORITHM")
         .unwrap_or("RS256".into());
 
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("jwt_service_app=info".parse().unwrap()))
-        .with_ansi(true)
-        .pretty()
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    // Логирование: формат (`LOG_FORMAT=json|pretty`) и фильтр уровней (`RUST_LOG`).
+    init_subscriber();
 
     let host = env::var("HOST")
         .unwrap_or("127.0.0.1".into());
@@ -215,6 +210,9 @@ async fn main() -> std::io::Result<()> {
         let auth = Rc::new(auth_config.clone());
 
         App::new()
+            // Per-request логирование — самый внешний слой: span с `request_id`
+            // покрывает auth/rate-limit/CORS и обработчик (см. `logging.rs`).
+            .wrap(RequestLog)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
             // Уровень 3 (TOTP): выпуск и отзыв токенов. Глобальный cap — внутри auth

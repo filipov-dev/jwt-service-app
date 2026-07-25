@@ -8,7 +8,7 @@
 use std::env;
 use redis::{AsyncCommands, RedisError};
 use redis::aio::MultiplexedConnection;
-use tracing::log::error;
+use tracing::error;
 use crate::models::jwt::{JtiError, JtiStore};
 
 /// Клиент Redis. Дёшево клонируется; соединения берутся по требованию
@@ -40,7 +40,8 @@ impl RedisClient {
         match self.client.get_multiplexed_async_connection().await {
             Ok(c) => { Ok(c) }
             Err(e) => {
-                error!("{}", e);
+                // Отказ хранилища — ERROR.
+                error!("Redis: не удалось открыть соединение: {}", e);
                 Err(JtiError::BadConnection)
             }
         }
@@ -60,7 +61,7 @@ impl RedisClient {
         match redis::cmd("PING").query_async::<String>(&mut conn).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                error!("{}", e);
+                error!("Redis: PING не выполнился: {}", e);
                 Err(JtiError::WrongOperation)
             }
         }
