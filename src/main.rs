@@ -114,8 +114,9 @@ pub async fn openapi_spec() -> impl Responder {
 /// 3. Читает `HOST`/`PORT` для привязки.
 /// 4. Создаёт Redis-клиент и менеджер ключей (падает с паникой, если Redis
 ///    недоступен на старте).
-/// 5. Поднимает `HttpServer` с CORS (открыт для всех источников) и регистрирует
-///    маршруты, включая выдачу OpenAPI.
+/// 5. Поднимает `HttpServer`, навешивает CORS точечно только на публичную
+///    ручку `/tokens/verify` (см. ниже) и регистрирует маршруты, включая
+///    выдачу OpenAPI.
 ///
 /// # Panics
 ///
@@ -166,19 +167,41 @@ async fn main() -> std::io::Result<()> {
         limiter.spawn_cleanup();
     }
 
+    // Список origin'ов для CORS. Пусто/не задано → `allow_any_origin` (текущее
+    // поведение, чтобы не ломать деплои); задано → только перечисленные origin'ы.
+    let cors_origins: Vec<String> = env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     info!("Starting server on {}:{}", host, port);
 
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allowed_methods(vec!["GET", "POST", "DELETE"])
-            .allow_any_header()
-            .max_age(3600);
+        // ВАЖНО: CORS навешивается ТОЧЕЧНО только на `/tokens/verify` (см. ниже) —
+        // это ЕДИНСТВЕННАЯ публичная ручка, которую имеет смысл дёргать из
+        // браузера. Остальные ручки (health, OpenAPI, выпуск/отзыв токенов) —
+        // internal, CORS им не нужен. При добавлении новых ручек НЕ расширяйте на
+        // них CORS без явного решения: под CORS должна оставаться ровно одна
+        // публичная ручка.
+        let cors = {
+            let base = Cors::default()
+                .allowed_methods(vec!["POST"])
+                .allow_any_header()
+                .max_age(3600);
+            if cors_origins.is_empty() {
+                base.allow_any_origin()
+            } else {
+                cors_origins
+                    .iter()
+                    .fold(base, |cors, origin| cors.allowed_origin(origin))
+            }
+        };
 
         let auth = Rc::new(auth_config.clone());
 
         App::new()
-            .wrap(cors)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
             // Уровень 3 (TOTP): выпуск и отзыв токенов. Глобальный cap — внутри auth
@@ -192,12 +215,15 @@ async fn main() -> std::io::Result<()> {
             )
             // Уровень 2 (proxy-secret): проверка токена. Регистрируется до
             // `/tokens/{jti}`, чтобы путь `/tokens/verify` не поглотился шаблоном.
-            // Per-IP лимит — снаружи auth (последний `.wrap` — внешний), чтобы флуд
-            // отсекался ещё до проверки proxy-secret.
+            // Per-IP лимит — снаружи auth (`.wrap` ниже — внешнее), чтобы флуд
+            // отсекался ещё до проверки proxy-secret. CORS — самый внешний слой:
+            // preflight-запрос `OPTIONS` (без proxy-secret) должен обработаться
+            // CORS'ом раньше, чем его отклонят auth или rate-limit.
             .service(
                 web::resource("/tokens/verify")
                     .wrap(Auth::new(AuthLevel::ProxySecret, auth.clone()))
                     .wrap(RateLimit::per_ip(verify_limiter.clone()))
+                    .wrap(cors)
                     .route(web::post().to(verify_token_impl::<RedisClient>)),
             )
             .service(

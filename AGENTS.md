@@ -134,8 +134,11 @@ PR, при пуше в `master` и еженедельно по расписан�
 блокирует пайплайн. Осознанно игнорируемые advisory заносятся в
 `.cargo/audit.toml` с комментарием-причиной.
 
-Тестов в репозитории **нет**. Если добавляете фичу — добавляйте тесты
-(`cargo test`); dev-образ уже включает `cargo-tarpaulin` для покрытия.
+Тесты — инлайн `#[cfg(test)]` модули в исходниках (в `auth.rs`, `rate_limit.rs`,
+`key.rs`, `handlers.rs`, `error.rs`, `models/jwt.rs`). Запуск — `cargo test`; в CI
+(`.github/workflows/ci.yml`) прогоняется `cargo test --verbose` на каждый PR и
+пуш. dev-образ включает `cargo-tarpaulin` для покрытия. Добавляете фичу —
+добавляйте тесты рядом, в том же стиле.
 
 ### Docker Compose (dev)
 
@@ -163,7 +166,7 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
 | `AUTH_TOTP_SECRET_NEXT` | — (нет) | Уровень 3: второй активный секрет на время ротации (base32). |
 | `AUTH_TOTP_HEADER` | `X-TOTP-Code` | Уровень 3: имя заголовка с TOTP-кодом. |
-| `AUTH_TOTP_STEP_SECONDS` | `30` | Уровень 3: шаг окна TOTP. |
+| `AUTH_TOTP_STEP_SECONDS` | `30` | Уровень 3: шаг окна TOTP. Для более узкого окна replay задайте меньшее значение (напр. `5`) — но тогда часы клиента и сервера должны быть синхронизированы по NTP; при рассинхроне поднимайте `AUTH_TOTP_SKEW_STEPS`. Дефолт 30 не меняем в коде: это общий контракт с клиентами. |
 | `AUTH_TOTP_DIGITS` | `6` | Уровень 3: число знаков кода (6–8). |
 | `AUTH_TOTP_ALGORITHM` | `SHA1` | Уровень 3: хеш HMAC (`SHA1`/`SHA256`/`SHA512`). |
 | `AUTH_TOTP_SKEW_STEPS` | `1` | Уровень 3: допуск по окнам в обе стороны (рассинхрон часов). |
@@ -175,6 +178,7 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `RATE_LIMIT_INTERNAL_BURST` | `100` | Ёмкость всплеска глобального cap. |
 | `RATE_LIMIT_TRUSTED_PROXIES` | — (нет) | Список доверенных прокси (IP/CIDR через запятую). Только за ними доверяется `X-Forwarded-For`; пусто → ключ = peer-адрес. |
 | `RATE_LIMIT_FORWARDED_HEADER` | `X-Forwarded-For` | Имя заголовка с IP клиента (разбор — список справа налево). |
+| `CORS_ALLOWED_ORIGINS` | — (нет) | Разрешённые origin'ы CORS для `POST /tokens/verify` (список через запятую). Пусто → `allow_any_origin`. Применяется только к этой ручке. |
 
 `iss` токена берётся **из заголовка `Host` запроса**, а не из конфига.
 
@@ -201,7 +205,15 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   `Cargo.toml` запускает `release.yml`, который создаёт GitHub Release и
   дёргает `docker.yml` для сборки/публикации образов (`filipov/jwt-service-app`,
   `ghcr.io/filipov-dev/jwt-service-app`). Меняйте версию осознанно.
-- CORS открыт настежь (`allow_any_origin`) — это преднамеренно для сервиса.
+- **CORS навешивается точечно только на `POST /tokens/verify`** — это
+  единственная публичная ручка, которую имеет смысл дёргать из браузера.
+  Остальные ручки (health, OpenAPI, выпуск/отзыв токенов) — internal и CORS не
+  имеют. **Правило: под CORS должна оставаться ровно одна публичная ручка** —
+  при добавлении новых ручек не расширяйте на них CORS без явного решения.
+  Разрешённые origin'ы задаёт `CORS_ALLOWED_ORIGINS` (список через запятую);
+  если пусто — `allow_any_origin` (дефолт, обратная совместимость). CORS —
+  самый внешний слой на ручке, чтобы preflight `OPTIONS` обрабатывался до auth и
+  rate-limit.
 
 ## Правила для агентов
 

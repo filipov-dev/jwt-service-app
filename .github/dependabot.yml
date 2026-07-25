@@ -1,0 +1,20 @@
+# Автообновление зависимостей. Cargo — раз в неделю, GitHub Actions — раз в неделю.
+# Уязвимости отдельно отслеживает `cargo audit` (см. audit.yml); dependabot же
+# держит зависимости и версии actions свежими.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
