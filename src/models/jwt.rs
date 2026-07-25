@@ -24,7 +24,7 @@ use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 
@@ -133,7 +133,8 @@ impl TokenClaims {
                 let max = env_u64("TOKEN_TTL_MAX_SECONDS", 86400);
 
                 if requested < min || requested > max {
-                    error!(
+                    // Вина клиента (отдаём 422) — не повод для ERROR в проде.
+                    debug!(
                         "Requested ttl {} out of bounds [{}, {}]",
                         requested, min, max
                     );
@@ -147,7 +148,9 @@ impl TokenClaims {
                 .parse::<u64>() {
                     Ok(v) => { v }
                     Err(e) => {
-                        error!("{}", e);
+                        // Некорректная конфигурация сервиса — деградация, не отказ
+                        // зависимости.
+                        warn!("TOKEN_EXPIRATION_SECONDS: {}", e);
                         return Err(JwtError::UnprocessableEntity)
                     }
                 },
@@ -193,10 +196,12 @@ impl TokenClaims {
     /// [`JwtError::Broken`] — сегмент не является корректным base64url, не
     /// декодируется в UTF-8 или не парсится как JSON claims.
     pub fn from_base64(str: String) -> Result<Self, JwtError> {
+        // Битый токен присылает клиент — это DEBUG, а не ERROR: в проде такие
+        // события нормальны и не должны поднимать алерты.
         let bytes = match BASE64_URL_SAFE_NO_PAD.decode(str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("{}", e);
+                debug!("Claims: base64url не декодируется: {}", e);
                 return Err(JwtError::Broken)
             },
         };
@@ -204,7 +209,7 @@ impl TokenClaims {
         let json = match String::from_utf8(bytes) {
             Ok(string) => string,
             Err(e) => {
-                error!("{}", e);
+                debug!("Claims: не UTF-8: {}", e);
                 return Err(JwtError::Broken)
             },
         };
@@ -212,7 +217,7 @@ impl TokenClaims {
         match serde_json::from_str(&json) {
             Ok(jwt) => Ok(jwt),
             Err(e) => {
-                error!("{}", e);
+                debug!("Claims: не разбирается как JSON: {}", e);
                 Err(JwtError::Broken)
             },
         }
@@ -317,18 +322,19 @@ impl TokenHeaders {
     /// [`JwtError::Broken`] — сегмент не является корректным base64url, не
     /// декодируется в UTF-8 или не парсится как JSON-заголовок.
     pub fn from_base64(str: String) -> Result<Self, JwtError> {
+        // Как и у claims: битый заголовок — вина клиента, уровень DEBUG.
         let bytes = BASE64_URL_SAFE_NO_PAD.decode(str).map_err(|e| {
-            error!("{}", e);
+            debug!("Header: base64url не декодируется: {}", e);
             JwtError::Broken
         })?;
 
         let json = String::from_utf8(bytes).map_err(|e| {
-            error!("{}", e);
+            debug!("Header: не UTF-8: {}", e);
             JwtError::Broken
         })?;
 
         serde_json::from_str(&json).map_err(|e| {
-            error!("{}", e);
+            debug!("Header: не разбирается как JSON: {}", e);
             JwtError::Broken
         })
     }
@@ -466,7 +472,9 @@ impl JsonWebToken<Public> {
         let key = match KeyManager::get_public_key(headers.kid.as_str()).await {
             Ok(key) => key,
             Err(e) => {
-                error!("{}", e);
+                // Причину (недоступность JWKS и т.п.) уже залогировал `key.rs` на
+                // своём уровне — здесь только исход проверки, без дубля ERROR.
+                debug!("Публичный ключ по kid не получен: {}", e);
                 return Err(JwtError::BadSignature);
             }
         };
@@ -474,7 +482,7 @@ impl JsonWebToken<Public> {
         let signature_decoded = match URL_SAFE_NO_PAD.decode(signature_segment) {
             Ok(decoded) => decoded,
             Err(e) => {
-                error!("{}", e);
+                debug!("Подпись: base64url не декодируется: {}", e);
                 return Err(JwtError::Broken);
             }
         };
@@ -499,7 +507,8 @@ impl JsonWebToken<Public> {
                     format!("{}.{}", headers_segment, claims_segment).as_bytes(),
                 )
                 .map_err(|e| {
-                    error!("{}", e);
+                    // Чаще всего — некорректные байты подписи от клиента.
+                    debug!("Проверка подписи не выполнена: {}", e);
                     JwtError::BadSignature
                 })?
         };

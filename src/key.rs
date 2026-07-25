@@ -20,7 +20,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{Id, PKey, Private, Public};
 use openssl::rsa::Rsa;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::jwk::JwkService;
 use crate::models::{Jwk, JwkData};
@@ -73,8 +73,9 @@ impl KeyManager {
     /// # Errors
     /// [`KeyError::NotFound`] — сервис ключей недоступен или вернул некорректный ответ.
     pub async fn check_jwks(&self) -> Result<(), KeyError> {
+        // Причину уже залогировал `jwk.rs` на уровне ERROR — здесь без дубля.
         self.service.health_check().await.map_err(|e| {
-            error!("{}", e);
+            debug!("Проверка JWKS не прошла: {}", e);
             KeyError::NotFound
         })
     }
@@ -90,7 +91,8 @@ impl KeyManager {
         ).await {
             Ok(v) => { v }
             Err(e) => {
-                error!("{}", e);
+                // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
+                debug!("Приватный ключ не получен: {}", e);
                 return Err(KeyError::NotFound)
             }
         };
@@ -107,7 +109,8 @@ impl KeyManager {
         let jwk = match service.public_key(kid).await {
             Ok(v) => { v }
             Err(e) => {
-                error!("{}", e);
+                // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
+                debug!("Публичный ключ по kid не получен: {}", e);
                 return Err(KeyError::NotFound)
             }
         };

@@ -370,12 +370,18 @@ where
 
         let authorized = self.config.authorize(self.level, req.headers());
         let service = self.service.clone();
+        let level = self.level;
 
         Box::pin(async move {
             if authorized {
                 let res = service.call(req).await?;
                 Ok(res.map_into_left_body())
             } else {
+                // Отказ доступа — сигнал безопасности (подбор секрета, неверный
+                // TOTP, забытый заголовок у клиента). Уровень WARN: не сбой
+                // сервиса, но повод смотреть. Сам секрет/код НЕ логируем.
+                tracing::warn!(access_level = level.as_str(), "Отказ в доступе");
+
                 // Единый скупой ответ без деталей — как и на остальных ручках.
                 let (req, _payload) = req.into_parts();
                 let response = HttpResponse::Unauthorized()

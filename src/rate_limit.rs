@@ -482,6 +482,10 @@ where
                     Ok(res.map_into_left_body())
                 }
                 Err(retry_after) => {
+                    // Срабатывание лимита — не сбой сервиса, но повод смотреть
+                    // (флуд, зациклившийся клиент, заниженный лимит) → WARN.
+                    warn!(retry_after, "Превышен лимит частоты запросов");
+
                     // Скупой ответ без деталей — как и на остальных ручках.
                     let (req, _payload) = req.into_parts();
                     let response = HttpResponse::TooManyRequests()
