@@ -183,7 +183,9 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `LOG_FORMAT` | `pretty` | Формат логов: `json` — построчный JSON (для сборщиков: Monium/ELK); иначе человекочитаемый `pretty` с ANSI. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL OTLP-коллектора (напр. `http://otel-collector:4318`); к нему добавляется `/v1/traces`. Не задан — трейсинг выключен. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (нет) | **Полный** URL для трейсов; используется как есть и имеет приоритет над базовым. |
-| `OTEL_SERVICE_NAME` | `jwt-service-app` | Имя сервиса в трейсах (атрибут `service.name`). |
+| `OTEL_SERVICE_NAME` | `jwt-service-app` | Имя сервиса в трейсах и логах (атрибут `service.name`). |
+| `OTEL_LOGS_ENABLED` | `false` | Слать ли **логи** по OTLP. Отдельный флаг: включение трейсов логи не включает. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — (нет) | **Полный** URL для логов; используется как есть и имеет приоритет над базовым. |
 | `GLITCHTIP_DSN` | — (нет) | DSN GlitchTip. Не задан — интеграция выключена. Принимается и `SENTRY_DSN`. **Секрет, не коммитить.** |
 | `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | Доля span-ов в Performance (0.0–1.0). `0.0` — performance выключен. |
 | `GLITCHTIP_ENABLE_LOGS` | `false` | Слать ли структурные логи в канал Logs. |
@@ -255,8 +257,14 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   `tracing`-шины, что и логи, поэтому span `http_request` и вложенные
   `jwks.*`/`redis.*` попадают и в логи, и в трейсы.
   - **Путь сигнала обязателен.** `OTEL_EXPORTER_OTLP_ENDPOINT` — это **базовый**
-    URL, к которому добавляется `/v1/traces`. Если послать базовый URL как есть,
-    коллектор ответит `404` и трейсы будут **молча теряться** (см. `traces_endpoint`).
+    URL, к которому добавляется путь сигнала (`/v1/traces`, `/v1/logs`). Если
+    послать базовый URL как есть, коллектор ответит `404`, а данные будут **молча
+    теряться** (см. `signal_endpoint`).
+  - **Логи по OTLP — отдельный сигнал и отдельный флаг** (`OTEL_LOGS_ENABLED`).
+    Включение трейсов логи **не** включает: они и так идут в stdout, и там, где их
+    собирает агент с контейнерного лога, отправка по сети была бы дублированием.
+    Логи, записанные внутри запроса, несут `Trace ID`/`Span ID` — в бэкенде можно
+    переходить от трассы к её логам и обратно.
   - **Клиент экспортёра — блокирующий, намеренно.** Batch-процессор работает на
     своём выделенном потоке без tokio-рантайма; асинхронный HTTP-клиент там
     паникует («there is no reactor running»). Основной async-рантайм это не задевает.
