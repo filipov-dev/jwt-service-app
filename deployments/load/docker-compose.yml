@@ -1,0 +1,56 @@
+# Изолированный стенд зависимостей для нагрузочного теста (JWT-34).
+#
+# ЗАЧЕМ ОТДЕЛЬНЫЙ ФАЙЛ, а не `deployments/dev`:
+#
+# 1. Имя проекта. Compose по умолчанию берёт имя проекта из имени папки, а папка
+#    `dev` встречается у многих сервисов сразу — контейнеры разных стендов
+#    оказываются в одном проекте `dev` и «угоняют» друг друга (compose считает
+#    чужой контейнер своим сервисом и пересоздаёт его). Здесь имя проекта
+#    закреплено директивой `name:` и от папки не зависит.
+# 2. Порты. Dev-стенд публикует 6379/5432/8082 — они обычно уже заняты другими
+#    локальными стендами. Здесь порты смещены и конфликтовать им не с чем.
+# 3. Состав. Для замера нужны только зависимости: сам сервис запускается с хоста
+#    release-сборкой (dev-контейнер собран под hot-reload и для замеров не годится
+#    — debug-профиль искажает цифры в разы).
+name: jwt-load
+
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "16379:6379"
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: jwk_db
+    ports:
+      - "15432:5432"
+    # Данные намеренно без volume: стенд одноразовый, между прогонами его
+    # положено поднимать с нуля.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d jwk_db"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  jwks-service-app:
+    image: filipov/jwks-service-app:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8082
+      DATABASE_URL: postgres://user:password@postgres:5432/jwk_db
+      RUN_MIGRATIONS_ON_START: 1
+      PRIVATE_KEY_EXPIRATION_SECONDS: 86400
+      KEY_EXPIRATION_SECONDS: 172800
+    ports:
+      - "18082:8082"
+    # Именно `service_healthy`, а не простое `depends_on`: сервис ключей при
+    # старте применяет миграции и падает с паникой, если Postgres ещё не принимает
+    # соединения. Обычный `depends_on` дожидается только запуска контейнера.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure

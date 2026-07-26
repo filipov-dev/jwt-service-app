@@ -175,6 +175,23 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 запускается с `tail -f /dev/null` — предполагается hot-reload через
 `cargo watch` внутри контейнера (dev-образ ставит `cargo-watch`).
 
+> **Осторожно с именем проекта.** Compose берёт имя проекта из имени папки, то
+> есть `dev`, — а папка `deployments/dev` есть у многих сервисов сразу. Запуск
+> `docker compose up` из такой папки может подхватить контейнеры чужого стенда
+> как свои и пересоздать их. Если рядом крутятся другие проекты, задавайте имя
+> явно: `docker compose -p jwt-dev up`.
+
+### Нагрузочный тест
+
+`deployments/load/` — замер `POST /tokens/verify` (k6 в контейнере, ставить на
+хост ничего не нужно). Там же изолированный стенд зависимостей со своим именем
+проекта и смещёнными портами, инструкция в
+[`deployments/load/README.md`](deployments/load/README.md) и зафиксированный
+baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
+
+Мерить только release-сборкой и обязательно с `RATE_LIMIT_VERIFY_ENABLED=false`:
+с дефолтным per-IP лимитом (10 rps) прогон меряет rate limiter, а не сервис.
+
 ## Конфигурация (переменные окружения)
 
 | Переменная | Дефолт | Назначение |

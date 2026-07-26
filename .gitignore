@@ -4,3 +4,8 @@
 # Внутренние заметки для агентов; каноничная копия — на Вики
 # (homepage/projects/jwt-service-app/agents-internal)
 AGENTS_INTERNAL.md
+
+# Артефакты нагрузочного прогона: выпущенные токены и выгрузка k6.
+# Токены — настоящие подписанные JWT, им в репозитории не место.
+/deployments/load/tokens.json
+/deployments/load/summary.json
