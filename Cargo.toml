@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2021"
 
 [dependencies]
@@ -42,10 +42,14 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # `internal-logs` — чтобы ошибки самого экспортёра были видны в логе.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
+    "logs",
     "http-proto",
     "reqwest-blocking-client",
     "internal-logs",
 ] }
+# Мост `tracing` → OTLP-логи (сигнал logs). Включается отдельным флагом, чтобы не
+# дублировать stdout-логи там, где их уже собирают агентом.
+opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
 tracing-opentelemetry = "0.33"
 # GlitchTip (Sentry-совместимый): ошибки/паники, performance-транзакции и

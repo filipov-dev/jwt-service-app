@@ -51,6 +51,7 @@ use std::time::Instant;
 use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::Error;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -102,6 +103,13 @@ pub fn init_subscriber() -> Telemetry {
     let (provider, otel_status) = crate::tracing_otel::init_tracer_provider();
     let otel_layer = provider.as_ref().map(crate::tracing_otel::layer);
 
+    // Логи по OTLP — отдельный сигнал и отдельный флаг: там, где stdout уже
+    // собирает агент, дублировать их по сети не нужно.
+    let (logger_provider, otel_logs_status) = crate::tracing_otel::init_logger_provider();
+    let otel_logs_layer = logger_provider
+        .as_ref()
+        .map(crate::tracing_otel::logs_layer);
+
     // GlitchTip: клиент ставится до subscriber'а, слой раскладывает события по
     // каналам (issues / logs / performance) — см. `sentry_glitchtip`.
     let (sentry_guard, sentry_status) = crate::sentry_glitchtip::init();
@@ -113,15 +121,18 @@ pub fn init_subscriber() -> Telemetry {
         .with(filter)
         .with(fmt_layer)
         .with(otel_layer)
+        .with(otel_logs_layer)
         .with(sentry_layer)
         .init();
 
     // Статусы печатаем только теперь: до `.init()` писать было некуда.
     otel_status.log();
+    otel_logs_status.log();
     sentry_status.log();
 
     Telemetry {
         tracer_provider: provider,
+        logger_provider,
         sentry_guard,
     }
 }
@@ -133,6 +144,9 @@ pub fn init_subscriber() -> Telemetry {
 /// через [`crate::tracing_otel::shutdown`].
 pub struct Telemetry {
     pub tracer_provider: Option<SdkTracerProvider>,
+    /// Провайдер OTLP-логов; завершается через
+    /// [`crate::tracing_otel::shutdown_logs`], иначе последние логи не досылаются.
+    pub logger_provider: Option<SdkLoggerProvider>,
     /// Читать это поле не нужно — оно живёт ради RAII: события GlitchTip
     /// досылаются при уничтожении guard'а. Уроните его раньше времени — потеряете
     /// накопленные события.

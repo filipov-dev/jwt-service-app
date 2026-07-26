@@ -321,6 +321,9 @@ async fn main() -> std::io::Result<()> {
     if let Some(provider) = telemetry.tracer_provider {
         crate::tracing_otel::shutdown(provider);
     }
+    if let Some(provider) = telemetry.logger_provider {
+        crate::tracing_otel::shutdown_logs(provider);
+    }
 
     Ok(())
 }
