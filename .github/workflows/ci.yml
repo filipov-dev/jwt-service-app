@@ -4,6 +4,15 @@ on:
   pull_request:
     branches:
       - master
+  # Мерж-коммиты и прямые пуши в master тоже должны проверяться: без этого
+  # ветка по умолчанию остаётся единственным местом, где код не проходит CI.
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   checks:
@@ -18,13 +27,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Форматирование проверяется первым: шаг быстрый и не требует сборки,
+      # поэтому даёт обратную связь раньше остальных.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` делает предупреждения ошибками: без него шаг оставался
+      # зелёным при любых замечаниях и ничего не гарантировал.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --verbose
