@@ -12,7 +12,6 @@
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use serde_json::json;
 
 pub mod jwt;
 

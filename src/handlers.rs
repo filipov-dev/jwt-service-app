@@ -11,12 +11,9 @@
 //! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
 //! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации.
 
-use std::env;
 use actix_web::{web, HttpResponse, get, post, delete};
-use chrono::Utc;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::{debug, error, info};
-use utoipa::path;
 
 use crate::jwt::JwtManager;
 use crate::key::KeyManager;
@@ -80,7 +77,7 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
     match JwtManager::generate_token(
-        &host_header,
+        host_header,
         &req.sub,
         &req.aud,
         req.ttl,
@@ -327,7 +324,9 @@ mod tests {
     use actix_web::{test, App};
     use actix_web::http::StatusCode;
     use actix_web::http::header::HeaderValue;
+    use chrono::Utc;
     use std::collections::HashSet;
+    use std::env;
     use std::sync::Mutex;
     use parking_lot::Mutex as PlMutex;
     use openssl::pkey::{PKey, Private};

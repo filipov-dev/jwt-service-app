@@ -10,7 +10,6 @@
 //! `RwLock`, чтобы переиспользовать один ключ между запросами.
 
 use parking_lot::RwLock;
-use serde_json::json;
 use std::sync::Arc;
 use base64::{Engine};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,7 +19,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{Id, PKey, Private, Public};
 use openssl::rsa::Rsa;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::jwk::JwkService;
 use crate::models::{Jwk, JwkData};
@@ -35,8 +34,6 @@ pub const SUPPORTED_ALGORITHMS: &[&str] = &["RS256", "RS384", "RS512", "ES256", 
 pub enum KeyError {
     #[error("Key not found")]
     NotFound,
-    #[error("Key generation failed")]
-    GenerationFailed,
     #[error("Key is invalid")]
     InvalidKey,
     #[error("Key is unsupported")]
@@ -138,7 +135,7 @@ impl KeyManager {
             }
         };
 
-        let private_key = match PKey::private_key_from_pkcs8(&*new_private_key) {
+        let private_key = match PKey::private_key_from_pkcs8(&new_private_key) {
             Ok(v) => { v }
             Err(e) => {
                 error!("{}", e);

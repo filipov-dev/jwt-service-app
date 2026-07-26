@@ -13,7 +13,7 @@ use serde_json::json;
 use thiserror::Error;
 use std::time::Instant;
 
-use tracing::{error, debug, info};
+use tracing::{error, debug};
 
 use crate::metrics::record_jwks_request;
 use crate::tracing_otel::inject_context;

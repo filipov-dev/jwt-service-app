@@ -18,13 +18,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
-use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 
@@ -43,8 +42,6 @@ pub enum JtiError {
     BadConnection,
     #[error("Wrong operation")]
     WrongOperation,
-    #[error("Internal")]
-    Internal,
 }
 
 /// Хранилище идентификаторов токенов (`jti`).
@@ -300,10 +297,7 @@ impl TokenHeaders {
     /// `alg` берётся из `TOKEN_ALGORITHM` (по умолчанию `RS256`), `jku` —
     /// из необязательной `TOKEN_JKU`, `kid` передаётся из менеджера ключей.
     pub fn create_new(kid: String) -> Self {
-        let jku = match env::var("TOKEN_JKU") {
-            Ok(v) => { Some(v) }
-            Err(_) => { None }
-        };
+        let jku = env::var("TOKEN_JKU").ok();
 
         let alg = env::var("TOKEN_ALGORITHM")
             .unwrap_or("RS256".into());
@@ -344,10 +338,7 @@ impl TokenHeaders {
     /// Требует, чтобы `alg` был из [`SUPPORTED_ALGORITHMS`], `typ` был `"JWT"`,
     /// а `jku` совпадал с текущей конфигурацией (`TOKEN_JKU`).
     pub fn is_verify(&self) -> bool {
-        let jku = match env::var("TOKEN_JKU") {
-            Ok(v) => { Some(v) }
-            Err(_) => { None }
-        };
+        let jku = env::var("TOKEN_JKU").ok();
 
         SUPPORTED_ALGORITHMS.contains(&self.alg.as_str()) &&
             self.jku == jku &&

@@ -31,6 +31,9 @@ pub enum Error {
     Internal(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    // Ни один обработчик пока не отдаёт 404, но вариант достраивает маппинг
+    // ошибок в статусы (400/401/404/422) и покрыт тестом `error_response`.
+    #[allow(dead_code)]
     #[error("Not Found: {0}")]
     NotFound(String),
 }
