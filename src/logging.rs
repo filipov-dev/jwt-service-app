@@ -73,17 +73,19 @@ const REQUEST_ID_MAX_LEN: usize = 128;
 /// - фильтр уровней (`RUST_LOG`, дефолт `jwt_service_app=info`);
 /// - вывод логов (`LOG_FORMAT`: `json` → построчный JSON, иначе `pretty`);
 /// - опциональный слой OpenTelemetry, если задан `OTEL_EXPORTER_OTLP_ENDPOINT`
-///   (см. [`crate::tracing_otel`]).
+///   (см. [`crate::tracing_otel`]);
+/// - опциональный слой GlitchTip, если задан `GLITCHTIP_DSN`
+///   (см. [`crate::sentry_glitchtip`]).
 ///
-/// Возвращает провайдер трейсов, если экспорт включён: его нужно держать живым и
-/// завершить через [`crate::tracing_otel::shutdown`] при остановке сервиса, иначе
-/// последние span'ы не досылаются.
+/// Возвращает [`Telemetry`] — живые ресурсы (провайдер трейсов и guard GlitchTip),
+/// которые нужно держать до конца работы процесса, иначе последние span'ы и
+/// события не досылаются.
 ///
 /// # Panics
 ///
 /// Паникует, если глобальный subscriber уже установлен (вызывать один раз на
 /// старте — fail-fast).
-pub fn init_subscriber() -> Option<SdkTracerProvider> {
+pub fn init_subscriber() -> Telemetry {
     // ВАЖНО: дефолт применяется, только если `RUST_LOG` не задан. Нельзя делать
     // `from_default_env().add_directive("jwt_service_app=info")` — добавленная
     // директива перекрывает одноимённый таргет из `RUST_LOG`, и уровень крейта
@@ -100,16 +102,42 @@ pub fn init_subscriber() -> Option<SdkTracerProvider> {
     let (provider, otel_status) = crate::tracing_otel::init_tracer_provider();
     let otel_layer = provider.as_ref().map(crate::tracing_otel::layer);
 
+    // GlitchTip: клиент ставится до subscriber'а, слой раскладывает события по
+    // каналам (issues / logs / performance) — см. `sentry_glitchtip`.
+    let (sentry_guard, sentry_status) = crate::sentry_glitchtip::init();
+    let sentry_layer = sentry_guard
+        .as_ref()
+        .map(|_| crate::sentry_glitchtip::layer());
+
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .with(otel_layer)
+        .with(sentry_layer)
         .init();
 
-    // Статус трейсинга печатаем только теперь: до `.init()` писать было некуда.
+    // Статусы печатаем только теперь: до `.init()` писать было некуда.
     otel_status.log();
+    sentry_status.log();
 
-    provider
+    Telemetry {
+        tracer_provider: provider,
+        sentry_guard,
+    }
+}
+
+/// Живые ресурсы телеметрии, которые нужно держать до конца работы процесса.
+///
+/// `sentry_guard` досылает накопленные события при уничтожении, поэтому его
+/// нельзя ронять сразу после инициализации; `tracer_provider` завершается явно
+/// через [`crate::tracing_otel::shutdown`].
+pub struct Telemetry {
+    pub tracer_provider: Option<SdkTracerProvider>,
+    /// Читать это поле не нужно — оно живёт ради RAII: события GlitchTip
+    /// досылаются при уничтожении guard'а. Уроните его раньше времени — потеряете
+    /// накопленные события.
+    #[allow(dead_code)]
+    pub sentry_guard: Option<sentry::ClientInitGuard>,
 }
 
 /// Проверяет, что пришедший извне `X-Request-Id` безопасен для повторного
