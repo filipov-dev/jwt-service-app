@@ -18,11 +18,17 @@
 //! присутствующий в зависимостях. Конфигурация целиком из окружения
 //! ([`AuthConfig::from_env`]).
 //!
-//! **Защиты обязательны.** Секреты уровней 2, 3 и 4 (`AUTH_PROXY_SECRET`,
-//! `AUTH_TOTP_SECRET`, `AUTH_METRICS_TOKEN`) — обязательны: если хотя бы один не
+//! **Защиты основных ручек обязательны.** Секреты уровней 2 и 3
+//! (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) — обязательны: если хотя бы один не
 //! задан, [`AuthConfig::from_env`] возвращает ошибку и сервис **не стартует**
-//! (fail-fast на старте, как и с прочей критичной конфигурацией). Отключить
-//! уровень нельзя.
+//! (fail-fast на старте, как и с прочей критичной конфигурацией). Отключить эти
+//! уровни нельзя.
+//!
+//! **Уровень 4 — исключение: он опционален.** Метрики вспомогательны, и из-за их
+//! конфигурации не должен лежать весь сервис выдачи токенов. Без
+//! `AUTH_METRICS_TOKEN` сервис стартует, а роут `/metrics` не регистрируется
+//! вовсе — путь отдаёт `404`. Отсутствие токена при этом **никогда не означает
+//! открытый доступ**: [`MetricsValidator`] в таком состоянии отклоняет всё.
 //!
 //! ## Замечание о replay (уровень 3)
 //!
@@ -178,10 +184,16 @@ impl ProxyValidator {
 }
 
 /// Валидатор уровня 4: статический Bearer-токен для скрейпа метрик.
+///
+/// Токен **опционален**, в отличие от секретов уровней 2 и 3: без него сервис
+/// стартует, а роут `/metrics` просто не регистрируется (см. `main.rs`) и путь
+/// отдаёт штатный `404`. Валидатор при этом всё равно отвечает `false` на любой
+/// запрос — страховка на случай, если роут зарегистрируют мимо этой проверки:
+/// **отсутствие секрета никогда не должно означать открытый доступ**.
 #[derive(Clone)]
 pub struct MetricsValidator {
-    /// Ожидаемый токен (без префикса `Bearer `).
-    token: Vec<u8>,
+    /// Ожидаемый токен (без префикса `Bearer `); `None` — уровень недоступен.
+    token: Option<Vec<u8>>,
 }
 
 impl MetricsValidator {
@@ -190,6 +202,11 @@ impl MetricsValidator {
     /// Схема (`Bearer`) сравнивается регистронезависимо — так требует RFC 7235;
     /// сам токен — constant-time (`openssl::memcmp::eq` поверх проверки длины).
     pub fn validate(&self, headers: &HeaderMap) -> bool {
+        // Токен не настроен — уровень недоступен, пропускать нечего и некого.
+        let Some(expected) = self.token.as_deref() else {
+            return false;
+        };
+
         let Some(value) = headers.get("Authorization") else {
             return false;
         };
@@ -205,7 +222,7 @@ impl MetricsValidator {
         }
 
         let provided = provided.trim().as_bytes();
-        provided.len() == self.token.len() && openssl::memcmp::eq(provided, &self.token)
+        provided.len() == expected.len() && openssl::memcmp::eq(provided, expected)
     }
 }
 
@@ -319,13 +336,15 @@ impl AuthConfig {
             errors.push("AUTH_TOTP_SECRET не задан (обязателен для уровня 3 — TOTP)".into());
         }
 
-        // --- Уровень 4: токен метрик (обязателен) ---
-        let metrics_token = env::var("AUTH_METRICS_TOKEN").ok().filter(|s| !s.trim().is_empty());
-        if metrics_token.is_none() {
-            errors.push(
-                "AUTH_METRICS_TOKEN не задан (обязателен для уровня 4 — скрейп /metrics)".into(),
-            );
-        }
+        // --- Уровень 4: токен метрик (ОПЦИОНАЛЕН) ---
+        // В отличие от уровней 2 и 3, отсутствие токена не фатально: метрики —
+        // вспомогательная функция, и из-за её конфигурации не должен лежать весь
+        // сервис выдачи токенов. Без токена роут `/metrics` не регистрируется
+        // (см. `main.rs`) и путь отдаёт `404`.
+        let metrics_token = env::var("AUTH_METRICS_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         if !errors.is_empty() {
             return Err(errors.join("; "));
@@ -351,17 +370,20 @@ impl AuthConfig {
                 digest,
             },
             metrics: MetricsValidator {
-                // Проверено выше: при `None` мы бы уже вернули `Err`.
-                token: metrics_token
-                    .expect("metrics token present")
-                    .trim()
-                    .to_string()
-                    .into_bytes(),
+                token: metrics_token.map(String::into_bytes),
             },
         })
     }
 
     /// Разрешает или отклоняет запрос для заданного уровня по его заголовкам.
+    /// Доступен ли уровень 4 (задан ли токен метрик).
+    ///
+    /// По нему `main.rs` решает, регистрировать ли роут `/metrics`: без токена
+    /// ручку не публикуем вовсе, и путь отдаёт `404`.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics.token.is_some()
+    }
+
     pub fn authorize(&self, level: AuthLevel, headers: &HeaderMap) -> bool {
         match level {
             AuthLevel::Open => true,
@@ -484,7 +506,7 @@ mod tests {
     /// Валидатор уровня 4 с известным токеном.
     fn metrics_validator() -> MetricsValidator {
         MetricsValidator {
-            token: b"scrape-token".to_vec(),
+            token: Some(b"scrape-token".to_vec()),
         }
     }
 
@@ -684,17 +706,25 @@ mod tests {
     }
 
     #[test]
-    fn from_env_errors_when_only_metrics_token_missing() {
-        // Уровень 4 обязателен так же, как уровни 2 и 3: без токена сервис не
-        // стартует (fail-fast), чтобы `/metrics` не оказалась случайно открытой.
+    fn from_env_ok_without_metrics_token() {
+        // Уровень 4 ОПЦИОНАЛЕН, в отличие от уровней 2 и 3: без токена сервис
+        // стартует, просто уровень недоступен (роут `/metrics` не публикуется).
         with_clean_auth_env(|| {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             env::set_var("AUTH_TOTP_SECRET", "MZXW6");
-            let Err(err) = AuthConfig::from_env() else {
-                panic!("ожидалась ошибка конфигурации");
-            };
-            assert!(err.contains("AUTH_METRICS_TOKEN"), "{err}");
+            let cfg = AuthConfig::from_env().expect("config должна собраться без токена метрик");
+            assert!(!cfg.metrics_enabled(), "уровень 4 должен быть недоступен");
         });
+    }
+
+    #[test]
+    fn metrics_validator_rejects_everything_without_token() {
+        // Отсутствие секрета НИКОГДА не означает открытый доступ: валидатор
+        // отклоняет всё, даже если роут окажется зарегистрирован.
+        let v = MetricsValidator { token: None };
+        assert!(!v.validate(&HeaderMap::new()));
+        assert!(!v.validate(&headers_with("Authorization", "Bearer whatever")));
+        assert!(!v.validate(&headers_with("Authorization", "Bearer ")));
     }
 
     #[test]
@@ -706,7 +736,7 @@ mod tests {
             let cfg = AuthConfig::from_env().expect("config должна собраться");
             assert_eq!(cfg.proxy.secret, b"s3cr3t");
             assert_eq!(cfg.totp.secrets, vec![b"foo".to_vec()]);
-            assert_eq!(cfg.metrics.token, b"m3trics");
+            assert_eq!(cfg.metrics.token.as_deref(), Some(b"m3trics".as_slice()));
         });
     }
 
@@ -766,7 +796,7 @@ mod tests {
                     digest: MessageDigest::sha1(),
                 },
                 metrics: MetricsValidator {
-                    token: b"metrics-token".to_vec(),
+                    token: Some(b"metrics-token".to_vec()),
                 },
             }
         }
