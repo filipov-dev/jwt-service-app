@@ -189,6 +189,15 @@ async fn main() -> std::io::Result<()> {
     let auth_config = AuthConfig::from_env()
         .unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
 
+    // Уровень 4 опционален (в отличие от 2 и 3): без токена метрики просто не
+    // публикуются. Предупреждаем, чтобы это не выглядело как «метрики сломались».
+    if !auth_config.metrics_enabled() {
+        tracing::warn!(
+            "AUTH_METRICS_TOKEN не задан: уровень 4 недоступен, ручка GET /metrics \
+             не опубликована (ответ 404). Задайте токен, чтобы включить скрейп метрик."
+        );
+    }
+
     // Конфигурация rate limiting. В отличие от auth, ошибки не фатальны —
     // деградируем к безопасным дефолтам с предупреждением (см. `rate_limit.rs`).
     // Лимитеры строятся один раз и общие на все worker-потоки (внутри `Arc`).
@@ -273,14 +282,23 @@ async fn main() -> std::io::Result<()> {
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
             )
             // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
-            // scope, иначе тот перехватил бы путь. Токен обязателен — без него
-            // сервис не стартует (см. `AuthConfig::from_env`).
-            .service(
-                web::resource("/metrics")
-                    .wrap(Auth::new(AuthLevel::MetricsToken, auth.clone()))
-                    .wrap(deny_cors())
-                    .route(web::get().to(metrics_handler)),
-            )
+            // scope, иначе тот перехватил бы путь.
+            //
+            // Роут появляется ТОЛЬКО если задан `AUTH_METRICS_TOKEN`. Не задан —
+            // ручку не публикуем вовсе, и путь отдаёт штатный `404` (его подхватит
+            // открытый scope ниже). Отдавать `401` не стали намеренно: так наружу
+            // не виден даже факт существования ручки. `configure` нужен потому, что
+            // обычная цепочка `.service()` не позволяет регистрировать условно.
+            .configure(|cfg| {
+                if auth.metrics_enabled() {
+                    cfg.service(
+                        web::resource("/metrics")
+                            .wrap(Auth::new(AuthLevel::MetricsToken, auth.clone()))
+                            .wrap(deny_cors())
+                            .route(web::get().to(metrics_handler)),
+                    );
+                }
+            })
             // Уровень 1 (открыто): health-пробы и OpenAPI. Тот же middleware, но
             // валидатор `Open` пропускает всё. Регистрируется последним — scope с
             // пустым префиксом матчит любой путь, поэтому ресурсы токенов выше

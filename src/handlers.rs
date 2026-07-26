@@ -240,7 +240,8 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
 /// латентности зависимостей).
 ///
 /// Роут регистрируется в `main.rs` (не через атрибут-макрос), потому что ручка
-/// оборачивается auth-middleware уровня 4.
+/// оборачивается auth-middleware уровня 4 и публикуется **условно**: без
+/// `AUTH_METRICS_TOKEN` её нет вовсе и путь отдаёт `404`.
 pub async fn metrics(handle: web::Data<PrometheusHandle>) -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
@@ -469,6 +470,25 @@ mod tests {
         let req = test::TestRequest::get().uri("/livez").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn metrics_route_absent_gives_404() {
+        // Без токена роут не регистрируется (см. `main.rs`) — путь должен вести
+        // себя как любой несуществующий: 404, а не 401. Так наружу не виден даже
+        // факт существования ручки.
+        let app = test::init_service(App::new().service(livez)).await;
+
+        for req in [
+            test::TestRequest::get().uri("/metrics").to_request(),
+            test::TestRequest::get()
+                .uri("/metrics")
+                .insert_header(("Authorization", "Bearer anything"))
+                .to_request(),
+        ] {
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[actix_web::test]

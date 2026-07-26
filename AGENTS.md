@@ -46,7 +46,7 @@
 | **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет (пропускает всё) |
 | **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от прокси, сравнение constant-time |
 | **3 — TOTP** | `POST /tokens`, `DELETE /tokens/{jti}` | TOTP (RFC 6238), internal app-to-app |
-| **4 — Bearer-токен** | `GET /metrics` | статический токен в `Authorization: Bearer`, сравнение constant-time |
+| **4 — Bearer-токен** | `GET /metrics` (только если задан токен) | статический токен в `Authorization: Bearer`, сравнение constant-time |
 
 - **Уровень 2** — заголовок `X-Proxy-Secret` (имя настраивается), который ставит
   **только** обратный прокси. Сравнение с `AUTH_PROXY_SECRET` — constant-time
@@ -65,10 +65,17 @@
   `X-Proxy-Secret` по контракту затирается прокси. Bearer нативно поддержан
   Prometheus (`authorization: {credentials_file}`), Zabbix `agent2` и OTel
   Collector, через который метрики забирает Monium.
-- **Защиты обязательны.** Секреты уровней 2, 3 и 4 (`AUTH_PROXY_SECRET`,
-  `AUTH_TOTP_SECRET`, `AUTH_METRICS_TOKEN`) — обязательны: без них
+- **Защиты основных ручек обязательны.** Секреты уровней 2 и 3
+  (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) — обязательны: без них
   `AuthConfig::from_env` возвращает ошибку и сервис **не стартует** (fail-fast на
-  старте, как и с прочей критичной конфигурацией). Отключить уровень нельзя.
+  старте, как и с прочей критичной конфигурацией). Отключить эти уровни нельзя.
+- **Уровень 4 — исключение, он опционален.** Метрики вспомогательны, и из-за их
+  конфигурации не должен лежать весь сервис выдачи токенов. Без
+  `AUTH_METRICS_TOKEN` сервис стартует (с предупреждением в лог), а роут
+  `/metrics` **не регистрируется вовсе** — путь отдаёт штатный `404`.
+  `401` намеренно не отдаём: так наружу не виден даже факт существования ручки.
+  Отсутствие токена при этом **никогда не означает открытый доступ** —
+  `MetricsValidator` в таком состоянии отклоняет любой запрос.
 - **Replay (уровень 3):** TOTP-код переигрываем в пределах окна действия. Мы
   **осознанно не** закрываем это на сервисе — валидатор остаётся stateless (без
   обращения к Redis), полагаясь на короткий шаг окна и внутренний (app-to-app)
@@ -198,7 +205,7 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 | `RATE_LIMIT_INTERNAL_BURST` | `100` | Ёмкость всплеска глобального cap. |
 | `RATE_LIMIT_TRUSTED_PROXIES` | — (нет) | Список доверенных прокси (IP/CIDR через запятую). Только за ними доверяется `X-Forwarded-For`; пусто → ключ = peer-адрес. |
 | `RATE_LIMIT_FORWARDED_HEADER` | `X-Forwarded-For` | Имя заголовка с IP клиента (разбор — список справа налево). |
-| `AUTH_METRICS_TOKEN` | — (**обязателен**) | Уровень 4: статический Bearer-токен для скрейпа `GET /metrics`. Без него сервис не стартует. |
+| `AUTH_METRICS_TOKEN` | — (нет) | Уровень 4: статический Bearer-токен для скрейпа `GET /metrics`. Не задан → ручка не публикуется (`404`), сервис стартует. |
 | `CORS_ALLOWED_ORIGINS` | — (нет) | Разрешённые origin'ы CORS для `POST /tokens/verify` (список через запятую). Пусто → `allow_any_origin`. Применяется только к этой ручке. |
 
 `iss` токена берётся **из заголовка `Host` запроса**, а не из конфига.
@@ -280,7 +287,7 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   - Performance по умолчанию **выключен** (`0.0`): транзакции стоят объёма,
     включайте осознанно.
 - **Метрики (`metrics.rs`).** Экспозиция Prometheus на `GET /metrics` — **уровень
-  доступа 4** (Bearer-токен `AUTH_METRICS_TOKEN`). Ручку скрейпят Prometheus/Yandex
+  доступа 4** (Bearer-токен `AUTH_METRICS_TOKEN`; без него ручки нет — `404`). Ручку скрейпят Prometheus/Yandex
   Managed Prometheus, Zabbix (`agent2` с prometheus-плагином) и Monium (через
   Prometheus-совместимость); отдельный экспортёр под Zabbix не нужен. Пример
   конфигурации скрейпа:
