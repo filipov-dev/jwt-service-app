@@ -11,8 +11,8 @@ use redis::RedisError;
 use reqwest::Error as ReqwestError;
 use thiserror::Error;
 
-use crate::models::ErrorResponse;
 use crate::models::jwt::JwtError;
+use crate::models::ErrorResponse;
 
 /// Ошибка уровня приложения, преобразуемая в HTTP-ответ.
 #[derive(Debug, Error)]
@@ -31,6 +31,9 @@ pub enum Error {
     Internal(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    // Ни один обработчик пока не отдаёт 404, но вариант достраивает маппинг
+    // ошибок в статусы (400/401/404/422) и покрыт тестом `error_response`.
+    #[allow(dead_code)]
     #[error("Not Found: {0}")]
     NotFound(String),
 }
@@ -87,16 +90,17 @@ mod tests {
 
     #[actix_web::test]
     async fn unprocessable_maps_to_422_with_message() {
-        let (status, body) = render(Error::Unprocessable("Invalid token request parameters".into()))
-            .await;
+        let (status, body) = render(Error::Unprocessable(
+            "Invalid token request parameters".into(),
+        ))
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.error, "Invalid token request parameters");
     }
 
     #[actix_web::test]
     async fn unauthorized_maps_to_401_with_message() {
-        let (status, body) =
-            render(Error::Unauthorized("Invalid or expired token".into())).await;
+        let (status, body) = render(Error::Unauthorized("Invalid or expired token".into())).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body.error, "Invalid or expired token");
     }

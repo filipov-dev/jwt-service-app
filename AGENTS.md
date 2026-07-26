@@ -157,6 +157,11 @@ PR, при пуше в `master` и еженедельно по расписан�
 блокирует пайплайн. Осознанно игнорируемые advisory заносятся в
 `.cargo/audit.toml` с комментарием-причиной.
 
+**CI строгий** (`.github/workflows/ci.yml`, на PR и на пуш в `master`):
+`cargo fmt --all -- --check` и `cargo clippy --all-targets -- -D warnings`.
+Любое предупреждение линтера и любое расхождение с `rustfmt` роняют пайплайн,
+поэтому прогоняйте `cargo fmt` перед коммитом, а не после ревью.
+
 Тесты — инлайн `#[cfg(test)]` модули в исходниках (в `auth.rs`, `rate_limit.rs`,
 `key.rs`, `handlers.rs`, `error.rs`, `models/jwt.rs`). Запуск — `cargo test`; в CI
 (`.github/workflows/ci.yml`) прогоняется `cargo test --verbose` на каждый PR и

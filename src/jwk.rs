@@ -7,17 +7,17 @@
 //!
 //! Базовый URL берётся из `JWKS_SERVICE_URL`.
 
-use std::env;
 use reqwest::Client;
 use serde_json::json;
-use thiserror::Error;
+use std::env;
 use std::time::Instant;
+use thiserror::Error;
 
-use tracing::{error, debug, info};
+use tracing::{debug, error};
 
 use crate::metrics::record_jwks_request;
-use crate::tracing_otel::inject_context;
 use crate::models::{Jwk, JwkData, Jwks};
+use crate::tracing_otel::inject_context;
 
 /// Ошибки взаимодействия с сервисом ключей.
 #[derive(Error, Debug)]
@@ -42,8 +42,7 @@ impl JwkService {
     /// Создаёт клиент; базовый URL берётся из `JWKS_SERVICE_URL`
     /// (по умолчанию `http://jwks-service-app:8080`).
     pub fn new() -> Self {
-        let url = env::var("JWKS_SERVICE_URL")
-            .unwrap_or("http://jwks-service-app:8080".into());
+        let url = env::var("JWKS_SERVICE_URL").unwrap_or("http://jwks-service-app:8080".into());
 
         Self {
             client: Client::new(),
@@ -71,9 +70,7 @@ impl JwkService {
         let started = Instant::now();
 
         // Пробрасываем трейс-контекст: обращение к JWKS попадёт в ту же трассу.
-        let response = match inject_context(self.client.get(&url))
-            .send()
-            .await {
+        let response = match inject_context(self.client.get(&url)).send().await {
             Ok(v) => v,
             Err(e) => {
                 // Отказ внешней зависимости — ERROR.
@@ -122,8 +119,8 @@ impl JwkService {
     /// если ключа с таким `id` нет (или `id` пуст).
     pub async fn private_key(&self, id: &str, alg: &str) -> Result<JwkData, JwkError> {
         match self.get_key(id).await {
-            Ok(v) => { Ok(v) }
-            _ => { self.create_key(alg).await }
+            Ok(v) => Ok(v),
+            _ => self.create_key(alg).await,
         }
     }
 
@@ -134,7 +131,7 @@ impl JwkService {
     async fn create_key(&self, alg: &str) -> Result<JwkData, JwkError> {
         let url = format!("{}/jwks", self.url);
 
-        let alg = if alg == "EdDSA" {  "Ed25519" } else { alg };
+        let alg = if alg == "EdDSA" { "Ed25519" } else { alg };
 
         debug!("JWKS: запрашиваю приватный ключ (alg={})", alg);
         let started = Instant::now();
@@ -144,7 +141,8 @@ impl JwkService {
                 "alg": alg
             }))
             .send()
-            .await {
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 error!("JWKS недоступен при запросе приватного ключа: {}", e);

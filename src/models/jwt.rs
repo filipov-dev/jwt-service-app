@@ -12,21 +12,20 @@
 //!
 //! Кодирование сегментов — base64url без паддинга, как того требует JWS.
 
-use std::env;
+use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 use actix_web::web::Data;
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{Duration, Utc};
-use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
+use std::env;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
-use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 
 /// Читает `u64` из переменной окружения, откатываясь на `default` при её
 /// отсутствии или неразборчивом значении.
@@ -43,8 +42,6 @@ pub enum JtiError {
     BadConnection,
     #[error("Wrong operation")]
     WrongOperation,
-    #[error("Internal")]
-    Internal,
 }
 
 /// Хранилище идентификаторов токенов (`jti`).
@@ -52,7 +49,10 @@ pub enum JtiError {
 /// Абстрагирует бэкенд (в проекте — Redis) от доменной логики. Наличие `jti` в
 /// хранилище означает, что токен «активен»: при выпуске `jti` записывается с
 /// TTL, при отзыве — удаляется, при проверке — проверяется на существование.
-pub trait JtiStore where Self: Sized {
+pub trait JtiStore
+where
+    Self: Sized,
+{
     /// Сохраняет `jti` со временем жизни `ttl` (в секундах).
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError>;
     /// Возвращает `true`, если `jti` присутствует (токен не отозван и не истёк).
@@ -145,15 +145,16 @@ impl TokenClaims {
             }
             None => match env::var("TOKEN_EXPIRATION_SECONDS")
                 .unwrap_or("3600".into())
-                .parse::<u64>() {
-                    Ok(v) => { v }
-                    Err(e) => {
-                        // Некорректная конфигурация сервиса — деградация, не отказ
-                        // зависимости.
-                        warn!("TOKEN_EXPIRATION_SECONDS: {}", e);
-                        return Err(JwtError::UnprocessableEntity)
-                    }
-                },
+                .parse::<u64>()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Некорректная конфигурация сервиса — деградация, не отказ
+                    // зависимости.
+                    warn!("TOKEN_EXPIRATION_SECONDS: {}", e);
+                    return Err(JwtError::UnprocessableEntity);
+                }
+            },
         };
 
         let Some(first_audience) = audience.first() else {
@@ -168,10 +169,13 @@ impl TokenClaims {
         // Fail-fast: если `jti` не записался в хранилище, токен выпускать нельзя —
         // иначе его последующая проверка провалится (jti отсутствует → считается
         // отозванным). Пробрасываем ошибку наверх, обработчик вернёт 500.
-        store.store_jti(&jti, expiration_seconds).await.map_err(|e| {
-            error!("JTI Store: {}", e);
-            JwtError::StoreError
-        })?;
+        store
+            .store_jti(&jti, expiration_seconds)
+            .await
+            .map_err(|e| {
+                error!("JTI Store: {}", e);
+                JwtError::StoreError
+            })?;
 
         let jwt = Self {
             iss: issuer.to_string(),
@@ -202,16 +206,16 @@ impl TokenClaims {
             Ok(bytes) => bytes,
             Err(e) => {
                 debug!("Claims: base64url не декодируется: {}", e);
-                return Err(JwtError::Broken)
-            },
+                return Err(JwtError::Broken);
+            }
         };
 
         let json = match String::from_utf8(bytes) {
             Ok(string) => string,
             Err(e) => {
                 debug!("Claims: не UTF-8: {}", e);
-                return Err(JwtError::Broken)
-            },
+                return Err(JwtError::Broken);
+            }
         };
 
         match serde_json::from_str(&json) {
@@ -219,7 +223,7 @@ impl TokenClaims {
             Err(e) => {
                 debug!("Claims: не разбирается как JSON: {}", e);
                 Err(JwtError::Broken)
-            },
+            }
         }
     }
 
@@ -240,11 +244,11 @@ impl TokenClaims {
     ) -> bool {
         let now = Utc::now().timestamp() as usize;
 
-        let claims_valid = self.iss == issuer &&
-            self.aud.contains(&audience.to_owned()) &&
-            self.nbf <= now &&
-            self.iat <= now &&
-            self.exp > now;
+        let claims_valid = self.iss == issuer
+            && self.aud.contains(&audience.to_owned())
+            && self.nbf <= now
+            && self.iat <= now
+            && self.exp > now;
 
         if !claims_valid {
             return false;
@@ -300,13 +304,9 @@ impl TokenHeaders {
     /// `alg` берётся из `TOKEN_ALGORITHM` (по умолчанию `RS256`), `jku` —
     /// из необязательной `TOKEN_JKU`, `kid` передаётся из менеджера ключей.
     pub fn create_new(kid: String) -> Self {
-        let jku = match env::var("TOKEN_JKU") {
-            Ok(v) => { Some(v) }
-            Err(_) => { None }
-        };
+        let jku = env::var("TOKEN_JKU").ok();
 
-        let alg = env::var("TOKEN_ALGORITHM")
-            .unwrap_or("RS256".into());
+        let alg = env::var("TOKEN_ALGORITHM").unwrap_or("RS256".into());
 
         Self {
             alg,
@@ -344,14 +344,9 @@ impl TokenHeaders {
     /// Требует, чтобы `alg` был из [`SUPPORTED_ALGORITHMS`], `typ` был `"JWT"`,
     /// а `jku` совпадал с текущей конфигурацией (`TOKEN_JKU`).
     pub fn is_verify(&self) -> bool {
-        let jku = match env::var("TOKEN_JKU") {
-            Ok(v) => { Some(v) }
-            Err(_) => { None }
-        };
+        let jku = env::var("TOKEN_JKU").ok();
 
-        SUPPORTED_ALGORITHMS.contains(&self.alg.as_str()) &&
-            self.jku == jku &&
-            self.typ == "JWT"
+        SUPPORTED_ALGORITHMS.contains(&self.alg.as_str()) && self.jku == jku && self.typ == "JWT"
     }
 
     /// Сериализует заголовок в JSON-строку.
@@ -542,12 +537,12 @@ mod tests {
     //! корректность подписи, которую ставит [`JsonWebToken::to_string`].
 
     use super::*;
-    use openssl::pkey::Id;
-    use openssl::rsa::Rsa;
     use openssl::ec::{EcGroup, EcKey};
     use openssl::nid::Nid;
-    use std::collections::HashSet;
+    use openssl::pkey::Id;
+    use openssl::rsa::Rsa;
     use parking_lot::Mutex;
+    use std::collections::HashSet;
 
     /// In-memory реализация [`JtiStore`] для тестов.
     struct MockStore {
@@ -556,7 +551,9 @@ mod tests {
 
     impl MockStore {
         fn new() -> Self {
-            Self { jtis: Mutex::new(HashSet::new()) }
+            Self {
+                jtis: Mutex::new(HashSet::new()),
+            }
         }
 
         fn insert(&self, jti: &str) {
@@ -791,8 +788,7 @@ mod tests {
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
-        let result =
-            TokenClaims::create_new("issuer", "subject", &audience, Some(0), store).await;
+        let result = TokenClaims::create_new("issuer", "subject", &audience, Some(0), store).await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 
@@ -813,8 +809,7 @@ mod tests {
         let store = Data::new(FailingStore);
         let audience = vec!["api1".to_string()];
 
-        let result =
-            TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
+        let result = TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
         assert!(matches!(result, Err(JwtError::StoreError)));
     }
 
@@ -884,9 +879,11 @@ mod tests {
             }
             "EdDSA" => {
                 let private = PKey::generate_ed25519().unwrap();
-                let public =
-                    PKey::public_key_from_raw_bytes(&private.raw_public_key().unwrap(), Id::ED25519)
-                        .unwrap();
+                let public = PKey::public_key_from_raw_bytes(
+                    &private.raw_public_key().unwrap(),
+                    Id::ED25519,
+                )
+                .unwrap();
                 (private, public)
             }
             other => panic!("нет генератора ключа для alg {other} в тесте"),
@@ -923,7 +920,9 @@ mod tests {
         }
         .unwrap();
 
-        verifier.verify_oneshot(&signature, signed.as_bytes()).unwrap()
+        verifier
+            .verify_oneshot(&signature, signed.as_bytes())
+            .unwrap()
     }
 
     /// Round-trip выпуск→проверка для дефолтного `RS256` (регресс на JWT-13:

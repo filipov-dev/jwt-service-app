@@ -11,19 +11,18 @@
 //! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
 //! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации.
 
-use std::env;
-use actix_web::{web, HttpResponse, get, post, delete};
-use chrono::Utc;
+use actix_web::{delete, get, post, web, HttpResponse};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::{debug, error, info};
-use utoipa::path;
 
+use crate::error::*;
 use crate::jwt::JwtManager;
 use crate::key::KeyManager;
-use crate::redis::RedisClient;
-use crate::error::*;
-use crate::models::{ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse, TokenVerifyRequest};
 use crate::models::jwt::{JtiStore, JwtError};
+use crate::models::{
+    ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse, TokenVerifyRequest,
+};
+use crate::redis::RedisClient;
 
 #[utoipa::path(
     post,
@@ -74,19 +73,14 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
     keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let host_header = host.headers().get("Host")
+    let host_header = host
+        .headers()
+        .get("Host")
         .ok_or(Error::Validation("Missing Host header".into()))?
         .to_str()
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
-    match JwtManager::generate_token(
-        &host_header,
-        &req.sub,
-        &req.aud,
-        req.ttl,
-        &keys,
-        store,
-    ).await {
+    match JwtManager::generate_token(host_header, &req.sub, &req.aud, req.ttl, &keys, store).await {
         Ok(token) => {
             crate::metrics::record_token_issued();
             Ok(HttpResponse::Ok().json(TokenResponse { token }))
@@ -150,7 +144,9 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
     store: web::Data<S>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let host_header = host.headers().get("Host")
+    let host_header = host
+        .headers()
+        .get("Host")
         .ok_or(Error::Validation("Missing Host header".into()))?
         .to_str()
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
@@ -279,15 +275,17 @@ pub async fn livez() -> HttpResponse {
 /// доступны, иначе `503 Service Unavailable`. В обоих случаях тело —
 /// [`ReadinessResponse`] с детализацией по каждой зависимости.
 #[get("/readyz")]
-pub async fn readyz(
-    redis: web::Data<RedisClient>,
-    keys: web::Data<KeyManager>,
-) -> HttpResponse {
+pub async fn readyz(redis: web::Data<RedisClient>, keys: web::Data<KeyManager>) -> HttpResponse {
     let redis_ok = redis.ping().await.is_ok();
     let jwks_ok = keys.check_jwks().await.is_ok();
 
     let body = ReadinessResponse {
-        status: if redis_ok && jwks_ok { "ok" } else { "unavailable" }.into(),
+        status: if redis_ok && jwks_ok {
+            "ok"
+        } else {
+            "unavailable"
+        }
+        .into(),
         redis: redis_ok,
         jwks: jwks_ok,
     };
@@ -324,20 +322,22 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
-    use actix_web::{test, App};
-    use actix_web::http::StatusCode;
-    use actix_web::http::header::HeaderValue;
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    use parking_lot::Mutex as PlMutex;
-    use openssl::pkey::{PKey, Private};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use serde_json::json;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wiremock::matchers::{method, path};
-    use crate::models::TokenResponse;
     use crate::models::jwt::{JsonWebToken, JtiError, TokenClaims, TokenHeaders};
+    use crate::models::TokenResponse;
+    use actix_web::http::header::HeaderValue;
+    use actix_web::http::StatusCode;
+    use actix_web::{test, App};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use chrono::Utc;
+    use openssl::pkey::{PKey, Private};
+    use parking_lot::Mutex as PlMutex;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::env;
+    use std::sync::Mutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Тесты токенов правят процесс-глобальные переменные окружения
     /// (`JWKS_SERVICE_URL`, `TOKEN_ALGORITHM`, ...) и адрес JWKS-мока, поэтому
@@ -357,7 +357,9 @@ mod tests {
 
     impl MockStore {
         fn new() -> Self {
-            Self { jtis: PlMutex::new(HashSet::new()) }
+            Self {
+                jtis: PlMutex::new(HashSet::new()),
+            }
         }
     }
 
@@ -413,17 +415,21 @@ mod tests {
             "crv": "Ed25519", "x": key.x_b64, "y": null, "n": null, "e": null,
             "private_key": key.private_b64,
         });
-        Mock::given(method("POST")).and(path("/jwks"))
+        Mock::given(method("POST"))
+            .and(path("/jwks"))
             .respond_with(ResponseTemplate::new(200).set_body_json(jwk_data))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let jwks = json!({ "keys": [ {
             "kty": "OKP", "alg": "EdDSA", "kid": key.kid, "crv": "Ed25519",
             "x": key.x_b64, "y": null, "n": null, "e": null,
         } ] });
-        Mock::given(method("GET")).and(path("/.well-known/jwks.json"))
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         server
     }
@@ -451,8 +457,14 @@ mod tests {
                 .app_data($store)
                 .app_data(keys)
                 .route("/tokens", web::post().to(create_token_impl::<MockStore>))
-                .route("/tokens/verify", web::post().to(verify_token_impl::<MockStore>))
-                .route("/tokens/{jti}", web::delete().to(revoke_token_impl::<MockStore>))
+                .route(
+                    "/tokens/verify",
+                    web::post().to(verify_token_impl::<MockStore>),
+                )
+                .route(
+                    "/tokens/{jti}",
+                    web::delete().to(revoke_token_impl::<MockStore>),
+                )
         }};
     }
 

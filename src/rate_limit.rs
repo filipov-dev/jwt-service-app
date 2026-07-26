@@ -61,12 +61,18 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Читает `u64` из переменной окружения с откатом на `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Читает `u32` из переменной окружения с откатом на `default`.
 fn env_u32(key: &str, default: u32) -> u32 {
-    env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Читает булев флаг (`1/true/yes/on` — истина, `0/false/no/off/""` — ложь).
@@ -233,7 +239,9 @@ fn quota(per_second: u64, burst: u32) -> Quota {
     let per_second = per_second.max(1);
     let burst = NonZeroU32::new(burst.max(1)).expect("burst >= 1");
     let period = Duration::from_nanos(1_000_000_000 / per_second);
-    Quota::with_period(period).expect("period > 0").allow_burst(burst)
+    Quota::with_period(period)
+        .expect("period > 0")
+        .allow_burst(burst)
 }
 
 /// Секунды до следующего разрешённого запроса (для заголовка `Retry-After`),
@@ -281,7 +289,9 @@ impl RateLimitConfig {
             }
             match Cidr::parse(entry) {
                 Some(cidr) => trusted.push(cidr),
-                None => warn!("RATE_LIMIT_TRUSTED_PROXIES: не разобран IP/CIDR '{entry}', пропускаю"),
+                None => {
+                    warn!("RATE_LIMIT_TRUSTED_PROXIES: не разобран IP/CIDR '{entry}', пропускаю")
+                }
             }
         }
 
@@ -330,7 +340,10 @@ impl RateLimitConfig {
             return None;
         }
         Some(PerIpLimiter {
-            limiter: Arc::new(RateLimiter::keyed(quota(self.verify_per_second, self.verify_burst))),
+            limiter: Arc::new(RateLimiter::keyed(quota(
+                self.verify_per_second,
+                self.verify_burst,
+            ))),
             trusted: self.trusted.clone(),
             forwarded_header: Arc::from(self.forwarded_header.as_str()),
         })
@@ -342,7 +355,10 @@ impl RateLimitConfig {
             return None;
         }
         Some(GlobalLimiter {
-            limiter: Arc::new(RateLimiter::direct(quota(self.internal_per_second, self.internal_burst))),
+            limiter: Arc::new(RateLimiter::direct(quota(
+                self.internal_per_second,
+                self.internal_burst,
+            ))),
         })
     }
 }
@@ -393,7 +409,11 @@ impl Strategy {
         match self {
             Strategy::Disabled => Ok(()),
             Strategy::Global { limiter } => limiter.check().map_err(retry_after_secs),
-            Strategy::PerIp { limiter, trusted, forwarded_header } => {
+            Strategy::PerIp {
+                limiter,
+                trusted,
+                forwarded_header,
+            } => {
                 let peer = req.peer_addr().map(|addr| addr.ip());
                 match resolve_key_ip(peer, req.headers(), forwarded_header, trusted) {
                     Some(ip) => limiter.check_key(&ip).map_err(retry_after_secs),
@@ -422,7 +442,9 @@ impl RateLimit {
             },
             None => Strategy::Disabled,
         };
-        Self { strategy: Rc::new(strategy) }
+        Self {
+            strategy: Rc::new(strategy),
+        }
     }
 
     /// Глобальный cap для internal-ручки. `None` → пропуск (cap выключен).
@@ -431,7 +453,9 @@ impl RateLimit {
             Some(l) => Strategy::Global { limiter: l.limiter },
             None => Strategy::Disabled,
         };
-        Self { strategy: Rc::new(strategy) }
+        Self {
+            strategy: Rc::new(strategy),
+        }
     }
 }
 
@@ -510,16 +534,37 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn cidrs(entries: &[&str]) -> Vec<Cidr> {
-        entries.iter().map(|e| Cidr::parse(e).expect("valid cidr")).collect()
+        entries
+            .iter()
+            .map(|e| Cidr::parse(e).expect("valid cidr"))
+            .collect()
     }
 
     // --- Cidr ---
 
     #[test]
     fn cidr_parses_single_ip_and_range() {
-        assert_eq!(Cidr::parse("10.0.0.1"), Some(Cidr { addr: "10.0.0.1".parse().unwrap(), prefix: 32 }));
-        assert_eq!(Cidr::parse("10.0.0.0/8"), Some(Cidr { addr: "10.0.0.0".parse().unwrap(), prefix: 8 }));
-        assert_eq!(Cidr::parse("::1"), Some(Cidr { addr: "::1".parse().unwrap(), prefix: 128 }));
+        assert_eq!(
+            Cidr::parse("10.0.0.1"),
+            Some(Cidr {
+                addr: "10.0.0.1".parse().unwrap(),
+                prefix: 32
+            })
+        );
+        assert_eq!(
+            Cidr::parse("10.0.0.0/8"),
+            Some(Cidr {
+                addr: "10.0.0.0".parse().unwrap(),
+                prefix: 8
+            })
+        );
+        assert_eq!(
+            Cidr::parse("::1"),
+            Some(Cidr {
+                addr: "::1".parse().unwrap(),
+                prefix: 128
+            })
+        );
         assert_eq!(Cidr::parse("2001:db8::/32").map(|c| c.prefix), Some(32));
     }
 
@@ -567,7 +612,12 @@ mod tests {
     #[test]
     fn key_uses_peer_when_no_trusted_proxies() {
         // XFF есть, но список доверенных пуст → доверять нельзя, ключ = peer.
-        let key = resolve_key_ip(Some(ip("203.0.113.9")), &xff(&["1.2.3.4"]), "X-Forwarded-For", &[]);
+        let key = resolve_key_ip(
+            Some(ip("203.0.113.9")),
+            &xff(&["1.2.3.4"]),
+            "X-Forwarded-For",
+            &[],
+        );
         assert_eq!(key, Some(ip("203.0.113.9")));
     }
 
@@ -575,7 +625,12 @@ mod tests {
     fn key_ignores_forwarded_from_untrusted_peer() {
         // Peer не в списке доверенных — XFF мог быть подделан, берём peer.
         let trusted = cidrs(&["10.0.0.0/8"]);
-        let key = resolve_key_ip(Some(ip("203.0.113.9")), &xff(&["1.2.3.4"]), "X-Forwarded-For", &trusted);
+        let key = resolve_key_ip(
+            Some(ip("203.0.113.9")),
+            &xff(&["1.2.3.4"]),
+            "X-Forwarded-For",
+            &trusted,
+        );
         assert_eq!(key, Some(ip("203.0.113.9")));
     }
 
@@ -583,7 +638,12 @@ mod tests {
     fn key_takes_client_from_forwarded_behind_trusted_proxy() {
         let trusted = cidrs(&["10.0.0.0/8"]);
         // Peer = доверенный прокси; XFF = "клиент".
-        let key = resolve_key_ip(Some(ip("10.0.0.5")), &xff(&["198.51.100.7"]), "X-Forwarded-For", &trusted);
+        let key = resolve_key_ip(
+            Some(ip("10.0.0.5")),
+            &xff(&["198.51.100.7"]),
+            "X-Forwarded-For",
+            &trusted,
+        );
         assert_eq!(key, Some(ip("198.51.100.7")));
     }
 
@@ -599,12 +659,25 @@ mod tests {
 
     #[test]
     fn key_groups_ipv6_to_56() {
-        let a = resolve_key_ip(Some(ip("2001:db8:1:2:3:4:5:6")), &HeaderMap::new(), "X-Forwarded-For", &[]);
-        let b = resolve_key_ip(Some(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")), &HeaderMap::new(), "X-Forwarded-For", &[]);
+        let a = resolve_key_ip(
+            Some(ip("2001:db8:1:2:3:4:5:6")),
+            &HeaderMap::new(),
+            "X-Forwarded-For",
+            &[],
+        );
+        let b = resolve_key_ip(
+            Some(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")),
+            &HeaderMap::new(),
+            "X-Forwarded-For",
+            &[],
+        );
         // Оба адреса в одном /56 → один ключ. /56 = 7 байт: младший байт 4-го
         // хекстета (byte 7) зануляется, поэтому оба сводятся к 2001:db8:1::.
         assert_eq!(a, b);
-        assert_eq!(a, Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0))));
+        assert_eq!(
+            a,
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0)))
+        );
     }
 
     #[test]
@@ -660,10 +733,16 @@ mod tests {
             let app = per_ip_app!(Some(per_ip(1, 2, &[])));
             // burst=2: два запроса проходят, третий — 429.
             for _ in 0..2 {
-                let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
+                let req = test::TestRequest::get()
+                    .uri("/x")
+                    .peer_addr(peer("203.0.113.1"))
+                    .to_request();
                 assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
             }
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.1"))
+                .to_request();
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
             assert!(resp.headers().contains_key(RETRY_AFTER));
@@ -673,12 +752,24 @@ mod tests {
         async fn buckets_are_independent_per_ip() {
             let app = per_ip_app!(Some(per_ip(1, 1, &[])));
             // Первый IP исчерпал ведро.
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.1"))
+                .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
-            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.1"))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
             // Другой IP — своё ведро, проходит.
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.2")).to_request();
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.2"))
+                .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
         }
 
@@ -698,7 +789,10 @@ mod tests {
                 .peer_addr(peer("10.0.0.5"))
                 .insert_header(("X-Forwarded-For", "198.51.100.1"))
                 .to_request();
-            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
             // Другой клиент за тем же прокси → своё ведро, проходит.
             let req = test::TestRequest::get()
                 .uri("/x")
@@ -724,21 +818,29 @@ mod tests {
                 .peer_addr(peer("203.0.113.9"))
                 .insert_header(("X-Forwarded-For", "2.2.2.2"))
                 .to_request();
-            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
         }
 
         #[actix_web::test]
         async fn disabled_limiter_passes_through() {
             let app = per_ip_app!(None);
             for _ in 0..5 {
-                let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
+                let req = test::TestRequest::get()
+                    .uri("/x")
+                    .peer_addr(peer("203.0.113.1"))
+                    .to_request();
                 assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
             }
         }
 
         #[actix_web::test]
         async fn global_cap_limits_regardless_of_ip() {
-            let limiter = GlobalLimiter { limiter: Arc::new(RateLimiter::direct(quota(1, 2))) };
+            let limiter = GlobalLimiter {
+                limiter: Arc::new(RateLimiter::direct(quota(1, 2))),
+            };
             let app = test::init_service(
                 App::new().service(
                     web::resource("/x")
@@ -748,12 +850,24 @@ mod tests {
             )
             .await;
             // burst=2 на весь эндпоинт: два любых запроса ок, третий — 429, даже с другого IP.
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.1")).to_request();
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.1"))
+                .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.2")).to_request();
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.2"))
+                .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
-            let req = test::TestRequest::get().uri("/x").peer_addr(peer("203.0.113.3")).to_request();
-            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            let req = test::TestRequest::get()
+                .uri("/x")
+                .peer_addr(peer("203.0.113.3"))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
         }
     }
 }

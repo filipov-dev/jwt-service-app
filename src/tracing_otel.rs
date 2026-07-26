@@ -31,8 +31,8 @@ use std::time::Duration;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing::warn;
@@ -72,11 +72,16 @@ const LOGS_PATH: &str = "/v1/logs";
 /// послать базовый URL как есть, коллектор ответит `404`, а данные будут молча
 /// теряться.
 fn signal_endpoint(signal: Option<String>, base: Option<String>, path: &str) -> Option<String> {
-    if let Some(signal) = signal.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(signal) = signal
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         return Some(signal);
     }
 
-    let base = base.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let base = base
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     Some(format!("{}{path}", base.trim_end_matches('/')))
 }
 
@@ -99,7 +104,10 @@ pub enum Status {
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` не задан — трейсинг выключен.
     Disabled,
     /// Экспорт настроен.
-    Enabled { endpoint: String, service_name: String },
+    Enabled {
+        endpoint: String,
+        service_name: String,
+    },
     /// Экспортёр не построился; сервис продолжает работу без трейсинга.
     Failed { endpoint: String, error: String },
 }
@@ -109,11 +117,12 @@ impl Status {
     pub fn log(&self) {
         match self {
             Status::Disabled => {
-                tracing::debug!(
-                    "OpenTelemetry: трейсинг выключен ({ENDPOINT_VAR} не задан)"
-                );
+                tracing::debug!("OpenTelemetry: трейсинг выключен ({ENDPOINT_VAR} не задан)");
             }
-            Status::Enabled { endpoint, service_name } => {
+            Status::Enabled {
+                endpoint,
+                service_name,
+            } => {
                 tracing::info!(
                     endpoint = %endpoint,
                     service_name = %service_name,
@@ -191,7 +200,9 @@ pub fn init_tracer_provider() -> (Option<SdkTracerProvider>, Status) {
 }
 
 /// Строит `tracing`-слой поверх провайдера.
-pub fn layer<S>(provider: &SdkTracerProvider) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
+pub fn layer<S>(
+    provider: &SdkTracerProvider,
+) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
@@ -261,8 +272,10 @@ pub fn init_logger_provider() -> (Option<SdkLoggerProvider>, LogsStatus) {
 /// Строит `tracing`-слой, отправляющий события в OTLP-логи.
 pub fn logs_layer(
     provider: &SdkLoggerProvider,
-) -> opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<SdkLoggerProvider, opentelemetry_sdk::logs::SdkLogger>
-{
+) -> opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<
+    SdkLoggerProvider,
+    opentelemetry_sdk::logs::SdkLogger,
+> {
     opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(provider)
 }
 
@@ -425,7 +438,10 @@ mod tests {
     #[test]
     fn no_endpoint_means_disabled() {
         assert_eq!(signal_endpoint(None, None, TRACES_PATH), None);
-        assert_eq!(signal_endpoint(Some("  ".into()), Some("  ".into()), TRACES_PATH), None);
+        assert_eq!(
+            signal_endpoint(Some("  ".into()), Some("  ".into()), TRACES_PATH),
+            None
+        );
     }
 
     #[test]
@@ -460,7 +476,10 @@ mod tests {
         env::remove_var(ENDPOINT_VAR);
         env::remove_var(TRACES_ENDPOINT_VAR);
         let (provider, status) = init_tracer_provider();
-        assert!(provider.is_none(), "без {ENDPOINT_VAR} трейсинг должен быть выключен");
+        assert!(
+            provider.is_none(),
+            "без {ENDPOINT_VAR} трейсинг должен быть выключен"
+        );
         assert_eq!(status, Status::Disabled);
     }
 

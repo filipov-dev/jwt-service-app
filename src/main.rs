@@ -12,40 +12,36 @@
 //! Конфигурация — через переменные окружения (`HOST`, `PORT`,
 //! `TOKEN_ALGORITHM`, и т.д.), полный список см. в `AGENTS.md`.
 
-use std::env;
-use std::rc::Rc;
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use std::env;
+use std::rc::Rc;
 use tracing::info;
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
-use utoipa::openapi::security::{
-    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
-};
 
 mod auth;
 mod error;
 mod handlers;
+mod jwk;
+mod jwt;
 mod key;
 mod logging;
 mod metrics;
+mod models;
 mod rate_limit;
+mod redis;
 mod sentry_glitchtip;
 mod tracing_otel;
-mod redis;
-mod models;
-mod jwk;
-mod jwt;
 
 use crate::auth::{Auth, AuthConfig, AuthLevel};
-use crate::logging::{init_subscriber, RequestLog};
-use crate::rate_limit::{RateLimit, RateLimitConfig};
-use crate::handlers::{
-    create_token_impl, verify_token_impl, revoke_token_impl, livez, readyz,
-};
 use crate::handlers::metrics as metrics_handler;
+use crate::handlers::{create_token_impl, livez, readyz, revoke_token_impl, verify_token_impl};
 use crate::key::KeyManager;
+use crate::logging::{init_subscriber, RequestLog};
+use crate::models::{ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse};
+use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
-use crate::models::{ErrorResponse, ReadinessResponse, TokenResponse, TokenRequest};
 
 /// Корневой описатель OpenAPI-документации.
 ///
@@ -160,8 +156,7 @@ pub async fn openapi_spec() -> impl Responder {
 /// см. [`AuthConfig::from_env`]).
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let algorithm = env::var("TOKEN_ALGORITHM")
-        .unwrap_or("RS256".into());
+    let algorithm = env::var("TOKEN_ALGORITHM").unwrap_or("RS256".into());
 
     // Логирование и трейсинг: формат (`LOG_FORMAT`), уровни (`RUST_LOG`) и
     // опциональный OTLP-экспорт (`OTEL_EXPORTER_OTLP_ENDPOINT`). Провайдер держим
@@ -173,21 +168,20 @@ async fn main() -> std::io::Result<()> {
     // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
     let metrics_handle = crate::metrics::init_recorder();
 
-    let host = env::var("HOST")
-        .unwrap_or("127.0.0.1".into());
+    let host = env::var("HOST").unwrap_or("127.0.0.1".into());
     let port = env::var("PORT")
         .unwrap_or("8080".into())
-        .parse::<u16>().unwrap();
+        .parse::<u16>()
+        .unwrap();
 
-    let redis_client = RedisClient::new()
-        .expect("Failed to connect to Redis");
+    let redis_client = RedisClient::new().expect("Failed to connect to Redis");
     let key_manager = KeyManager::new(algorithm);
 
     // Конфигурация уровней доступа собирается один раз. Секреты уровней 2 и 3
     // обязательны: без них сервис не стартует (fail-fast). Копия оборачивается в
     // `Rc` внутри фабрики приложения на каждый worker-поток.
-    let auth_config = AuthConfig::from_env()
-        .unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
+    let auth_config =
+        AuthConfig::from_env().unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
 
     // Уровень 4 опционален (в отличие от 2 и 3): без токена метрики просто не
     // публикуются. Предупреждаем, чтобы это не выглядело как «метрики сломались».
@@ -312,9 +306,9 @@ async fn main() -> std::io::Result<()> {
                     .service(readyz),
             )
     })
-        .bind((host, port))?
-        .run()
-        .await?;
+    .bind((host, port))?
+    .run()
+    .await?;
 
     // Сервер остановлен — досылаем накопленные span'ы (если трейсинг включён).
     // Guard GlitchTip досылает свои события сам при уничтожении `telemetry`.
