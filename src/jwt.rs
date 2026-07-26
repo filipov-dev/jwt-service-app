@@ -4,10 +4,10 @@
 //! `jti` ([`JtiStore`]) и низкоуровневые типы токена из [`crate::models::jwt`],
 //! предоставляя обработчикам два высокоуровневых метода: генерацию и проверку.
 
+use crate::key::KeyManager;
+use crate::models::jwt::{JsonWebToken, JtiStore, JwtError, TokenClaims, TokenHeaders};
 use actix_web::web::Data;
 use tracing::error;
-use crate::models::jwt::{JsonWebToken, JtiStore, JwtError, TokenClaims, TokenHeaders};
-use crate::key::KeyManager;
 
 /// Без состояния: набор ассоциированных операций над токенами.
 pub struct JwtManager;
@@ -43,21 +43,11 @@ impl JwtManager {
             JwtError::KeyError
         })?;
 
-        let claims = TokenClaims::create_new(
-            issuer,
-            subject,
-            audience,
-            ttl,
-            store,
-        ).await?;
+        let claims = TokenClaims::create_new(issuer, subject, audience, ttl, store).await?;
 
         let headers = TokenHeaders::create_new(jwk.kid);
 
-        let token = JsonWebToken::create_new(
-            headers,
-            claims,
-            private_key,
-        );
+        let token = JsonWebToken::create_new(headers, claims, private_key);
 
         token.to_string()
     }

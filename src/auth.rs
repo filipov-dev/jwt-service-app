@@ -138,7 +138,12 @@ fn digest_by_name(name: &str) -> MessageDigest {
 ///
 /// # Errors
 /// Проброс `openssl::error::ErrorStack`, если не удалось построить HMAC.
-fn hotp(secret: &[u8], counter: u64, digits: u32, digest: MessageDigest) -> Result<String, openssl::error::ErrorStack> {
+fn hotp(
+    secret: &[u8],
+    counter: u64,
+    digits: u32,
+    digest: MessageDigest,
+) -> Result<String, openssl::error::ErrorStack> {
     let key = PKey::hmac(secret)?;
     let mut signer = Signer::new(digest, &key)?;
     signer.update(&counter.to_be_bytes())?;
@@ -314,10 +319,12 @@ impl AuthConfig {
         let mut errors: Vec<String> = Vec::new();
 
         // --- Уровень 2: proxy-secret (обязателен) ---
-        let proxy_header = env::var("AUTH_PROXY_SECRET_HEADER").unwrap_or_else(|_| "X-Proxy-Secret".into());
+        let proxy_header =
+            env::var("AUTH_PROXY_SECRET_HEADER").unwrap_or_else(|_| "X-Proxy-Secret".into());
         let proxy_secret = env::var("AUTH_PROXY_SECRET").ok().filter(|s| !s.is_empty());
         if proxy_secret.is_none() {
-            errors.push("AUTH_PROXY_SECRET не задан (обязателен для уровня 2 — proxy-secret)".into());
+            errors
+                .push("AUTH_PROXY_SECRET не задан (обязателен для уровня 2 — proxy-secret)".into());
         }
 
         // --- Уровень 3: TOTP (хотя бы один секрет обязателен) ---
@@ -353,7 +360,8 @@ impl AuthConfig {
         let digits = env_u64("AUTH_TOTP_DIGITS", 6).clamp(6, 8) as u32;
         let step = env_u64("AUTH_TOTP_STEP_SECONDS", 30).max(1);
         let skew = env_u64("AUTH_TOTP_SKEW_STEPS", 1);
-        let digest = digest_by_name(&env::var("AUTH_TOTP_ALGORITHM").unwrap_or_else(|_| "SHA1".into()));
+        let digest =
+            digest_by_name(&env::var("AUTH_TOTP_ALGORITHM").unwrap_or_else(|_| "SHA1".into()));
 
         Ok(Self {
             proxy: ProxyValidator {
@@ -388,7 +396,9 @@ impl AuthConfig {
         match level {
             AuthLevel::Open => true,
             AuthLevel::ProxySecret => self.proxy.validate(headers),
-            AuthLevel::Totp => self.totp.validate(headers, Utc::now().timestamp().max(0) as u64),
+            AuthLevel::Totp => self
+                .totp
+                .validate(headers, Utc::now().timestamp().max(0) as u64),
             AuthLevel::MetricsToken => self.metrics.validate(headers),
         }
     }
@@ -552,7 +562,10 @@ mod tests {
         ];
         for (counter, want) in expected.iter().enumerate() {
             let got = hotp(RFC_SECRET, counter as u64, 6, MessageDigest::sha1()).unwrap();
-            assert_eq!(&got, want, "HOTP расходится с RFC 4226 на counter={counter}");
+            assert_eq!(
+                &got, want,
+                "HOTP расходится с RFC 4226 на counter={counter}"
+            );
         }
     }
 
@@ -664,9 +677,15 @@ mod tests {
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
         const VARS: &[&str] = &[
-            "AUTH_PROXY_SECRET", "AUTH_PROXY_SECRET_HEADER", "AUTH_TOTP_SECRET",
-            "AUTH_TOTP_SECRET_NEXT", "AUTH_TOTP_HEADER", "AUTH_TOTP_DIGITS",
-            "AUTH_TOTP_STEP_SECONDS", "AUTH_TOTP_ALGORITHM", "AUTH_TOTP_SKEW_STEPS",
+            "AUTH_PROXY_SECRET",
+            "AUTH_PROXY_SECRET_HEADER",
+            "AUTH_TOTP_SECRET",
+            "AUTH_TOTP_SECRET_NEXT",
+            "AUTH_TOTP_HEADER",
+            "AUTH_TOTP_DIGITS",
+            "AUTH_TOTP_STEP_SECONDS",
+            "AUTH_TOTP_ALGORITHM",
+            "AUTH_TOTP_SKEW_STEPS",
             "AUTH_METRICS_TOKEN",
         ];
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

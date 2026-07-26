@@ -95,9 +95,16 @@ pub fn init_subscriber() -> Telemetry {
         .unwrap_or_else(|_| EnvFilter::new("jwt_service_app=info"));
 
     // Слои json/pretty различаются по типу — приводим к общему через `.boxed()`.
-    let fmt_layer = match env::var("LOG_FORMAT").unwrap_or_default().to_lowercase().as_str() {
+    let fmt_layer = match env::var("LOG_FORMAT")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
         "json" => tracing_subscriber::fmt::layer().json().boxed(),
-        _ => tracing_subscriber::fmt::layer().pretty().with_ansi(true).boxed(),
+        _ => tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_ansi(true)
+            .boxed(),
     };
 
     let (provider, otel_status) = crate::tracing_otel::init_tracer_provider();
@@ -307,10 +314,9 @@ mod tests {
 
     #[actix_web::test]
     async fn generates_request_id_when_absent() {
-        let app = actix_test::init_service(
-            App::new().wrap(RequestLog).route("/", web::get().to(ok)),
-        )
-        .await;
+        let app =
+            actix_test::init_service(App::new().wrap(RequestLog).route("/", web::get().to(ok)))
+                .await;
         let req = actix_test::TestRequest::get().uri("/").to_request();
         let res = actix_test::call_service(&app, req).await;
 
@@ -324,10 +330,9 @@ mod tests {
 
     #[actix_web::test]
     async fn propagates_valid_incoming_request_id() {
-        let app = actix_test::init_service(
-            App::new().wrap(RequestLog).route("/", web::get().to(ok)),
-        )
-        .await;
+        let app =
+            actix_test::init_service(App::new().wrap(RequestLog).route("/", web::get().to(ok)))
+                .await;
         let req = actix_test::TestRequest::get()
             .uri("/")
             .insert_header((REQUEST_ID_HEADER, "trace-42"))
@@ -335,24 +340,32 @@ mod tests {
         let res = actix_test::call_service(&app, req).await;
 
         assert_eq!(
-            res.headers().get(REQUEST_ID_HEADER).unwrap().to_str().unwrap(),
+            res.headers()
+                .get(REQUEST_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "trace-42"
         );
     }
 
     #[actix_web::test]
     async fn replaces_invalid_incoming_request_id() {
-        let app = actix_test::init_service(
-            App::new().wrap(RequestLog).route("/", web::get().to(ok)),
-        )
-        .await;
+        let app =
+            actix_test::init_service(App::new().wrap(RequestLog).route("/", web::get().to(ok)))
+                .await;
         let req = actix_test::TestRequest::get()
             .uri("/")
             .insert_header((REQUEST_ID_HEADER, "bad value!"))
             .to_request();
         let res = actix_test::call_service(&app, req).await;
 
-        let rid = res.headers().get(REQUEST_ID_HEADER).unwrap().to_str().unwrap();
+        let rid = res
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_ne!(rid, "bad value!");
         assert!(Uuid::parse_str(rid).is_ok());
     }

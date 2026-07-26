@@ -5,9 +5,9 @@
 //! токена. Наличие ключа = токен активен, удаление = отзыв, истечение TTL =
 //! естественное «протухание».
 
-use std::env;
-use redis::{AsyncCommands, RedisError};
 use redis::aio::MultiplexedConnection;
+use redis::{AsyncCommands, RedisError};
+use std::env;
 use std::time::Instant;
 
 use tracing::error;
@@ -42,7 +42,7 @@ impl RedisClient {
     /// [`JtiError::BadConnection`], если подключиться не удалось.
     async fn get_connection(&self) -> Result<MultiplexedConnection, JtiError> {
         match self.client.get_multiplexed_async_connection().await {
-            Ok(c) => { Ok(c) }
+            Ok(c) => Ok(c),
             Err(e) => {
                 // Отказ хранилища — ERROR.
                 error!("Redis: не удалось открыть соединение: {}", e);
@@ -95,7 +95,7 @@ impl JtiStore for RedisClient {
                 error!("Redis: SETEX не выполнился: {}", e);
                 record_redis_command("store_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
-            },
+            }
         }
     }
 
@@ -114,7 +114,7 @@ impl JtiStore for RedisClient {
                 error!("Redis: EXISTS не выполнился: {}", e);
                 record_redis_command("check_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
-            },
+            }
         }
     }
 
@@ -133,7 +133,7 @@ impl JtiStore for RedisClient {
                 error!("Redis: DEL не выполнился: {}", e);
                 record_redis_command("delete_jti", false, started.elapsed());
                 Err(JtiError::WrongOperation)
-            },
+            }
         }
     }
 }

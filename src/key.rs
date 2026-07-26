@@ -9,15 +9,15 @@
 //! Менеджер кэширует идентификатор текущего ключа (`current_key_id`) под
 //! `RwLock`, чтобы переиспользовать один ключ между запросами.
 
-use parking_lot::RwLock;
-use std::sync::Arc;
-use base64::{Engine};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::ec::{EcGroup, EcKey, EcPoint};
 use openssl::nid::Nid;
 use openssl::pkey::{Id, PKey, Private, Public};
 use openssl::rsa::Rsa;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error};
 
@@ -27,7 +27,9 @@ use crate::models::{Jwk, JwkData};
 /// Алгоритмы подписи, поддерживаемые сервисом.
 ///
 /// Используется при проверке заголовка токена ([`crate::models::jwt::TokenHeaders::is_verify`]).
-pub const SUPPORTED_ALGORITHMS: &[&str] = &["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"];
+pub const SUPPORTED_ALGORITHMS: &[&str] = &[
+    "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA",
+];
 
 /// Ошибки работы с ключами.
 #[derive(Error, Debug)]
@@ -82,15 +84,16 @@ impl KeyManager {
     async fn get_jwk_data(&self) -> Result<JwkData, KeyError> {
         let key_id = self.current_key_id.read().clone();
 
-        let jwk = match self.service.private_key(
-            key_id.as_str(),
-            self.algorithm.as_str()
-        ).await {
-            Ok(v) => { v }
+        let jwk = match self
+            .service
+            .private_key(key_id.as_str(), self.algorithm.as_str())
+            .await
+        {
+            Ok(v) => v,
             Err(e) => {
                 // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
                 debug!("Приватный ключ не получен: {}", e);
-                return Err(KeyError::NotFound)
+                return Err(KeyError::NotFound);
             }
         };
 
@@ -104,11 +107,11 @@ impl KeyManager {
         let service = JwkService::new();
 
         let jwk = match service.public_key(kid).await {
-            Ok(v) => { v }
+            Ok(v) => v,
             Err(e) => {
                 // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
                 debug!("Публичный ключ по kid не получен: {}", e);
-                return Err(KeyError::NotFound)
+                return Err(KeyError::NotFound);
             }
         };
 
@@ -128,18 +131,18 @@ impl KeyManager {
         let jwk = self.get_jwk_data().await?;
 
         let new_private_key = match URL_SAFE_NO_PAD.decode(jwk.private_key.clone()) {
-            Ok(v) => { v }
+            Ok(v) => v,
             Err(e) => {
                 error!("{}", e);
-                return Err(KeyError::InvalidKey)
+                return Err(KeyError::InvalidKey);
             }
         };
 
         let private_key = match PKey::private_key_from_pkcs8(&new_private_key) {
-            Ok(v) => { v }
+            Ok(v) => v,
             Err(e) => {
                 error!("{}", e);
-                return Err(KeyError::InvalidKey)
+                return Err(KeyError::InvalidKey);
             }
         };
 
@@ -162,7 +165,7 @@ impl KeyManager {
             "RS256" | "RS384" | "RS512" => Self::get_public_key_from_rs(jwk),
             "ES256" | "ES384" | "ES512" => Self::get_public_key_from_es(jwk),
             "EdDSA" => Self::get_public_key_from_dsa(jwk),
-            _ => Err(KeyError::Unsupported)
+            _ => Err(KeyError::Unsupported),
         }
     }
 
@@ -172,15 +175,15 @@ impl KeyManager {
         let jwk_e = Self::get_big_num_from_option_string(jwk.e)?;
 
         let rsa_public_key = match Rsa::from_public_components(jwk_n, jwk_e) {
-            Ok(v) => { v }
+            Ok(v) => v,
             Err(e) => {
                 error!("{}", e);
-                return Err(KeyError::InvalidKey)
+                return Err(KeyError::InvalidKey);
             }
         };
 
         match PKey::from_rsa(rsa_public_key) {
-            Ok(v) => { Ok(v) }
+            Ok(v) => Ok(v),
             Err(e) => {
                 error!("{}", e);
                 Err(KeyError::InvalidKey)
@@ -197,10 +200,10 @@ impl KeyManager {
     ///   смог собрать ключ из них.
     fn get_public_key_from_es(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
         let curve = match jwk.alg.as_str() {
-            "ES256" => { Nid::X9_62_PRIME256V1 }
-            "ES384" => { Nid::SECP384R1 }
-            "ES512" => { Nid::SECP521R1 }
-            _ => { return Err(KeyError::Unsupported) }
+            "ES256" => Nid::X9_62_PRIME256V1,
+            "ES384" => Nid::SECP384R1,
+            "ES512" => Nid::SECP521R1,
+            _ => return Err(KeyError::Unsupported),
         };
 
         let group = EcGroup::from_curve_name(curve).map_err(|e| {
@@ -219,7 +222,8 @@ impl KeyManager {
             error!("{}", e);
             KeyError::InvalidKey
         })?;
-        point.set_affine_coordinates_gfp(&group, &jwk_x, &jwk_y, &mut ctx)
+        point
+            .set_affine_coordinates_gfp(&group, &jwk_x, &jwk_y, &mut ctx)
             .map_err(|e| {
                 error!("{}", e);
                 KeyError::InvalidKey
@@ -231,7 +235,7 @@ impl KeyManager {
         })?;
 
         match PKey::from_ec_key(ec_key_public) {
-            Ok(v) => { Ok(v) }
+            Ok(v) => Ok(v),
             Err(e) => {
                 error!("{}", e);
                 Err(KeyError::InvalidKey)
@@ -255,18 +259,16 @@ impl KeyManager {
         })?;
 
         let id = match jwk.crv {
-            None => { return Err(KeyError::InvalidKey) }
-            Some(crv) => {
-                match crv.as_str() {
-                    "Ed25519" => Id::ED25519,
-                    "Ed448" => Id::ED448,
-                    _ => return Err(KeyError::Unsupported)
-                }
-            }
+            None => return Err(KeyError::InvalidKey),
+            Some(crv) => match crv.as_str() {
+                "Ed25519" => Id::ED25519,
+                "Ed448" => Id::ED448,
+                _ => return Err(KeyError::Unsupported),
+            },
         };
 
         match PKey::public_key_from_raw_bytes(&jwk_x, id) {
-            Ok(v) => { Ok(v) }
+            Ok(v) => Ok(v),
             Err(e) => {
                 error!("{}", e);
                 Err(KeyError::InvalidKey)
@@ -287,7 +289,7 @@ impl KeyManager {
         })?;
 
         match BigNum::from_slice(&bytes) {
-            Ok(v) => { Ok(v) }
+            Ok(v) => Ok(v),
             Err(e) => {
                 error!("{}", e);
                 Err(KeyError::InvalidKey)
