@@ -5,7 +5,7 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
 
 ## Многоуровневый доступ к API
 
-Доступ к эндпоинтам разграничен единым auth-middleware по трём уровням; уровень
+Доступ к эндпоинтам разграничен единым auth-middleware по четырём уровням; уровень
 задаётся при регистрации роута, разница — только в валидаторе.
 
 | Уровень | Эндпоинты | Защита |
@@ -13,11 +13,13 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
 | **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет |
 | **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от обратного прокси (constant-time) |
 | **3 — TOTP** | `POST /tokens`, `DELETE /tokens/{jti}` | TOTP (RFC 6238), internal app-to-app |
+| **4 — Bearer-токен** | `GET /metrics` (только если задан токен) | статический токен в `Authorization: Bearer` (constant-time) |
 
-Невалидный или отсутствующий кред → `401`. Защиты **обязательны**: секреты
-уровней 2 и 3 (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) должны быть заданы, иначе
-сервис **не стартует**. Переменные окружения — в
-[AGENTS.md](AGENTS.md#переменные-окружения).
+Невалидный или отсутствующий кред → `401`. Защиты основных ручек **обязательны**:
+секреты уровней 2 и 3 (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) должны быть заданы,
+иначе сервис **не стартует**. Уровень 4 — исключение: без `AUTH_METRICS_TOKEN`
+сервис стартует, а ручка `/metrics` просто не публикуется (`404`). Переменные
+окружения — в [AGENTS.md](AGENTS.md#переменные-окружения).
 
 ## Документация
 
@@ -28,5 +30,9 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
   [`docs/proxy/`](docs/proxy/README.md): как инжектить секрет-заголовок И
   обязательно затирать клиентскую версию (nginx, Traefik, HAProxy, Envoy, Caddy,
   Apache, Kong, AWS ALB/API Gateway, Cloudflare, NGINX Ingress).
-- **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret` и
-  `totp` для уровней 2 и 3).
+- **Observability: логи, метрики, трейсы, ошибки** —
+  [`docs/observability.md`](docs/observability.md): что сервис отдаёт наружу, как
+  включить и куда оно течёт (stdout/JSON, Prometheus и Zabbix, OpenTelemetry и
+  Monium, GlitchTip), сводная таблица переменных и готовые конфиги.
+- **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret`,
+  `totp` и `metrics_token` для уровней 2, 3 и 4).
