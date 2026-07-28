@@ -8,7 +8,7 @@ actix-web = "4.9"
 actix-cors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12.12", features = ["json"] }
+reqwest = { version = "0.13.4", features = ["json"] }
 # `connection-manager` — постоянное мультиплексированное соединение с
 # автоматическим переподключением. Без него каждая команда открывала своё TCP-
 # соединение и под нагрузкой упиралась в исчерпание эфемерных портов.
