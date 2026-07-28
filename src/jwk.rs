@@ -29,6 +29,25 @@ use crate::tracing_otel::inject_context;
 /// кеш и возвращает прежнее поведение — полезно при отладке.
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 
+/// Общий таймаут запроса к сервису ключей (`JWKS_REQUEST_TIMEOUT_MS`).
+///
+/// Две секунды с запасом покрывают самую долгую операцию — генерацию ключа — и
+/// заметно меньше типичного клиентского таймаута в 5–10 с: клиент успевает
+/// получить осмысленную ошибку вместо обрыва по своему таймауту.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 2000;
+
+/// Таймаут установки соединения с сервисом ключей (`JWKS_CONNECT_TIMEOUT_MS`).
+///
+/// JWKS живёт в той же сети, поэтому полсекунды на установку соединения — уже
+/// аномалия.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 500;
+
+/// Сколько простаивающее соединение держится в пуле.
+///
+/// Пул нужен, чтобы не платить за TCP-хендшейк на каждом обновлении кеша;
+/// удерживать соединение дольше минуты смысла нет — обновления реже.
+const POOL_IDLE_TIMEOUT_SECONDS: u64 = 60;
+
 /// Минимальный интервал между внеплановыми обновлениями кеша по неизвестному
 /// `kid` (`JWKS_CACHE_MISS_REFRESH_SECONDS`).
 ///
@@ -37,11 +56,48 @@ const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 /// одному — ровно то, от чего мы уходим.
 const DEFAULT_MISS_REFRESH_SECONDS: u64 = 10;
 
-/// Читает число секунд из переменной окружения, откатываясь на `default`.
+/// Собирает HTTP-клиент к сервису ключей с таймаутами.
+///
+/// Без них `reqwest` ждёт ответа неограниченно, и зависший — не упавший, а
+/// именно висящий — JWKS удерживал бы воркеры actix до TCP-таймаута ОС, то есть
+/// десятки минут. Кеш (JWT-25) частоту обращений сократил, но от одного
+/// зависшего запроса не защищает.
+///
+/// Не fail-fast: если клиент почему-то не собрался, берём дефолтный — без
+/// таймаутов, но рабочий. Телеметрия и настройки такого рода не должны быть
+/// причиной недоступности сервиса.
+fn build_client() -> Client {
+    let request_timeout = env_millis("JWKS_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS);
+    let connect_timeout = env_millis("JWKS_CONNECT_TIMEOUT_MS", DEFAULT_CONNECT_TIMEOUT_MS);
+
+    Client::builder()
+        .timeout(Duration::from_millis(request_timeout))
+        .connect_timeout(Duration::from_millis(connect_timeout))
+        .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECONDS))
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "JWKS: не удалось собрать HTTP-клиент с таймаутами ({e}), беру дефолтный"
+            );
+            Client::new()
+        })
+}
+
+/// Читает миллисекунды из переменной окружения, откатываясь на `default`.
+fn env_millis(name: &str, default: u64) -> u64 {
+    env_u64(name, default)
+}
+
+/// Читает секунды из переменной окружения, откатываясь на `default`.
+fn env_seconds(name: &str, default: u64) -> u64 {
+    env_u64(name, default)
+}
+
+/// Общий разбор `u64` из переменной окружения.
 ///
 /// Не fail-fast: как и прочая настройка кеша и телеметрии, кривое значение даёт
 /// предупреждение и дефолт, а не падение сервиса.
-fn env_seconds(name: &str, default: u64) -> u64 {
+fn env_u64(name: &str, default: u64) -> u64 {
     match env::var(name) {
         Err(_) => default,
         Ok(raw) => match raw.trim().parse::<u64>() {
@@ -105,7 +161,7 @@ impl JwkService {
         let url = env::var("JWKS_SERVICE_URL").unwrap_or("http://jwks-service-app:8080".into());
 
         Self {
-            client: Client::new(),
+            client: build_client(),
             url,
             cache: Arc::new(RwLock::new(CacheState {
                 entry: None,
@@ -359,8 +415,18 @@ mod tests {
         /// Через env это делать нельзя — переменные процесса общие, а тесты
         /// бегут параллельно.
         fn for_test(url: String, cache_ttl: Duration, miss_refresh_interval: Duration) -> Self {
+            Self::for_test_with_client(Client::new(), url, cache_ttl, miss_refresh_interval)
+        }
+
+        /// То же, но с заранее собранным клиентом — нужен тестам таймаутов.
+        fn for_test_with_client(
+            client: Client,
+            url: String,
+            cache_ttl: Duration,
+            miss_refresh_interval: Duration,
+        ) -> Self {
             Self {
-                client: Client::new(),
+                client,
                 url,
                 cache: Arc::new(RwLock::new(CacheState {
                     entry: None,
@@ -494,5 +560,45 @@ mod tests {
         }
 
         assert_eq!(requests_to(&server).await, 1);
+    }
+
+    #[actix_web::test]
+    async fn hanging_jwks_is_cut_off_by_timeout() {
+        let server = MockServer::start().await;
+
+        // Мок отвечает с задержкой, заведомо большей таймаута клиента: именно
+        // так выглядит зависший (а не упавший) сервис ключей — самый неприятный
+        // случай, потому что без таймаута воркер ждал бы до таймаута ОС.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "keys": [] }))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let service = JwkService::for_test_with_client(
+            client,
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        let started = Instant::now();
+        let result = service.public_key("kid-1").await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(JwkError::BadConnection)));
+        // Уложились в таймаут, а не ждали ответа мока пять секунд.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "запрос должен был прерваться по таймауту, а занял {elapsed:?}"
+        );
     }
 }
