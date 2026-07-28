@@ -319,6 +319,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1442,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "jwt-service-app"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "actix-cors",
  "actix-web",
@@ -2279,8 +2288,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9568894e8bdefd16512bca9e286a9d2abc27773609aa4eb7f428497d64df4373"
 dependencies = [
  "arc-swap",
+ "backon",
  "bytes",
  "combine",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint",

@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.9.0"
+version = "1.9.1"
 edition = "2021"
 
 [dependencies]
@@ -9,7 +9,10 @@ actix-cors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12.12", features = ["json"] }
-redis = { version = "0.29.0", features = ["tokio-comp"] }
+# `connection-manager` — постоянное мультиплексированное соединение с
+# автоматическим переподключением. Без него каждая команда открывала своё TCP-
+# соединение и под нагрузкой упиралась в исчерпание эфемерных портов.
+redis = { version = "0.29.0", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5.3.1", features = ["actix_extras", "chrono"] }

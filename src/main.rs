@@ -174,7 +174,10 @@ async fn main() -> std::io::Result<()> {
         .parse::<u16>()
         .unwrap();
 
-    let redis_client = RedisClient::new().expect("Failed to connect to Redis");
+    // Здесь только разбор `REDIS_URL`: само соединение открывается при первой
+    // команде и дальше переиспользуется (см. `RedisClient::connection`).
+    // Недоступный на старте Redis не роняет процесс — об этом сообщает `/readyz`.
+    let redis_client = RedisClient::new().expect("Invalid REDIS_URL");
     let key_manager = KeyManager::new(algorithm);
 
     // Конфигурация уровней доступа собирается один раз. Секреты уровней 2 и 3
