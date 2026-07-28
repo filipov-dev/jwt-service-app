@@ -324,9 +324,20 @@ impl JwkService {
     /// Возвращает приватный ключ по `id`, создавая новый под алгоритм `alg`,
     /// если ключа с таким `id` нет (или `id` пуст).
     pub async fn private_key(&self, id: &str, alg: &str) -> Result<JwkData, JwkError> {
+        // Идентификатора ещё нет — первый ключ за время жизни процесса.
+        if id.is_empty() {
+            return self.create_key(alg).await;
+        }
+
         match self.get_key(id).await {
             Ok(v) => Ok(v),
-            _ => self.create_key(alg).await,
+            // Ключа действительно нет — создаём новый.
+            Err(JwkError::NotFound) => self.create_key(alg).await,
+            // А вот недоступность или сбой сервиса ключей — НЕ повод плодить
+            // ключи: раньше сюда попадали и `BadConnection`, и `BadResponse`,
+            // поэтому кратковременный сбой сети приводил к созданию нового
+            // ключа, мусору в хранилище и смене активного `kid` на ровном месте.
+            Err(e) => Err(e),
         }
     }
 
@@ -371,25 +382,51 @@ impl JwkService {
     }
 
     /// Получаем ключ из сервиса
+    /// Получает ключ из сервиса по его `id`.
+    ///
+    /// # Errors
+    /// - [`JwkError::NotFound`] — **только** ответ `404`, то есть ключа
+    ///   действительно нет;
+    /// - [`JwkError::BadResponse`] — любой другой неуспешный статус (`5xx` и
+    ///   прочее) либо нечитаемое тело;
+    /// - [`JwkError::BadConnection`] — сервис недоступен.
+    ///
+    /// Различие принципиально: вызывающий ([`JwkService::private_key`]) создаёт
+    /// новый ключ по `NotFound`, поэтому «сервис ответил 500» ни в коем случае не
+    /// должно выглядеть как «ключа нет».
     async fn get_key(&self, id: &str) -> Result<JwkData, JwkError> {
         let url = format!("{}/jwks/{}", self.url, id);
+        let started = Instant::now();
 
-        let response = match self.client.get(&url).send().await {
+        let response = match inject_context(self.client.get(&url)).send().await {
             Ok(v) => v,
             Err(e) => {
-                error!("{}", e);
+                error!("JWKS недоступен при запросе ключа {}: {}", id, e);
+                record_jwks_request("get_key", false, started.elapsed());
                 return Err(JwkError::BadConnection);
             }
         };
 
-        if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            debug!("JWKS: ключ {} не найден", id);
+            record_jwks_request("get_key", true, started.elapsed());
             return Err(JwkError::NotFound);
         }
 
+        if !response.status().is_success() {
+            error!("JWKS вернул {} на запрос ключа {}", response.status(), id);
+            record_jwks_request("get_key", false, started.elapsed());
+            return Err(JwkError::BadResponse);
+        }
+
         match response.json().await {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                record_jwks_request("get_key", true, started.elapsed());
+                Ok(v)
+            }
             Err(e) => {
-                error!("{}", e);
+                error!("JWKS вернул некорректный ключ {}: {}", id, e);
+                record_jwks_request("get_key", false, started.elapsed());
                 Err(JwkError::BadResponse)
             }
         }
@@ -600,5 +637,113 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "запрос должен был прерваться по таймауту, а занял {elapsed:?}"
         );
+    }
+
+    /// Мок сервиса ключей для сценариев выпуска: `GET /jwks/{id}` отвечает
+    /// заданным статусом, `POST /jwks` всегда успешен.
+    async fn start_key_mock(get_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+
+        let key = json!({
+            "id": "kid-new", "kty": "OKP", "alg": "EdDSA", "kid": "kid-new",
+            "crv": "Ed25519", "x": "AAAA", "y": null, "n": null, "e": null,
+            "private_key": "AAAA",
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/jwks/kid-1"))
+            .respond_with(ResponseTemplate::new(get_status))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(key))
+            .mount(&server)
+            .await;
+
+        server
+    }
+
+    async fn post_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count()
+    }
+
+    #[actix_web::test]
+    async fn missing_key_is_created() {
+        // 404 — ключа действительно нет, новый выпустить можно и нужно.
+        let server = start_key_mock(404).await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        let key = service.private_key("kid-1", "EdDSA").await;
+
+        assert!(key.is_ok());
+        assert_eq!(post_requests(&server).await, 1);
+    }
+
+    #[actix_web::test]
+    async fn server_error_does_not_create_a_key() {
+        // 500 — сбой сервиса ключей. Раньше он был неотличим от «ключа нет»,
+        // и на каждом таком ответе выпускался новый ключ.
+        let server = start_key_mock(500).await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        let key = service.private_key("kid-1", "EdDSA").await;
+
+        assert!(matches!(key, Err(JwkError::BadResponse)));
+        assert_eq!(post_requests(&server).await, 0);
+    }
+
+    #[actix_web::test]
+    async fn unreachable_service_does_not_create_a_key() {
+        // Сеть недоступна: порт 1 гарантированно никем не слушается.
+        let service = JwkService::for_test(
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        let key = service.private_key("kid-1", "EdDSA").await;
+
+        assert!(matches!(key, Err(JwkError::BadConnection)));
+    }
+
+    #[actix_web::test]
+    async fn existing_key_is_reused() {
+        let server = MockServer::start().await;
+        let key = json!({
+            "id": "kid-1", "kty": "OKP", "alg": "EdDSA", "kid": "kid-1",
+            "crv": "Ed25519", "x": "AAAA", "y": null, "n": null, "e": null,
+            "private_key": "AAAA",
+        });
+        Mock::given(method("GET"))
+            .and(path("/jwks/kid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(key))
+            .mount(&server)
+            .await;
+
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        assert!(service.private_key("kid-1", "EdDSA").await.is_ok());
+        // Ключ нашёлся — выпускать новый незачем.
+        assert_eq!(post_requests(&server).await, 0);
     }
 }
