@@ -12,7 +12,7 @@ reqwest = { version = "0.12.12", features = ["json"] }
 # `connection-manager` — постоянное мультиплексированное соединение с
 # автоматическим переподключением. Без него каждая команда открывала своё TCP-
 # соединение и под нагрузкой упиралась в исчерпание эфемерных портов.
-redis = { version = "0.29.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.2.4", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5.3.1", features = ["actix_extras", "chrono"] }
