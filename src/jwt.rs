@@ -65,9 +65,10 @@ impl JwtManager {
         token: &str,
         issuer: &str,
         audience: &str,
+        key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<TokenClaims, JwtError> {
-        match JsonWebToken::from_string(token, issuer, audience, store).await {
+        match JsonWebToken::from_string(token, issuer, audience, key_manager, store).await {
             Ok(jwt) => Ok(jwt.claims),
             Err(e) => Err(e),
         }

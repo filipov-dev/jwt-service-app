@@ -119,6 +119,20 @@ pub fn record_jwks_request(operation: &str, success: bool, latency: Duration) {
     .record(latency.as_secs_f64());
 }
 
+/// Обращение к кешу JWKS.
+///
+/// `result`:
+/// - `hit` — ключ отдан из памяти, в сеть не ходили;
+/// - `miss` — в кеше не нашлось, пошли в `jwks-service-app`;
+/// - `throttled` — `kid` неизвестен, но обновляться ещё рано (защита от флуда
+///   несуществующими `kid`), запрос отклонён без похода в сеть.
+///
+/// Доля `hit` — главный показатель эффективности кеша; заметный поток
+/// `throttled` означает, что по сервису бьют мусорными `kid`.
+pub fn record_jwks_cache(result: &str) {
+    counter!("jwks_cache_total", "result" => result.to_string()).increment(1);
+}
+
 /// Длительность команды к Redis (`store_jti`, `check_jti`, `delete_jti`, `ping`).
 pub fn record_redis_command(command: &str, success: bool, latency: Duration) {
     histogram!(

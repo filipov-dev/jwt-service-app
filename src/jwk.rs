@@ -7,17 +7,61 @@
 //!
 //! Базовый URL берётся из `JWKS_SERVICE_URL`.
 
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::json;
 use std::env;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use tracing::{debug, error};
 
-use crate::metrics::record_jwks_request;
+use crate::metrics::{record_jwks_cache, record_jwks_request};
 use crate::models::{Jwk, JwkData, Jwks};
 use crate::tracing_otel::inject_context;
+
+/// Сколько кеш JWKS считается свежим (`JWKS_CACHE_TTL_SECONDS`).
+///
+/// Пять минут — компромисс: ключи в `jwks-service-app` живут сутками
+/// (`KEY_EXPIRATION_SECONDS`), поэтому запаздывание на минуты безопасно, а
+/// держать отозванный ключ в памяти дольше не хочется. `0` полностью отключает
+/// кеш и возвращает прежнее поведение — полезно при отладке.
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+
+/// Минимальный интервал между внеплановыми обновлениями кеша по неизвестному
+/// `kid` (`JWKS_CACHE_MISS_REFRESH_SECONDS`).
+///
+/// Без него кеш не закрывал бы главный сценарий перегрузки: поток токенов со
+/// случайными `kid` промахивался бы мимо кеша и транслировался в JWKS один к
+/// одному — ровно то, от чего мы уходим.
+const DEFAULT_MISS_REFRESH_SECONDS: u64 = 10;
+
+/// Читает число секунд из переменной окружения, откатываясь на `default`.
+///
+/// Не fail-fast: как и прочая настройка кеша и телеметрии, кривое значение даёт
+/// предупреждение и дефолт, а не падение сервиса.
+fn env_seconds(name: &str, default: u64) -> u64 {
+    match env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!("{name}: некорректное значение {raw:?}, беру дефолт {default}");
+                default
+            }
+        },
+    }
+}
+
+/// Состояние кеша публичных ключей.
+struct CacheState {
+    /// Последний успешно полученный набор ключей и момент получения.
+    entry: Option<(Jwks, Instant)>,
+    /// Момент последнего похода в JWKS (успешного или нет) — для троттлинга
+    /// обновлений по промаху.
+    last_attempt: Option<Instant>,
+}
 
 /// Ошибки взаимодействия с сервисом ключей.
 #[derive(Error, Debug)]
@@ -31,11 +75,27 @@ pub enum JwkError {
 }
 
 /// Клиент сервиса ключей на базе `reqwest`.
+///
+/// Экземпляр создаётся **один раз на процесс** и дальше клонируется: `client`
+/// несёт пул соединений, а `cache` и `refresh_lock` спрятаны за `Arc`, поэтому
+/// все копии разделяют один кеш и один пул. Создавать `JwkService` на каждый
+/// запрос нельзя — именно так и появлялся поход в JWKS на каждую верификацию.
 #[derive(Clone)]
 pub struct JwkService {
     client: Client,
     /// Базовый URL сервиса (`JWKS_SERVICE_URL`).
     url: String,
+    /// Кеш публичных ключей, общий для всех клонов.
+    cache: Arc<RwLock<CacheState>>,
+    /// Замок на обновление кеша: под нагрузкой в JWKS уходит один запрос, а не
+    /// столько, сколько запросов промахнулось одновременно. Асинхронный —
+    /// удерживается через `await` на время HTTP-запроса, где `parking_lot`
+    /// использовать нельзя.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Время жизни снимка кеша.
+    cache_ttl: Duration,
+    /// Минимальный интервал между обновлениями по промаху.
+    miss_refresh_interval: Duration,
 }
 
 impl JwkService {
@@ -47,6 +107,19 @@ impl JwkService {
         Self {
             client: Client::new(),
             url,
+            cache: Arc::new(RwLock::new(CacheState {
+                entry: None,
+                last_attempt: None,
+            })),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cache_ttl: Duration::from_secs(env_seconds(
+                "JWKS_CACHE_TTL_SECONDS",
+                DEFAULT_CACHE_TTL_SECONDS,
+            )),
+            miss_refresh_interval: Duration::from_secs(env_seconds(
+                "JWKS_CACHE_MISS_REFRESH_SECONDS",
+                DEFAULT_MISS_REFRESH_SECONDS,
+            )),
         }
     }
 
@@ -93,26 +166,103 @@ impl JwkService {
         }
     }
 
-    /// Получаем ключ
+    /// Возвращает публичный ключ по `kid`, по возможности из кеша.
+    ///
+    /// Порядок:
+    /// 1. **Попадание** — свежий кеш содержит `kid`, в сеть не идём.
+    /// 2. **Промах** — берём замок обновления и проверяем кеш ещё раз: пока мы
+    ///    ждали, его мог наполнить другой запрос.
+    /// 3. Если кеш свежий, но `kid` в нём нет, это либо новый ключ, либо мусор.
+    ///    Обновляемся, но не чаще `JWKS_CACHE_MISS_REFRESH_SECONDS` — иначе поток
+    ///    случайных `kid` снова транслировался бы в JWKS один к одному.
+    /// 4. Иначе идём в JWKS, обновляем кеш и ищем в нём.
+    ///
+    /// # Errors
+    /// - [`JwkError::NotFound`] — ключа нет ни в кеше, ни в свежем ответе JWKS,
+    ///   либо обновление сейчас троттлится;
+    /// - [`JwkError::BadConnection`] / [`JwkError::BadResponse`] — от запроса к JWKS.
     pub async fn public_key(&self, kid: &str) -> Result<Jwk, JwkError> {
-        let jwks = self.public_keys().await?;
-
-        for jwk in jwks.keys.iter() {
-            if jwk.kid == kid {
-                return Ok(Jwk {
-                    kty: jwk.kty.clone(),
-                    alg: jwk.alg.clone(),
-                    kid: jwk.kid.clone(),
-                    crv: jwk.crv.clone(),
-                    x: jwk.x.clone(),
-                    y: jwk.y.clone(),
-                    n: jwk.n.clone(),
-                    e: jwk.e.clone(),
-                });
-            }
+        if let Some(jwk) = self.lookup_fresh(kid) {
+            record_jwks_cache("hit");
+            return Ok(jwk);
         }
 
-        Err(JwkError::NotFound)
+        // Single-flight: под нагрузкой в JWKS уходит один запрос на весь всплеск
+        // промахов, остальные ждут здесь и забирают уже готовый кеш.
+        let _guard = self.refresh_lock.lock().await;
+
+        if let Some(jwk) = self.lookup_fresh(kid) {
+            record_jwks_cache("hit");
+            return Ok(jwk);
+        }
+
+        if self.cache_is_fresh() && !self.allow_refresh_on_miss() {
+            // Кеш свежий, ключа в нём нет, обновляться ещё рано — отказываем, не
+            // трогая сеть. Для клиента это неотличимо от «ключ не найден».
+            record_jwks_cache("throttled");
+            debug!("JWKS: kid {} неизвестен, обновление кеша троттлится", kid);
+            return Err(JwkError::NotFound);
+        }
+
+        record_jwks_cache("miss");
+        let jwks = self.fetch_and_store().await?;
+
+        jwks.keys
+            .iter()
+            .find(|jwk| jwk.kid == kid)
+            .cloned()
+            .ok_or(JwkError::NotFound)
+    }
+
+    /// Ищет `kid` в кеше, если тот ещё свеж. `None` — промах или протухший кеш.
+    fn lookup_fresh(&self, kid: &str) -> Option<Jwk> {
+        let state = self.cache.read();
+        let (jwks, fetched_at) = state.entry.as_ref()?;
+
+        if fetched_at.elapsed() >= self.cache_ttl {
+            return None;
+        }
+
+        jwks.keys.iter().find(|jwk| jwk.kid == kid).cloned()
+    }
+
+    /// Есть ли в кеше непротухший снимок (независимо от конкретного `kid`).
+    fn cache_is_fresh(&self) -> bool {
+        self.cache
+            .read()
+            .entry
+            .as_ref()
+            .is_some_and(|(_, fetched_at)| fetched_at.elapsed() < self.cache_ttl)
+    }
+
+    /// Разрешено ли сейчас внеплановое обновление по промаху; отмечает попытку.
+    fn allow_refresh_on_miss(&self) -> bool {
+        let mut state = self.cache.write();
+
+        match state.last_attempt {
+            Some(at) if at.elapsed() < self.miss_refresh_interval => false,
+            _ => {
+                state.last_attempt = Some(Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Запрашивает JWKS и кладёт результат в кеш.
+    async fn fetch_and_store(&self) -> Result<Jwks, JwkError> {
+        {
+            // Отмечаем попытку до запроса: если JWKS лежит, троттлинг не даст
+            // долбить его в цикле.
+            let mut state = self.cache.write();
+            state.last_attempt = Some(Instant::now());
+        }
+
+        let jwks = self.public_keys().await?;
+
+        let mut state = self.cache.write();
+        state.entry = Some((jwks.clone(), Instant::now()));
+
+        Ok(jwks)
     }
 
     /// Возвращает приватный ключ по `id`, создавая новый под алгоритм `alg`,
@@ -187,5 +337,162 @@ impl JwkService {
                 Err(JwkError::BadResponse)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Тесты кеша публичных ключей.
+    //!
+    //! `jwks-service-app` поднимается как HTTP-мок ([`wiremock`]), а число
+    //! реально ушедших запросов сверяется через `received_requests` — именно оно
+    //! и есть предмет проверки: до кеша каждая верификация давала свой запрос.
+
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    impl JwkService {
+        /// Конструктор для тестов: URL и тайминги задаются явно, минуя окружение.
+        ///
+        /// Через env это делать нельзя — переменные процесса общие, а тесты
+        /// бегут параллельно.
+        fn for_test(url: String, cache_ttl: Duration, miss_refresh_interval: Duration) -> Self {
+            Self {
+                client: Client::new(),
+                url,
+                cache: Arc::new(RwLock::new(CacheState {
+                    entry: None,
+                    last_attempt: None,
+                })),
+                refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+                cache_ttl,
+                miss_refresh_interval,
+            }
+        }
+    }
+
+    /// Поднимает мок JWKS с единственным ключом `kid-1`.
+    async fn start_jwks_mock() -> MockServer {
+        let server = MockServer::start().await;
+
+        let jwks = json!({ "keys": [ {
+            "kty": "OKP", "alg": "EdDSA", "kid": "kid-1", "crv": "Ed25519",
+            "x": "AAAA", "y": null, "n": null, "e": null,
+        } ] });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server)
+            .await;
+
+        server
+    }
+
+    async fn requests_to(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    #[actix_web::test]
+    async fn repeated_lookups_hit_cache_and_do_not_refetch() {
+        let server = start_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        for _ in 0..10 {
+            assert!(service.public_key("kid-1").await.is_ok());
+        }
+
+        // Главное число задачи: десять верификаций — один поход в JWKS.
+        assert_eq!(requests_to(&server).await, 1);
+    }
+
+    #[actix_web::test]
+    async fn unknown_kid_refreshes_when_interval_passed() {
+        let server = start_jwks_mock().await;
+        // Нулевой интервал — обновление по промаху разрешено всегда.
+        let service = JwkService::for_test(server.uri(), Duration::from_secs(300), Duration::ZERO);
+
+        // Прогреваем кеш известным ключом.
+        assert!(service.public_key("kid-1").await.is_ok());
+        assert_eq!(requests_to(&server).await, 1);
+
+        // Неизвестный `kid` — повод обновиться: так подхватывается ключ,
+        // появившийся после последнего обновления (ротация).
+        assert!(matches!(
+            service.public_key("kid-unknown").await,
+            Err(JwkError::NotFound)
+        ));
+        assert_eq!(requests_to(&server).await, 2);
+    }
+
+    #[actix_web::test]
+    async fn unknown_kid_is_throttled_right_after_refresh() {
+        let server = start_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+
+        assert!(service.public_key("kid-1").await.is_ok());
+        assert_eq!(requests_to(&server).await, 1);
+
+        // Кеш только что обновлён, ключа в нём нет — значит его нет и в JWKS,
+        // повторный поход ничего не даст. Поток случайных `kid` упирается сюда
+        // и в сеть не проходит.
+        for _ in 0..5 {
+            assert!(matches!(
+                service.public_key("kid-unknown").await,
+                Err(JwkError::NotFound)
+            ));
+        }
+        assert_eq!(requests_to(&server).await, 1);
+    }
+
+    #[actix_web::test]
+    async fn expired_cache_is_refreshed() {
+        let server = start_jwks_mock().await;
+        // Нулевой TTL — кеш выключен: каждый запрос идёт в сеть (прежнее
+        // поведение, оставлено для отладки).
+        let service = JwkService::for_test(server.uri(), Duration::ZERO, Duration::from_secs(300));
+
+        for _ in 0..3 {
+            assert!(service.public_key("kid-1").await.is_ok());
+        }
+
+        assert_eq!(requests_to(&server).await, 3);
+    }
+
+    #[actix_web::test]
+    async fn concurrent_misses_share_a_single_refresh() {
+        let server = start_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        // Двадцать одновременных промахов по холодному кешу должны сойтись в
+        // один запрос: замок обновления пропускает первого, остальные забирают
+        // уже готовый результат.
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let service = service.clone();
+            handles.push(actix_web::rt::spawn(async move {
+                service.public_key("kid-1").await.is_ok()
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.unwrap());
+        }
+
+        assert_eq!(requests_to(&server).await, 1);
     }
 }

@@ -131,9 +131,10 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
 pub async fn verify_token(
     request: web::Json<TokenVerifyRequest>,
     redis: web::Data<RedisClient>,
+    keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    verify_token_impl(request, redis, host).await
+    verify_token_impl(request, redis, keys, host).await
 }
 
 /// Реализация [`verify_token`], обобщённая по хранилищу `jti` ([`JtiStore`]).
@@ -142,6 +143,7 @@ pub async fn verify_token(
 pub async fn verify_token_impl<S: JtiStore + 'static>(
     request: web::Json<TokenVerifyRequest>,
     store: web::Data<S>,
+    keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let host_header = host
@@ -151,7 +153,9 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
         .to_str()
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
-    match JwtManager::verify_token(&request.token, host_header, &request.audience, store).await {
+    match JwtManager::verify_token(&request.token, host_header, &request.audience, &keys, store)
+        .await
+    {
         Ok(v) => {
             crate::metrics::record_token_verified(true);
             Ok(HttpResponse::Ok().json(v))

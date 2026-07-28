@@ -121,7 +121,9 @@ pub struct JwkData {
 ///
 /// Набор полей зависит от типа ключа: для RSA заполнены `n`/`e`, для EC —
 /// `crv`/`x`/`y`, для OKP (EdDSA) — `crv`/`x`.
-#[derive(Debug, Serialize, Deserialize)]
+// `Clone` нужен кешу JWKS: ключ отдаётся наружу копией, чтобы не держать
+// блокировку кеша на время сборки `PKey` (см. `jwk.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwk {
     /// Key type (e.g., "RSA").
     pub kty: String,
@@ -141,7 +143,7 @@ pub struct Jwk {
 }
 
 /// Набор публичных ключей — ответ эндпоинта `.well-known/jwks.json`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwks {
     /// Список доступных публичных ключей.
     pub keys: Vec<Jwk>,

@@ -9,7 +9,7 @@
 // `tokens.json` рядом со сценарием.
 
 import http from 'k6/http';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
 import { Counter } from 'k6/metrics';
 
 const tokens = JSON.parse(open('./tokens.json'));
@@ -21,6 +21,10 @@ const AUDIENCE = __ENV.AUDIENCE || 'load-test';
 // `iss` токена берётся из заголовка `Host` запроса, поэтому при проверке он
 // обязан совпадать с тем, с которым токен выпускали, иначе будет честный 401.
 const HOST_HEADER = __ENV.HOST_HEADER || 'jwt-load.local';
+// Пауза между итерациями. Нужна для сравнения «до/после» при ОДИНАКОВОМ темпе:
+// если оптимизация подняла потолок, то без ограничения прогон уходит на другой
+// уровень нагрузки и латентности становятся несопоставимы.
+const SLEEP_MS = Number(__ENV.SLEEP_MS || 0);
 
 // Отказы считаем отдельным счётчиком: k6 сам по себе считает failed только
 // транспортные ошибки, а нам нужны и 401/429 — они означают, что замер
@@ -57,5 +61,9 @@ export default function () {
     const ok = check(res, { 'status 200': (r) => r.status === 200 });
     if (!ok) {
         rejected.add(1, { status: String(res.status) });
+    }
+
+    if (SLEEP_MS > 0) {
+        sleep(SLEEP_MS / 1000);
     }
 }

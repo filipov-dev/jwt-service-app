@@ -50,8 +50,12 @@ PY
 # Нас интересуют не гистограммы целиком, а `_count` — сколько РАЗ сервис ходил
 # в JWKS и Redis. Поделённые на число верификаций, они и отвечают на главный
 # вопрос: сколько внешних вызовов стоит один запрос.
+# `--retry` здесь не роскошь: под нагрузкой сервис успевает исчерпать локальные
+# эфемерные порты, и подключиться не может уже сам curl. Без ретраев снятие
+# метрик молча возвращало нули, а сводка показывала нулевые дельты.
 scrape() {
-    curl -fsS -H "Authorization: Bearer ${METRICS_TOKEN}" "${TARGET_URL}/metrics" | python3 -c '
+    curl -sS --retry 5 --retry-all-errors --retry-delay 1 \
+        -H "Authorization: Bearer ${METRICS_TOKEN}" "${TARGET_URL}/metrics" | python3 -c '
 import sys
 verify = jwks = redis = 0.0
 for line in sys.stdin:
