@@ -103,10 +103,13 @@ impl KeyManager {
     }
 
     /// Получает публичный JWK по `kid` из сервиса ключей.
-    async fn get_jwk(kid: &str) -> Result<Jwk, KeyError> {
-        let service = JwkService::new();
-
-        let jwk = match service.public_key(kid).await {
+    ///
+    /// Метод, а не ассоциированная функция: клиент и кеш JWKS живут в
+    /// [`JwkService`] этого менеджера. Раньше здесь создавался новый
+    /// `JwkService` на каждый вызов — то есть новый HTTP-клиент со своим пулом
+    /// соединений и поход в JWKS на каждую верификацию токена.
+    async fn get_jwk(&self, kid: &str) -> Result<Jwk, KeyError> {
+        let jwk = match self.service.public_key(kid).await {
             Ok(v) => v,
             Err(e) => {
                 // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
@@ -158,8 +161,8 @@ impl KeyManager {
     /// - [`KeyError::NotFound`] — ключ с таким `kid` не найден;
     /// - [`KeyError::Unsupported`] — алгоритм/кривая не поддерживается;
     /// - [`KeyError::InvalidKey`] — компоненты ключа некорректны.
-    pub async fn get_public_key(kid: &str) -> Result<PKey<Public>, KeyError> {
-        let jwk = Self::get_jwk(kid).await?;
+    pub async fn get_public_key(&self, kid: &str) -> Result<PKey<Public>, KeyError> {
+        let jwk = self.get_jwk(kid).await?;
 
         match jwk.alg.as_str() {
             "RS256" | "RS384" | "RS512" => Self::get_public_key_from_rs(jwk),

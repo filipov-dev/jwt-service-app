@@ -205,6 +205,8 @@ baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
 | `TOKEN_JKU` | — (нет) | Если задан, кладётся в заголовок `jku` и проверяется при верификации. |
 | `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
 | `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |
+| `JWKS_CACHE_TTL_SECONDS` | `300` | Сколько снимок JWKS считается свежим. `0` — кеш выключен (каждая верификация идёт в JWKS, прежнее поведение). |
+| `JWKS_CACHE_MISS_REFRESH_SECONDS` | `10` | Минимальный интервал между обновлениями кеша по неизвестному `kid`. Он же — задержка подхвата нового ключа при ротации. |
 | `RUST_LOG` | — | Фильтр логов по уровням (`tracing-subscriber`, `EnvFilter`; дефолт `jwt_service_app=info`). |
 | `LOG_FORMAT` | `pretty` | Формат логов: `json` — построчный JSON (для сборщиков: Monium/ELK); иначе человекочитаемый `pretty` с ANSI. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL OTLP-коллектора (напр. `http://otel-collector:4318`); к нему добавляется `/v1/traces`. Не задан — трейсинг выключен. |
@@ -255,6 +257,21 @@ baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
   требует наличия `jti`. Сохраняйте это поведение при изменениях.
 - Ошибки наружу отдаются скупо: многие обработчики возвращают пустые
   `500`/`401`/`422` без тела. Не считайте, что клиент получает детали.
+- **Кеш публичных ключей (`jwk.rs`).** JWKS кешируется в памяти: до этого каждая
+  верификация тянула весь `/.well-known/jwks.json` и создавала новый HTTP-клиент,
+  из-за чего нагрузка транслировалась на сервис ключей один к одному (замер — в
+  [`deployments/load/BASELINE.md`](deployments/load/BASELINE.md)).
+  - **`JwkService` создаётся один раз на процесс** и дальше клонируется: кеш и пул
+    соединений спрятаны за `Arc` и общие для всех копий. Не создавайте его на
+    запрос — именно так и выглядела проблема.
+  - **Промах по неизвестному `kid` троттлится** (`JWKS_CACHE_MISS_REFRESH_SECONDS`).
+    Без этого кеш не защищал бы от главного сценария: поток токенов со случайными
+    `kid` промахивался бы мимо кеша и снова заваливал JWKS. Обратная сторона —
+    новый ключ после ротации подхватывается с задержкой до этого интервала.
+  - **Обновление под замком** (`tokio::sync::Mutex`): на всплеск одновременных
+    промахов в JWKS уходит один запрос, остальные ждут и забирают готовый кеш.
+  - **`GET /readyz` ходит в JWKS напрямую, мимо кеша** — проба обязана проверять
+    живость зависимости, а не наличие снимка в памяти.
 - **Логирование (`logging.rs`).** Каждый запрос оборачивается span'ом
   `http_request` с `request_id` (заголовок `X-Request-Id`: берётся входящий, если
   валиден, иначе генерируется UUID и возвращается в ответе). По завершении — одна
@@ -347,6 +364,7 @@ baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
   | `jwt_auth_denied_total` | counter | `level` (`open`/`proxy_secret`/`totp`) |
   | `jwt_rate_limit_exceeded_total` | counter | — |
   | `jwks_request_duration_seconds` | histogram | `operation`, `success` |
+  | `jwks_cache_total` | counter | `result` (`hit`/`miss`/`throttled`) |
   | `redis_command_duration_seconds` | histogram | `command`, `success` |
 
   **Кардинальность:** в лейбл `endpoint` идёт **шаблон роута** (`/tokens/{jti}`),

@@ -453,6 +453,7 @@ impl JsonWebToken<Public> {
         token: &str,
         issuer: &str,
         audience: &str,
+        key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<Self, JwtError> {
         let mut parts = token.split('.');
@@ -464,7 +465,7 @@ impl JsonWebToken<Public> {
 
         let headers = TokenHeaders::from_base64(headers_segment.to_string())?;
 
-        let key = match KeyManager::get_public_key(headers.kid.as_str()).await {
+        let key = match key_manager.get_public_key(headers.kid.as_str()).await {
             Ok(key) => key,
             Err(e) => {
                 // Причину (недоступность JWKS и т.п.) уже залогировал `key.rs` на
@@ -656,9 +657,12 @@ mod tests {
     #[actix_web::test]
     async fn from_string_rejects_malformed_token() {
         // Меньше трёх сегментов — раньше был бы panic на `parts.next().unwrap()`.
+        // Токен отбрасывается на разборе, до обращения к ключам, поэтому
+        // менеджер здесь нужен только для сигнатуры — в сеть он не ходит.
         let store = Data::new(MockStore::new());
+        let keys = KeyManager::new("RS256".to_string());
         let result =
-            JsonWebToken::<Public>::from_string("not-a-jwt", "issuer", "api1", store).await;
+            JsonWebToken::<Public>::from_string("not-a-jwt", "issuer", "api1", &keys, store).await;
         assert!(matches!(result, Err(JwtError::Broken)));
     }
 

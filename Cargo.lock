@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "jwt-service-app"
-version = "1.8.5"
+version = "1.9.0"
 dependencies = [
  "actix-cors",
  "actix-web",
@@ -1464,6 +1464,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

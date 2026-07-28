@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.8.5"
+version = "1.9.0"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +15,10 @@ chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5.3.1", features = ["actix_extras", "chrono"] }
 thiserror = "2.0.11"
 parking_lot = "0.12"
+# Только асинхронный примитив синхронизации: замок на обновление кеша JWKS
+# удерживается через `await` (см. `jwk.rs`), где `parking_lot` использовать
+# нельзя. Рантайм тянет actix-web, отдельно он здесь не нужен.
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"] }
 openssl = "0.10.70"
