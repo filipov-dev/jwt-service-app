@@ -548,11 +548,9 @@ where
         // прошёл проверку — иначе мусорные коды забивали бы Redis.
         let replay_claim =
             if authorized && level == AuthLevel::Totp && self.config.totp_replay_protection() {
-                self.config.totp_replay_claim(req.headers()).and_then(|c| {
-                    req.app_data::<actix_web::web::Data<St>>()
-                        .cloned()
-                        .map(|store| (c, store))
-                })
+                self.config
+                    .totp_replay_claim(req.headers())
+                    .zip(req.app_data::<actix_web::web::Data<St>>().cloned())
             } else {
                 None
             };
