@@ -54,6 +54,16 @@ pub struct TokenResponse {
     pub token: String,
 }
 
+/// Результат массового отзыва токенов субъекта.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RevokeGroupResponse {
+    /// Сколько активных токенов было отозвано.
+    ///
+    /// Уже истёкшие в счёт не идут: они и так невалидны, отзывать их незачем.
+    #[schema(example = 3)]
+    pub revoked: u64,
+}
+
 /// Унифицированное тело ответа об ошибке.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {

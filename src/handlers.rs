@@ -4,6 +4,8 @@
 //! - `POST /tokens` — выпуск токена ([`create_token`]);
 //! - `POST /tokens/verify` — проверка токена ([`verify_token`]);
 //! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]);
+//! - `DELETE /subjects/{sub}/tokens` — массовый отзыв токенов субъекта
+//!   ([`revoke_subject_tokens`]);
 //! - `GET /livez`, `GET /readyz` — пробы ([`livez`], [`readyz`]);
 //! - `GET /metrics` — метрики Prometheus ([`metrics`]).
 //!
@@ -18,9 +20,10 @@ use tracing::{debug, error, info};
 use crate::error::*;
 use crate::jwt::JwtManager;
 use crate::key::KeyManager;
-use crate::models::jwt::{JtiStore, JwtError};
+use crate::models::jwt::{subject_group, JtiStore, JwtError};
 use crate::models::{
-    ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse, TokenVerifyRequest,
+    ErrorResponse, ReadinessResponse, RevokeGroupResponse, TokenRequest, TokenResponse,
+    TokenVerifyRequest,
 };
 use crate::redis::RedisClient;
 
@@ -223,6 +226,58 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
 }
 
 #[utoipa::path(
+    delete,
+    path = "/subjects/{sub}/tokens",
+    params(("sub" = String, Path, description = "Субъект (claim `sub`), чьи токены отзываются")),
+    security(("totp" = [])),
+    responses(
+        (status = 200, body = RevokeGroupResponse),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
+    )
+)]
+/// Отзывает все активные токены субъекта.
+///
+/// Нужно при компрометации: гасить токены по одному через
+/// `DELETE /tokens/{jti}` вызывающий не может — он не знает их `jti`.
+///
+/// # Ответы
+/// - `200 OK` — [`RevokeGroupResponse`] с числом отозванных токенов (уже
+///   истёкшие не считаются, они и так невалидны);
+/// - `500 Internal Server Error` — хранилище недоступно. В отличие от
+///   `DELETE /tokens/{jti}`, ошибка **не** проглатывается: молчаливый «успех»
+///   при неудавшемся отзыве скомпрометированных токенов опаснее честной ошибки.
+#[delete("/subjects/{sub}/tokens")]
+pub async fn revoke_subject_tokens(
+    sub: web::Path<String>,
+    redis: web::Data<RedisClient>,
+) -> Result<HttpResponse, Error> {
+    revoke_subject_tokens_impl(sub, redis).await
+}
+
+/// Реализация [`revoke_subject_tokens`], обобщённая по хранилищу.
+pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
+    sub: web::Path<String>,
+    store: web::Data<S>,
+) -> Result<HttpResponse, Error> {
+    match store.revoke_group(&subject_group(&sub)).await {
+        Ok(revoked) => {
+            for _ in 0..revoked {
+                crate::metrics::record_token_revoked();
+            }
+            info!(revoked, "Отозваны все токены субъекта");
+            Ok(HttpResponse::Ok().json(RevokeGroupResponse { revoked }))
+        }
+        Err(e) => {
+            // Отказ хранилища — наша вина, ERROR.
+            error!("Не удалось отозвать токены субъекта: {}", e);
+            Err(Error::Internal("Failed to revoke subject tokens".into()))
+        }
+    }
+}
+
+#[utoipa::path(
     get,
     path = "/metrics",
     responses(
@@ -337,7 +392,7 @@ mod tests {
     use openssl::pkey::{PKey, Private};
     use parking_lot::Mutex as PlMutex;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::env;
     use std::sync::Mutex;
     use wiremock::matchers::{method, path};
@@ -355,14 +410,19 @@ mod tests {
     }
 
     /// In-memory реализация [`JtiStore`] для тестов HTTP-слоя.
+    ///
+    /// Группы ведутся по-настоящему (`group -> набор jti`), иначе тесты
+    /// массового отзыва проверяли бы только код ответа, но не сам отзыв.
     struct MockStore {
         jtis: PlMutex<HashSet<String>>,
+        groups: PlMutex<HashMap<String, HashSet<String>>>,
     }
 
     impl MockStore {
         fn new() -> Self {
             Self {
                 jtis: PlMutex::new(HashSet::new()),
+                groups: PlMutex::new(HashMap::new()),
             }
         }
     }
@@ -380,6 +440,29 @@ mod tests {
         async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
             self.jtis.lock().remove(jti);
             Ok(())
+        }
+
+        async fn add_to_group(
+            &self,
+            group: &str,
+            jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            self.groups
+                .lock()
+                .entry(group.to_string())
+                .or_default()
+                .insert(jti.to_string());
+            Ok(())
+        }
+
+        async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
+            let members = self.groups.lock().remove(group).unwrap_or_default();
+
+            let mut jtis = self.jtis.lock();
+            let revoked = members.iter().filter(|jti| jtis.remove(*jti)).count();
+
+            Ok(revoked as u64)
         }
     }
 
@@ -469,6 +552,28 @@ mod tests {
                     "/tokens/{jti}",
                     web::delete().to(revoke_token_impl::<MockStore>),
                 )
+                .route(
+                    "/subjects/{sub}/tokens",
+                    web::delete().to(revoke_subject_tokens_impl::<MockStore>),
+                )
+        }};
+    }
+
+    /// Выпускает токен на субъект `$sub` через тестовое приложение.
+    ///
+    /// Макрос, а не функция: тип приложения из `init_service` не выписывается
+    /// без вороха дженериков (та же причина, что у `token_app!`).
+    macro_rules! issue_token {
+        ($app:expr, $sub:expr) => {{
+            let req = test::TestRequest::post()
+                .uri("/tokens")
+                .insert_header(("Host", "example.com"))
+                .set_json(json!({ "sub": $sub, "aud": ["api1"] }))
+                .to_request();
+            let resp = test::call_service($app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let issued: TokenResponse = test::read_body_json(resp).await;
+            issued.token
         }};
     }
 
@@ -811,5 +916,60 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[actix_web::test]
+    async fn revoking_subject_kills_all_its_tokens() {
+        let _guard = env_guard();
+        let key = make_key("kid-bulk");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store.clone())).await;
+
+        // Три токена на одного субъекта и один — на другого.
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(issue_token!(&app, "victim"));
+        }
+        let bystander = issue_token!(&app, "bystander");
+
+        let req = test::TestRequest::delete()
+            .uri("/subjects/victim/tokens")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: RevokeGroupResponse = test::read_body_json(resp).await;
+        assert_eq!(body.revoked, 3);
+
+        // Токены субъекта больше не проходят проверку...
+        for token in &tokens {
+            assert!(!store.check_jti(&jti_of(token)).await.unwrap());
+        }
+        // ...а чужой не задет.
+        assert!(store.check_jti(&jti_of(&bystander)).await.unwrap());
+    }
+
+    #[actix_web::test]
+    async fn revoking_unknown_subject_is_idempotent() {
+        let _guard = env_guard();
+        let key = make_key("kid-none");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::delete()
+            .uri("/subjects/nobody/tokens")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        // Нечего отзывать — это не ошибка.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: RevokeGroupResponse = test::read_body_json(resp).await;
+        assert_eq!(body.revoked, 0);
     }
 }

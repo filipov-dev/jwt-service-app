@@ -36,10 +36,15 @@ mod tracing_otel;
 
 use crate::auth::{Auth, AuthConfig, AuthLevel};
 use crate::handlers::metrics as metrics_handler;
-use crate::handlers::{create_token_impl, livez, readyz, revoke_token_impl, verify_token_impl};
+use crate::handlers::{
+    create_token_impl, livez, readyz, revoke_subject_tokens_impl, revoke_token_impl,
+    verify_token_impl,
+};
 use crate::key::KeyManager;
 use crate::logging::{init_subscriber, RequestLog};
-use crate::models::{ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse};
+use crate::models::{
+    ErrorResponse, ReadinessResponse, RevokeGroupResponse, TokenRequest, TokenResponse,
+};
 use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
 
@@ -55,6 +60,7 @@ use crate::redis::RedisClient;
         handlers::create_token,
         handlers::verify_token,
         handlers::revoke_token,
+        handlers::revoke_subject_tokens,
         handlers::livez,
         handlers::readyz,
         handlers::metrics
@@ -63,7 +69,8 @@ use crate::redis::RedisClient;
         TokenRequest,
         TokenResponse,
         ErrorResponse,
-        ReadinessResponse
+        ReadinessResponse,
+        RevokeGroupResponse
     )),
     modifiers(&SecurityAddon)
 )]
@@ -277,6 +284,16 @@ async fn main() -> std::io::Result<()> {
                     .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
                     .wrap(deny_cors())
                     .route(web::delete().to(revoke_token_impl::<RedisClient>)),
+            )
+            // Уровень 3 (TOTP): массовый отзыв токенов субъекта. Обвязка та же,
+            // что у поштучного отзыва, — это операция того же класса, только
+            // разрушительнее, и внешнему миру её видеть незачем.
+            .service(
+                web::resource("/subjects/{sub}/tokens")
+                    .wrap(RateLimit::global(internal_limiter.clone()))
+                    .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                    .wrap(deny_cors())
+                    .route(web::delete().to(revoke_subject_tokens_impl::<RedisClient>)),
             )
             // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
             // scope, иначе тот перехватил бы путь.

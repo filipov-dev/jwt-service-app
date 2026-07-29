@@ -211,6 +211,87 @@ impl JtiStore for RedisClient {
         }
     }
 
+    /// Добавляет `jti` в ZSET группы со score, равным времени истечения
+    /// (`ZADD`).
+    ///
+    /// ZSET, а не SET: у элементов множества нет собственного TTL, и истёкшие
+    /// `jti` копились бы в индексе мёртвым грузом. Score = момент истечения
+    /// позволяет отрезать их одной командой (см. [`RedisClient::revoke_group`]).
+    ///
+    /// TTL самой группы продлевается до времени жизни самого долгого токена в
+    /// ней: иначе индекс пережил бы все свои токены и остался висеть в памяти.
+    #[tracing::instrument(name = "redis.add_to_group", skip_all, err(level = "debug"))]
+    async fn add_to_group(&self, group: &str, jti: &str, expires_at: i64) -> Result<(), JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let result: Result<(), RedisError> = async {
+            conn.zadd::<&str, i64, &str, ()>(group, jti, expires_at)
+                .await?;
+            conn.expire_at::<&str, ()>(group, expires_at).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                record_redis_command("add_to_group", true, started.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Redis: ZADD в группу не выполнился: {}", e);
+                record_redis_command("add_to_group", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Отзывает все токены группы.
+    ///
+    /// Порядок: отрезаем протухшие записи по score, забираем оставшиеся `jti`,
+    /// удаляем их пачкой и саму группу.
+    ///
+    /// Атомарности здесь намеренно нет: параллельный выпуск токена во время
+    /// отзыва может добавить `jti` уже после `ZRANGE`, и такой токен уцелеет.
+    /// Окно — доли миллисекунды, а цена атомарности (Lua-скрипт или WATCH) выше
+    /// пользы: массовый отзыв делают при компрометации, и следом за ним обычно
+    /// меняют учётные данные субъекта.
+    #[tracing::instrument(name = "redis.revoke_group", skip_all, err(level = "debug"))]
+    async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let result: Result<u64, RedisError> = async {
+            // Протухшие токены отзывать незачем — они и так невалидны.
+            conn.zrembyscore::<&str, &str, i64, ()>(group, "-inf", now)
+                .await?;
+
+            let jtis: Vec<String> = conn.zrange(group, 0, -1).await?;
+
+            if !jtis.is_empty() {
+                conn.del::<&Vec<String>, ()>(&jtis).await?;
+            }
+            conn.del::<&str, ()>(group).await?;
+
+            Ok(jtis.len() as u64)
+        }
+        .await;
+
+        match result {
+            Ok(count) => {
+                record_redis_command("revoke_group", true, started.elapsed());
+                Ok(count)
+            }
+            Err(e) => {
+                error!("Redis: отзыв группы не выполнился: {}", e);
+                record_redis_command("revoke_group", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
     /// Удаляет ключ `jti` (`DEL`); отзыв токена. Идемпотентна.
     #[tracing::instrument(name = "redis.delete_jti", skip_all, err(level = "debug"))]
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
