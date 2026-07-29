@@ -250,3 +250,141 @@ impl JwtManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Тесты фасада, дополняющие интеграционные тесты HTTP-слоя.
+    //!
+    //! Здесь проверяются ветки, до которых через HTTP не дотянуться: сбой
+    //! хранилища на конкретном шаге обмена. Ключи не нужны — все эти ветки
+    //! отрабатывают до обращения к JWKS.
+
+    use super::*;
+    use crate::models::jwt::JtiError;
+    use actix_web::web::Data;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+
+    /// Хранилище, у которого известен один refresh-токен, а всё остальное падает.
+    ///
+    /// Позволяет довести обмен до нужного шага и уронить именно его.
+    struct StoreWithRefresh {
+        records: Mutex<HashMap<String, RefreshRecord>>,
+        used: Mutex<Vec<String>>,
+        /// Ронять ли `mark_refresh_used` (имитация сбоя хранилища на пометке).
+        fail_mark: bool,
+    }
+
+    impl StoreWithRefresh {
+        fn new(id: &str, fail_mark: bool) -> Self {
+            let mut records = HashMap::new();
+            records.insert(
+                id.to_string(),
+                RefreshRecord {
+                    subject: "user1".to_string(),
+                    audience: vec!["api1".to_string()],
+                    family: "family-1".to_string(),
+                },
+            );
+
+            Self {
+                records: Mutex::new(records),
+                used: Mutex::new(Vec::new()),
+                fail_mark,
+            }
+        }
+    }
+
+    impl JtiStore for StoreWithRefresh {
+        async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            Ok(())
+        }
+
+        async fn check_jti(&self, _jti: &str) -> Result<bool, JtiError> {
+            Ok(true)
+        }
+
+        async fn delete_jti(&self, _jti: &str) -> Result<(), JtiError> {
+            Ok(())
+        }
+
+        async fn add_to_group(
+            &self,
+            _group: &str,
+            _jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            Ok(())
+        }
+
+        async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Ok(0)
+        }
+
+        async fn store_refresh(
+            &self,
+            _id: &str,
+            _record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            Ok(())
+        }
+
+        async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Ok(self.records.lock().get(id).cloned())
+        }
+
+        async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
+            if self.fail_mark {
+                return Err(JtiError::BadConnection);
+            }
+
+            let mut used = self.used.lock();
+            if used.iter().any(|u| u == id) {
+                return Ok(false);
+            }
+
+            used.push(id.to_string());
+            Ok(true)
+        }
+    }
+
+    #[actix_web::test]
+    async fn refresh_rejects_unknown_token() {
+        let store = Data::new(StoreWithRefresh::new("known", false));
+        let keys = KeyManager::new("EdDSA".to_string());
+
+        let result = JwtManager::refresh_token_pair("unknown", "issuer", &keys, store).await;
+
+        // Именно NotValid, а не StoreError: это вина клиента, и наружу уйдёт 401.
+        assert!(matches!(result, Err(JwtError::NotValid)));
+    }
+
+    #[actix_web::test]
+    async fn refresh_reports_store_failure_separately() {
+        // Токен найден, но пометка использования не прошла — это сбой хранилища,
+        // а не невалидный токен. Разница видна снаружи: 500 против 401.
+        let store = Data::new(StoreWithRefresh::new("known", true));
+        let keys = KeyManager::new("EdDSA".to_string());
+
+        let result = JwtManager::refresh_token_pair("known", "issuer", &keys, store).await;
+
+        assert!(matches!(result, Err(JwtError::StoreError)));
+    }
+
+    #[test]
+    fn refresh_ttl_falls_back_to_default() {
+        // Значение по умолчанию берётся, когда переменная не задана; кривое
+        // значение тоже откатывается на дефолт, а не роняет выпуск.
+        std::env::remove_var("JWT_TEST_TTL");
+        assert_eq!(env_u64("JWT_TEST_TTL", 42), 42);
+
+        std::env::set_var("JWT_TEST_TTL", "не-число");
+        assert_eq!(env_u64("JWT_TEST_TTL", 42), 42);
+
+        std::env::set_var("JWT_TEST_TTL", "100");
+        assert_eq!(env_u64("JWT_TEST_TTL", 42), 100);
+
+        std::env::remove_var("JWT_TEST_TTL");
+    }
+}

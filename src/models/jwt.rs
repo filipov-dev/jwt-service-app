@@ -1073,7 +1073,11 @@ mod tests {
             PKey::public_key_from_raw_bytes(&private.raw_public_key().unwrap(), Id::ED25519)
                 .unwrap();
 
-        let headers = TokenHeaders::create_new("kid-1".to_string());
+        // `alg` задаётся явно, а не через `TokenHeaders::create_new`: тот читает
+        // `TOKEN_ALGORITHM` из окружения, и тест проходил лишь потому, что
+        // соседи успевали выставить там `EdDSA`. В одиночку он падал — ключ
+        // Ed25519 подписывался с дайджестом от дефолтного `RS256`.
+        let headers = headers_with_alg("EdDSA");
         let claims = sample_claims();
         let jwt = JsonWebToken::create_new(headers, claims, private);
 

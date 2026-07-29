@@ -182,3 +182,94 @@ pub struct Jwks {
     /// Список доступных публичных ключей.
     pub keys: Vec<Jwk>,
 }
+
+#[cfg(test)]
+mod tests {
+    //! Тесты сериализации DTO.
+    //!
+    //! Проверяется то, что видит клиент: форма JSON и поведение дефолтов.
+    //! Обе вещи — часть публичного контракта, а не деталь реализации.
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn token_response_omits_refresh_when_absent() {
+        let response = TokenResponse {
+            token: "header.payload.signature".to_string(),
+            refresh_token: None,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+
+        // Ключа быть не должно вовсе — не `null`. Иначе прежние клиенты увидели
+        // бы в ответе новое поле, которого не ждали (см. `skip_serializing_if`).
+        assert_eq!(value, json!({ "token": "header.payload.signature" }));
+        assert!(!value.as_object().unwrap().contains_key("refresh_token"));
+    }
+
+    #[test]
+    fn token_response_includes_refresh_when_present() {
+        let response = TokenResponse {
+            token: "header.payload.signature".to_string(),
+            refresh_token: Some("refresh-id".to_string()),
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(value["refresh_token"], "refresh-id");
+    }
+
+    #[test]
+    fn token_request_defaults_are_optional() {
+        // Минимальное тело: ни `ttl`, ни `refresh` клиент присылать не обязан.
+        let request: TokenRequest =
+            serde_json::from_value(json!({ "sub": "user1", "aud": ["api1"] })).unwrap();
+
+        assert_eq!(request.sub, "user1");
+        assert_eq!(request.aud, vec!["api1".to_string()]);
+        assert!(request.ttl.is_none());
+        assert!(!request.refresh, "refresh по умолчанию выключен");
+    }
+
+    #[test]
+    fn token_request_reads_explicit_values() {
+        let request: TokenRequest = serde_json::from_value(
+            json!({ "sub": "user1", "aud": ["api1"], "ttl": 60, "refresh": true }),
+        )
+        .unwrap();
+
+        assert_eq!(request.ttl, Some(60));
+        assert!(request.refresh);
+    }
+
+    #[test]
+    fn jwk_keeps_unset_components_as_none() {
+        // OKP-ключ (EdDSA): заполнены `crv`/`x`, компоненты RSA отсутствуют.
+        let jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP", "alg": "EdDSA", "kid": "kid-1",
+            "crv": "Ed25519", "x": "AAAA",
+        }))
+        .unwrap();
+
+        assert_eq!(jwk.crv.as_deref(), Some("Ed25519"));
+        assert!(jwk.n.is_none());
+        assert!(jwk.e.is_none());
+        assert!(jwk.y.is_none());
+    }
+
+    #[test]
+    fn jwks_parses_empty_key_list() {
+        // Пустой список — штатный ответ сервиса ключей до выпуска первого ключа.
+        let jwks: Jwks = serde_json::from_value(json!({ "keys": [] })).unwrap();
+        assert!(jwks.keys.is_empty());
+    }
+
+    #[test]
+    fn error_response_has_no_details_by_default() {
+        let error = ErrorResponse::new("Invalid token");
+
+        assert_eq!(error.error, "Invalid token");
+        assert!(error.details.is_none());
+    }
+}
