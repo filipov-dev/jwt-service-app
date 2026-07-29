@@ -198,20 +198,24 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
     path = "/tokens/{jti}",
     security(("totp" = [])),
     responses(
-        (status = 204),
+        (status = 204, description = "Токен отозван. Идемпотентно: несуществующий `jti` — тоже 204"),
         (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 404, body = ErrorResponse),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)")
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
     )
 )]
 /// Отзывает токен по его идентификатору `jti`.
 ///
 /// Удаляет запись `jti` из Redis; после этого проверка соответствующего токена
-/// в [`verify_token`] будет неуспешной. Операция идемпотентна.
+/// в [`verify_token`] будет неуспешной.
 ///
 /// # Ответы
-/// - `204 No Content` — всегда, даже если `jti` не существовал. Ошибка Redis
-///   логируется, но наружу не пробрасывается.
+/// - `204 No Content` — токен отозван. **Идемпотентно**: несуществующий `jti`
+///   тоже даёт `204`, потому что желаемое состояние достигнуто — такого токена
+///   нет;
+/// - `500 Internal Server Error` — хранилище недоступно, отзыв **не выполнен**.
+///   Отличать этот случай от успеха обязательно: вызывающий отзывает
+///   скомпрометированный токен и должен узнать, что попытка не удалась.
 #[delete("/tokens/{jti}")]
 pub async fn revoke_token(
     jti: web::Path<String>,
@@ -231,14 +235,19 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
         Ok(_) => {
             crate::metrics::record_token_revoked();
             info!("Токен отозван");
+            Ok(HttpResponse::NoContent().finish())
         }
         Err(e) => {
             // Отказ хранилища — наша вина, ERROR.
+            //
+            // Раньше ошибка проглатывалась и наружу всё равно уходил `204`:
+            // вызывающий считал скомпрометированный токен отозванным и не
+            // повторял попытку, хотя токен оставался активным. Молчаливый
+            // «успех» здесь опаснее честной ошибки.
             error!("Не удалось отозвать токен: {}", e);
+            Err(Error::Internal("Failed to revoke token".into()))
         }
-    };
-
-    Ok(HttpResponse::NoContent().finish())
+    }
 }
 
 #[utoipa::path(
@@ -603,6 +612,57 @@ mod tests {
                 }
                 None => Ok(false),
             }
+        }
+    }
+
+    /// [`JtiStore`], у которого любая операция падает: имитирует недоступное
+    /// хранилище.
+    ///
+    /// Нужен там, где проверяется не результат операции, а честность ответа при
+    /// сбое: `MockStore` всегда успешен и такую ветку не покрывает.
+    struct UnavailableStore;
+
+    impl JtiStore for UnavailableStore {
+        async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn check_jti(&self, _jti: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn delete_jti(&self, _jti: &str) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn add_to_group(
+            &self,
+            _group: &str,
+            _jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn store_refresh(
+            &self,
+            _id: &str,
+            _record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn get_refresh(&self, _id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
         }
     }
 
@@ -1060,6 +1120,26 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[actix_web::test]
+    async fn revoke_reports_store_failure_instead_of_204() {
+        // Хранилище недоступно — отзыв не выполнен, и клиент обязан это узнать.
+        // Прежнее поведение (всегда `204`) означало, что вызывающий считал
+        // скомпрометированный токен погашенным и не повторял попытку.
+        let store = web::Data::new(UnavailableStore);
+        let app = test::init_service(App::new().app_data(store).route(
+            "/tokens/{jti}",
+            web::delete().to(revoke_token_impl::<UnavailableStore>),
+        ))
+        .await;
+
+        let req = test::TestRequest::delete()
+            .uri("/tokens/some-jti")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[actix_web::test]
