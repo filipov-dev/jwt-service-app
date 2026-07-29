@@ -53,8 +53,8 @@ access + refresh. Refresh-токен — непрозрачная строка, 
 | Уровень | Эндпоинты | Валидатор |
 |--------:|-----------|-----------|
 | **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет (пропускает всё) |
-| **2 — proxy-secret** | `POST /tokens/verify`, `POST /tokens/refresh` | статический секрет-заголовок от прокси, сравнение constant-time |
-| **3 — TOTP** | `POST /tokens`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | TOTP (RFC 6238), internal app-to-app |
+| **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от прокси, сравнение constant-time |
+| **3 — TOTP** | `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | TOTP (RFC 6238), internal app-to-app |
 | **4 — Bearer-токен** | `GET /metrics` (только если задан токен) | статический токен в `Authorization: Bearer`, сравнение constant-time |
 
 - **Уровень 2** — заголовок `X-Proxy-Secret` (имя настраивается), который ставит
@@ -100,8 +100,8 @@ access + refresh. Refresh-токен — непрозрачная строка, 
 
 | Ручка | Тип лимита | Порядок относительно auth |
 |-------|-----------|---------------------------|
-| `POST /tokens/verify`, `POST /tokens/refresh` (уровень 2) | **per-IP** (ключ — IP клиента) | **снаружи** auth — флуд отсекается до проверки proxy-secret |
-| `POST /tokens`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` (уровень 3) | **опц. глобальный cap** на эндпоинт (не per-IP) | **внутри** auth — потолок расходуют только запросы, прошедшие TOTP |
+| `POST /tokens/verify` (уровень 2) | **per-IP** (ключ — IP клиента) | **снаружи** auth — флуд отсекается до проверки proxy-secret |
+| `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` (уровень 3) | **опц. глобальный cap** на эндпоинт (не per-IP) | **внутри** auth — потолок расходуют только запросы, прошедшие TOTP |
 
 - **Почему так.** На публичной `/tokens/verify` клиентов много и они разные →
   per-IP. Internal-ручки бьёт один-два доверенных клиента с одного адреса → per-IP
@@ -282,6 +282,12 @@ baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
     не могут обе получить новую пару.
   - **Access-токены тоже попадают в группу семьи.** Иначе детектор гасил бы
     только refresh, а уже выданные access продолжали бы работать до своего `exp`.
+  - **Обмен закрыт уровнем 3, как и выпуск.** Обмен — это выпуск токена, просто
+    основанием служит предъявленный refresh, а не запрос доверенного бэкенда.
+    Уровень 2 здесь был бы дырой: proxy-secret статичен и вызывающего не
+    аутентифицирует, поэтому украденный refresh давал бы вечную цепочку токенов
+    любому, кто дотянулся через прокси. Конечное приложение с сервисом напрямую
+    не общается — с ним говорит бэкенд-потребитель, который и держит TOTP-секрет.
 - **Группы токенов (`models/jwt.rs`, `redis.rs`).** Механизм намеренно обобщён:
   хранилище оперирует абстрактным ключом группы, а смысл задаёт вызывающий
   ([`subject_group`]). Так его переиспользует отзыв семьи refresh-токенов

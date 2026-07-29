@@ -297,11 +297,12 @@ pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
     post,
     path = "/tokens/refresh",
     request_body = RefreshRequest,
-    security(("proxy_secret" = [])),
+    security(("totp" = [])),
     responses(
         (status = 200, body = TokenResponse),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 2: нет proxy-secret, либо refresh-токен неизвестен/использован"),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: нет TOTP-кода, либо refresh-токен неизвестен/использован"),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
         (status = 500, body = ErrorResponse)
     )
 )]
@@ -312,8 +313,10 @@ pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
 /// семья, включая выданные по ней access-токены (см.
 /// [`JwtManager::refresh_token_pair`]).
 ///
-/// Уровень доступа 2 (proxy-secret), а не 3: TOTP-код клиентское приложение не
-/// посчитает, а субъекта аутентифицирует сам refresh-токен.
+/// Уровень доступа 3 (TOTP), как и у `POST /tokens`: обмен — это выпуск токена,
+/// просто основанием служит предъявленный refresh, а не запрос доверенного
+/// бэкенда. Ручку дёргает тот же internal-клиент, что выпускает токены; конечное
+/// приложение с сервисом напрямую не общается.
 ///
 /// # Ответы
 /// - `200 OK` — [`TokenResponse`] с новыми `token` и `refresh_token`;

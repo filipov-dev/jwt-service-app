@@ -281,14 +281,16 @@ async fn main() -> std::io::Result<()> {
                     .wrap(cors)
                     .route(web::post().to(verify_token_impl::<RedisClient>)),
             )
-            // Уровень 2 (proxy-secret): обмен refresh-токена. Не уровень 3 —
-            // TOTP-код клиентское приложение не посчитает, а субъекта
-            // аутентифицирует сам refresh-токен. CORS запрещающий: refresh-токену
-            // не место в браузере, его предъявляет бэкенд клиента.
+            // Уровень 3 (TOTP): обмен refresh-токена. Это операция ВЫПУСКА, просто
+            // с другим основанием — вместо «доверенный бэкенд попросил» действует
+            // «предъявлен валидный refresh». Раз `POST /tokens` закрыт TOTP,
+            // перевыпуск обязан быть там же: proxy-secret статичен и вызывающего
+            // не аутентифицирует, так что на уровне 2 украденный refresh давал бы
+            // вечную цепочку токенов любому, кто дотянулся через прокси.
             .service(
                 web::resource("/tokens/refresh")
-                    .wrap(Auth::new(AuthLevel::ProxySecret, auth.clone()))
-                    .wrap(RateLimit::per_ip(verify_limiter.clone()))
+                    .wrap(RateLimit::global(internal_limiter.clone()))
+                    .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
                     .wrap(deny_cors())
                     .route(web::post().to(refresh_token_impl::<RedisClient>)),
             )
