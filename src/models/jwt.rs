@@ -84,6 +84,19 @@ where
     /// **атомарной**: на ней держится и детектор повторного использования, и
     /// защита от гонки двух одновременных обменов одним токеном.
     async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError>;
+    /// Резервирует одноразовый TOTP-код на время `ttl` (в секундах).
+    ///
+    /// Возвращает `true`, если код зарезервирован именно этим вызовом, и
+    /// `false`, если он уже предъявлялся — то есть это повтор.
+    ///
+    /// Как и [`JtiStore::mark_refresh_used`], операция обязана быть **атомарной**
+    /// (`SET NX`): на ней держится защита от переигрывания кода.
+    async fn claim_totp_code(&self, hash: &str, ttl: u64) -> Result<bool, JtiError>;
+}
+
+/// Ключ зарезервированного TOTP-кода в хранилище.
+pub fn totp_code_key(hash: &str) -> String {
+    format!("totp:used:{hash}")
 }
 
 /// Ключ группы токенов, выпущенных на субъект.
@@ -710,6 +723,10 @@ mod tests {
                 None => Ok(false),
             }
         }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            Ok(true)
+        }
     }
 
     /// [`JtiStore`], у которого запись `jti` всегда падает — имитирует
@@ -756,6 +773,10 @@ mod tests {
         }
 
         async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
             Err(JtiError::BadConnection)
         }
     }
@@ -819,6 +840,10 @@ mod tests {
         }
 
         async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
+            Err(JtiError::WrongOperation)
+        }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
             Err(JtiError::WrongOperation)
         }
     }

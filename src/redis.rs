@@ -6,7 +6,7 @@
 //! естественное «протухание».
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{AsyncCommands, RedisError};
+use redis::{AsyncCommands, ExistenceCheck, RedisError, SetExpiry, SetOptions};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use tokio::sync::OnceCell;
 use tracing::error;
 
 use crate::metrics::record_redis_command;
-use crate::models::jwt::{refresh_key, JtiError, JtiStore, RefreshRecord};
+use crate::models::jwt::{refresh_key, totp_code_key, JtiError, JtiStore, RefreshRecord};
 
 /// Таймаут ожидания ответа на команду (`REDIS_RESPONSE_TIMEOUT_MS`).
 ///
@@ -413,6 +413,40 @@ impl JtiStore for RedisClient {
             Err(e) => {
                 error!("Redis: пометка refresh-токена не выполнилась: {}", e);
                 record_redis_command("mark_refresh_used", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Резервирует TOTP-код через `SET NX EX`.
+    ///
+    /// `SET NX` возвращает `nil`, если ключ уже существует, — то есть операция
+    /// атомарна и «победитель» ровно один. На этом держится защита от
+    /// переигрывания: второе предъявление того же кода получит `false`.
+    ///
+    /// Значение-заглушка `1`: важен сам факт наличия ключа, а TTL снимает запись
+    /// вместе с окном действия кода.
+    #[tracing::instrument(name = "redis.claim_totp_code", skip_all, err(level = "debug"))]
+    async fn claim_totp_code(&self, hash: &str, ttl: u64) -> Result<bool, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let options = SetOptions::default()
+            .conditional_set(ExistenceCheck::NX)
+            .with_expiration(SetExpiry::EX(ttl));
+
+        match conn
+            .set_options::<String, u8, Option<String>>(totp_code_key(hash), 1, options)
+            .await
+        {
+            Ok(result) => {
+                record_redis_command("claim_totp_code", true, started.elapsed());
+                // `Some("OK")` — ключ создан нами, `None` — уже существовал.
+                Ok(result.is_some())
+            }
+            Err(e) => {
+                error!("Redis: резервирование TOTP-кода не выполнилось: {}", e);
+                record_redis_command("claim_totp_code", false, started.elapsed());
                 Err(classify(&e))
             }
         }

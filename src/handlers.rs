@@ -518,6 +518,8 @@ mod tests {
         groups: PlMutex<HashMap<String, HashSet<String>>>,
         /// Записи refresh-токенов и признак использования.
         refreshes: PlMutex<HashMap<String, (RefreshRecord, bool)>>,
+        /// Отпечатки уже предъявленных TOTP-кодов.
+        used_codes: PlMutex<HashSet<String>>,
     }
 
     impl MockStore {
@@ -526,6 +528,7 @@ mod tests {
                 jtis: PlMutex::new(HashSet::new()),
                 groups: PlMutex::new(HashMap::new()),
                 refreshes: PlMutex::new(HashMap::new()),
+                used_codes: PlMutex::new(HashSet::new()),
             }
         }
     }
@@ -613,6 +616,11 @@ mod tests {
                 None => Ok(false),
             }
         }
+
+        async fn claim_totp_code(&self, hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            // `insert` возвращает false, если элемент уже был — это и есть повтор.
+            Ok(self.used_codes.lock().insert(hash.to_string()))
+        }
     }
 
     /// [`JtiStore`], у которого любая операция падает: имитирует недоступное
@@ -662,6 +670,10 @@ mod tests {
         }
 
         async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
             Err(JtiError::BadConnection)
         }
     }
