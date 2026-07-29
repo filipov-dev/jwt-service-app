@@ -68,16 +68,60 @@ where
     ///
     /// Идемпотентна: для несуществующей группы возвращает `0`.
     async fn revoke_group(&self, group: &str) -> Result<u64, JtiError>;
+    /// Сохраняет запись refresh-токена со временем жизни `ttl` (в секундах).
+    async fn store_refresh(
+        &self,
+        id: &str,
+        record: &RefreshRecord,
+        ttl: u64,
+    ) -> Result<(), JtiError>;
+    /// Читает запись refresh-токена. `None` — записи нет (истекла или отозвана).
+    async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError>;
+    /// Помечает refresh-токен использованным.
+    ///
+    /// Возвращает `true`, если пометка проставлена именно этим вызовом, и
+    /// `false`, если токен уже был использован раньше. Операция обязана быть
+    /// **атомарной**: на ней держится и детектор повторного использования, и
+    /// защита от гонки двух одновременных обменов одним токеном.
+    async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError>;
 }
 
 /// Ключ группы токенов, выпущенных на субъект.
 ///
 /// Вынесено в функцию не ради красоты: тот же механизм групп переиспользует
-/// отзыв семьи refresh-токенов (JWT-28), поэтому хранилище оперирует абстрактным
-/// ключом, а смысл группы задаёт вызывающий. Префикс отделяет группы от плоских
-/// ключей-`jti`.
+/// отзыв семьи refresh-токенов ([`family_group`]), поэтому хранилище оперирует
+/// абстрактным ключом, а смысл группы задаёт вызывающий. Префикс отделяет группы
+/// от плоских ключей-`jti`.
 pub fn subject_group(subject: &str) -> String {
     format!("group:sub:{subject}")
+}
+
+/// Ключ группы одной семьи refresh-токенов.
+///
+/// В группу попадают и `jti` выданных access-токенов, и ключи самих
+/// refresh-записей — поэтому один `revoke_group` гасит всю цепочку целиком.
+pub fn family_group(family: &str) -> String {
+    format!("group:family:{family}")
+}
+
+/// Ключ записи refresh-токена в хранилище.
+pub fn refresh_key(id: &str) -> String {
+    format!("refresh:{id}")
+}
+
+/// Запись refresh-токена: всё, что нужно, чтобы выпустить по нему новый access.
+///
+/// Сам refresh-токен — непрозрачная случайная строка, а не JWT: его никто не
+/// разбирает и не проверяет по подписи, он лишь ключ к этой записи. Значит и
+/// утёкший токен бесполезен без хранилища, а отзыв мгновенен.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshRecord {
+    /// Субъект, которому выдан токен.
+    pub subject: String,
+    /// Аудитория, с которой выпускаются access-токены цепочки.
+    pub audience: Vec<String>,
+    /// Идентификатор семьи — общий для всей цепочки ротации.
+    pub family: String,
 }
 
 #[derive(Error, Debug)]
@@ -579,6 +623,7 @@ mod tests {
     struct MockStore {
         jtis: Mutex<HashSet<String>>,
         groups: Mutex<HashMap<String, HashSet<String>>>,
+        refreshes: Mutex<HashMap<String, (RefreshRecord, bool)>>,
     }
 
     impl MockStore {
@@ -586,6 +631,7 @@ mod tests {
             Self {
                 jtis: Mutex::new(HashSet::new()),
                 groups: Mutex::new(HashMap::new()),
+                refreshes: Mutex::new(HashMap::new()),
             }
         }
 
@@ -631,6 +677,39 @@ mod tests {
 
             Ok(revoked as u64)
         }
+
+        async fn store_refresh(
+            &self,
+            id: &str,
+            record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            self.refreshes
+                .lock()
+                .insert(id.to_string(), (record.clone(), false));
+            Ok(())
+        }
+
+        async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Ok(self
+                .refreshes
+                .lock()
+                .get(id)
+                .map(|(record, _)| record.clone()))
+        }
+
+        async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
+            let mut refreshes = self.refreshes.lock();
+
+            match refreshes.get_mut(id) {
+                Some((_, true)) => Ok(false),
+                Some((_, used)) => {
+                    *used = true;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
     }
 
     /// [`JtiStore`], у которого запись `jti` всегда падает — имитирует
@@ -660,6 +739,23 @@ mod tests {
         }
 
         async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn store_refresh(
+            &self,
+            _id: &str,
+            _record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn get_refresh(&self, _id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
             Err(JtiError::BadConnection)
         }
     }
@@ -706,6 +802,23 @@ mod tests {
         }
 
         async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::WrongOperation)
+        }
+
+        async fn store_refresh(
+            &self,
+            _id: &str,
+            _record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::WrongOperation)
+        }
+
+        async fn get_refresh(&self, _id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Err(JtiError::WrongOperation)
+        }
+
+        async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
             Err(JtiError::WrongOperation)
         }
     }

@@ -7,6 +7,7 @@
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{AsyncCommands, RedisError};
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use tokio::sync::OnceCell;
 use tracing::error;
 
 use crate::metrics::record_redis_command;
-use crate::models::jwt::{JtiError, JtiStore};
+use crate::models::jwt::{refresh_key, JtiError, JtiStore, RefreshRecord};
 
 /// Таймаут ожидания ответа на команду (`REDIS_RESPONSE_TIMEOUT_MS`).
 ///
@@ -287,6 +288,131 @@ impl JtiStore for RedisClient {
             Err(e) => {
                 error!("Redis: отзыв группы не выполнился: {}", e);
                 record_redis_command("revoke_group", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Сохраняет запись refresh-токена как HASH с TTL.
+    #[tracing::instrument(name = "redis.store_refresh", skip_all, err(level = "debug"))]
+    async fn store_refresh(
+        &self,
+        id: &str,
+        record: &RefreshRecord,
+        ttl: u64,
+    ) -> Result<(), JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+        let key = refresh_key(id);
+
+        // Аудитория — список, а в HASH значения плоские; кладём JSON-массивом.
+        let audience = match serde_json::to_string(&record.audience) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Redis: не сериализуется audience refresh-токена: {}", e);
+                return Err(JtiError::WrongOperation);
+            }
+        };
+
+        let result: Result<(), RedisError> = async {
+            conn.hset_multiple::<&str, &str, String, ()>(
+                &key,
+                &[
+                    ("sub", record.subject.clone()),
+                    ("aud", audience),
+                    ("family", record.family.clone()),
+                ],
+            )
+            .await?;
+            conn.expire::<&str, ()>(&key, ttl as i64).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                record_redis_command("store_refresh", true, started.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Redis: запись refresh-токена не выполнилась: {}", e);
+                record_redis_command("store_refresh", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Читает запись refresh-токена (`HGETALL`).
+    #[tracing::instrument(name = "redis.get_refresh", skip_all, err(level = "debug"))]
+    async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let fields: Result<HashMap<String, String>, RedisError> =
+            conn.hgetall(refresh_key(id)).await;
+
+        let fields = match fields {
+            Ok(v) => {
+                record_redis_command("get_refresh", true, started.elapsed());
+                v
+            }
+            Err(e) => {
+                error!("Redis: чтение refresh-токена не выполнилось: {}", e);
+                record_redis_command("get_refresh", false, started.elapsed());
+                return Err(classify(&e));
+            }
+        };
+
+        // Пустой HASH — ключа нет: истёк или отозван.
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        let (Some(subject), Some(audience), Some(family)) =
+            (fields.get("sub"), fields.get("aud"), fields.get("family"))
+        else {
+            // Запись есть, но неполная — так быть не должно; трактуем как
+            // отсутствие, чтобы не выпустить токен на мусорных данных.
+            error!("Redis: запись refresh-токена неполная");
+            return Ok(None);
+        };
+
+        let audience: Vec<String> = match serde_json::from_str(audience) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Redis: audience refresh-токена не разбирается: {}", e);
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(RefreshRecord {
+            subject: subject.clone(),
+            audience,
+            family: family.clone(),
+        }))
+    }
+
+    /// Помечает refresh-токен использованным (`HSETNX`).
+    ///
+    /// `HSETNX` возвращает `1`, только если поля ещё не было, — то есть операция
+    /// атомарна и «победитель» ровно один. На этом держится детектор повторного
+    /// использования: второй обмен тем же токеном получит `false`.
+    #[tracing::instrument(name = "redis.mark_refresh_used", skip_all, err(level = "debug"))]
+    async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        match conn
+            .hset_nx::<String, &str, u8, bool>(refresh_key(id), "used", 1)
+            .await
+        {
+            Ok(marked) => {
+                record_redis_command("mark_refresh_used", true, started.elapsed());
+                Ok(marked)
+            }
+            Err(e) => {
+                error!("Redis: пометка refresh-токена не выполнилась: {}", e);
+                record_redis_command("mark_refresh_used", false, started.elapsed());
                 Err(classify(&e))
             }
         }
