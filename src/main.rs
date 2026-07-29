@@ -178,7 +178,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
         .service(
             web::resource("/tokens")
                 .wrap(RateLimit::global(internal_limiter.clone()))
-                .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
                 .route(web::post().to(create_token_impl::<S>)),
         )
@@ -190,7 +190,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
         // CORS'ом раньше, чем его отклонят auth или rate-limit.
         .service(
             web::resource("/tokens/verify")
-                .wrap(Auth::new(AuthLevel::ProxySecret, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::ProxySecret, auth.clone()))
                 .wrap(RateLimit::per_ip(verify_limiter.clone()))
                 .wrap(cors)
                 .route(web::post().to(verify_token_impl::<S>)),
@@ -204,14 +204,14 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
         .service(
             web::resource("/tokens/refresh")
                 .wrap(RateLimit::global(internal_limiter.clone()))
-                .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
                 .route(web::post().to(refresh_token_impl::<S>)),
         )
         .service(
             web::resource("/tokens/{jti}")
                 .wrap(RateLimit::global(internal_limiter.clone()))
-                .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
                 .route(web::delete().to(revoke_token_impl::<S>)),
         )
@@ -221,7 +221,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
         .service(
             web::resource("/subjects/{sub}/tokens")
                 .wrap(RateLimit::global(internal_limiter.clone()))
-                .wrap(Auth::new(AuthLevel::Totp, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
                 .route(web::delete().to(revoke_subject_tokens_impl::<S>)),
         );
@@ -236,7 +236,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
     if auth.metrics_enabled() {
         cfg.service(
             web::resource("/metrics")
-                .wrap(Auth::new(AuthLevel::MetricsToken, auth.clone()))
+                .wrap(Auth::<S>::new(AuthLevel::MetricsToken, auth.clone()))
                 .wrap(deny_cors())
                 .route(web::get().to(metrics_handler)),
         );
@@ -248,7 +248,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
     // имеют приоритет.
     cfg.service(
         web::scope("")
-            .wrap(Auth::new(AuthLevel::Open, auth.clone()))
+            .wrap(Auth::<S>::new(AuthLevel::Open, auth.clone()))
             .wrap(deny_cors())
             .route("/api-docs/openapi.json", web::get().to(openapi_spec))
             .service(livez)
@@ -483,6 +483,10 @@ mod tests {
 
         async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
             Ok(false)
+        }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            Ok(true)
         }
     }
 

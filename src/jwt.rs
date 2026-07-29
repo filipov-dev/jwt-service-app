@@ -347,6 +347,10 @@ mod tests {
             used.push(id.to_string());
             Ok(true)
         }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            Ok(true)
+        }
     }
 
     #[actix_web::test]
