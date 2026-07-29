@@ -59,6 +59,25 @@ where
     async fn check_jti(&self, jti: &str) -> Result<bool, JtiError>;
     /// Удаляет `jti` (отзыв токена). Идемпотентна.
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError>;
+    /// Привязывает `jti` к группе; `expires_at` — unix-время истечения токена.
+    ///
+    /// Группа нужна, чтобы гасить токены пачкой. Ключ группы формирует
+    /// вызывающий (см. [`subject_group`]) — само хранилище о его смысле не знает.
+    async fn add_to_group(&self, group: &str, jti: &str, expires_at: i64) -> Result<(), JtiError>;
+    /// Отзывает все токены группы и саму группу. Возвращает число отозванных.
+    ///
+    /// Идемпотентна: для несуществующей группы возвращает `0`.
+    async fn revoke_group(&self, group: &str) -> Result<u64, JtiError>;
+}
+
+/// Ключ группы токенов, выпущенных на субъект.
+///
+/// Вынесено в функцию не ради красоты: тот же механизм групп переиспользует
+/// отзыв семьи refresh-токенов (JWT-28), поэтому хранилище оперирует абстрактным
+/// ключом, а смысл группы задаёт вызывающий. Префикс отделяет группы от плоских
+/// ключей-`jti`.
+pub fn subject_group(subject: &str) -> String {
+    format!("group:sub:{subject}")
 }
 
 #[derive(Error, Debug)]
@@ -174,6 +193,17 @@ impl TokenClaims {
             .await
             .map_err(|e| {
                 error!("JTI Store: {}", e);
+                JwtError::StoreError
+            })?;
+
+        // Индекс для массового отзыва — тоже fail-fast, и по той же причине, что
+        // и сам `jti`: токен, не попавший в индекс, переживёт отзыв всех токенов
+        // субъекта. Тихо выпустить такой токен опаснее, чем не выпустить вовсе.
+        store
+            .add_to_group(&subject_group(subject), &jti, exp.timestamp())
+            .await
+            .map_err(|e| {
+                error!("JTI Store (индекс субъекта): {}", e);
                 JwtError::StoreError
             })?;
 
@@ -543,17 +573,19 @@ mod tests {
     use openssl::pkey::Id;
     use openssl::rsa::Rsa;
     use parking_lot::Mutex;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// In-memory реализация [`JtiStore`] для тестов.
     struct MockStore {
         jtis: Mutex<HashSet<String>>,
+        groups: Mutex<HashMap<String, HashSet<String>>>,
     }
 
     impl MockStore {
         fn new() -> Self {
             Self {
                 jtis: Mutex::new(HashSet::new()),
+                groups: Mutex::new(HashMap::new()),
             }
         }
 
@@ -576,6 +608,29 @@ mod tests {
             self.jtis.lock().remove(jti);
             Ok(())
         }
+
+        async fn add_to_group(
+            &self,
+            group: &str,
+            jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            self.groups
+                .lock()
+                .entry(group.to_string())
+                .or_default()
+                .insert(jti.to_string());
+            Ok(())
+        }
+
+        async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
+            let members = self.groups.lock().remove(group).unwrap_or_default();
+
+            let mut jtis = self.jtis.lock();
+            let revoked = members.iter().filter(|jti| jtis.remove(*jti)).count();
+
+            Ok(revoked as u64)
+        }
     }
 
     /// [`JtiStore`], у которого запись `jti` всегда падает — имитирует
@@ -593,6 +648,65 @@ mod tests {
 
         async fn delete_jti(&self, _jti: &str) -> Result<(), JtiError> {
             Err(JtiError::BadConnection)
+        }
+
+        async fn add_to_group(
+            &self,
+            _group: &str,
+            _jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+    }
+
+    /// [`JtiStore`], у которого падает ТОЛЬКО запись в индекс группы.
+    ///
+    /// Нужен, чтобы проверить fail-fast отдельно: сам `jti` записался, а индекс
+    /// для массового отзыва — нет. Такой токен пережил бы отзыв всех токенов
+    /// субъекта, поэтому выпускать его нельзя.
+    struct FailingGroupStore {
+        jtis: Mutex<HashSet<String>>,
+    }
+
+    impl FailingGroupStore {
+        fn new() -> Self {
+            Self {
+                jtis: Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    impl JtiStore for FailingGroupStore {
+        async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            self.jtis.lock().insert(jti.to_string());
+            Ok(())
+        }
+
+        async fn check_jti(&self, jti: &str) -> Result<bool, JtiError> {
+            Ok(self.jtis.lock().contains(jti))
+        }
+
+        async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
+            self.jtis.lock().remove(jti);
+            Ok(())
+        }
+
+        async fn add_to_group(
+            &self,
+            _group: &str,
+            _jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::WrongOperation)
+        }
+
+        async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::WrongOperation)
         }
     }
 
@@ -815,6 +929,25 @@ mod tests {
 
         let result = TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
         assert!(matches!(result, Err(JwtError::StoreError)));
+    }
+
+    #[actix_web::test]
+    async fn create_new_fails_when_group_index_unavailable() {
+        // Сам `jti` записался, а индекс субъекта — нет. Такой токен пережил бы
+        // массовый отзыв, поэтому выпускать его нельзя: fail-fast, как и при
+        // недоступной записи `jti`.
+        let store = Data::new(FailingGroupStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let result = TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
+        assert!(matches!(result, Err(JwtError::StoreError)));
+    }
+
+    #[test]
+    fn subject_group_is_namespaced() {
+        // Префикс отделяет группы от плоских ключей-`jti`, иначе субъект с
+        // именем-UUID мог бы совпасть с чужим идентификатором токена.
+        assert_eq!(subject_group("user1"), "group:sub:user1");
     }
 
     // --- Подпись токена (JsonWebToken::to_string) ---
