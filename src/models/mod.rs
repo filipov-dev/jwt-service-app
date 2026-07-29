@@ -32,6 +32,14 @@ pub struct TokenRequest {
     #[schema(example = 3600, nullable = true)]
     #[serde(default)]
     pub ttl: Option<u64>,
+
+    /// Выдать вместе с токеном refresh-токен для продления сессии.
+    ///
+    /// По умолчанию `false` — контракт существующих клиентов не меняется, а
+    /// refresh появляется только у тех, кто его осознанно попросил.
+    #[schema(example = false)]
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 /// Тело запроса на проверку токена (`POST /tokens/verify`).
@@ -52,6 +60,22 @@ pub struct TokenResponse {
     /// Подписанный JWT.
     #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
     pub token: String,
+
+    /// Refresh-токен, если он запрашивался.
+    ///
+    /// Непрозрачная строка, а не JWT: разбирать её клиенту незачем, она лишь
+    /// предъявляется в `POST /tokens/refresh`. Отсутствует в ответе, когда
+    /// refresh не запрашивали.
+    #[schema(nullable = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// Тело запроса на обмен refresh-токена (`POST /tokens/refresh`).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RefreshRequest {
+    /// Refresh-токен, полученный при выпуске или предыдущем обмене.
+    pub refresh_token: String,
 }
 
 /// Результат массового отзыва токенов субъекта.

@@ -37,13 +37,14 @@ mod tracing_otel;
 use crate::auth::{Auth, AuthConfig, AuthLevel};
 use crate::handlers::metrics as metrics_handler;
 use crate::handlers::{
-    create_token_impl, livez, readyz, revoke_subject_tokens_impl, revoke_token_impl,
-    verify_token_impl,
+    create_token_impl, livez, readyz, refresh_token_impl, revoke_subject_tokens_impl,
+    revoke_token_impl, verify_token_impl,
 };
 use crate::key::KeyManager;
 use crate::logging::{init_subscriber, RequestLog};
 use crate::models::{
-    ErrorResponse, ReadinessResponse, RevokeGroupResponse, TokenRequest, TokenResponse,
+    ErrorResponse, ReadinessResponse, RefreshRequest, RevokeGroupResponse, TokenRequest,
+    TokenResponse,
 };
 use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
@@ -59,6 +60,7 @@ use crate::redis::RedisClient;
     paths(
         handlers::create_token,
         handlers::verify_token,
+        handlers::refresh_token,
         handlers::revoke_token,
         handlers::revoke_subject_tokens,
         handlers::livez,
@@ -70,6 +72,7 @@ use crate::redis::RedisClient;
         TokenResponse,
         ErrorResponse,
         ReadinessResponse,
+        RefreshRequest,
         RevokeGroupResponse
     )),
     modifiers(&SecurityAddon)
@@ -277,6 +280,17 @@ async fn main() -> std::io::Result<()> {
                     .wrap(RateLimit::per_ip(verify_limiter.clone()))
                     .wrap(cors)
                     .route(web::post().to(verify_token_impl::<RedisClient>)),
+            )
+            // Уровень 2 (proxy-secret): обмен refresh-токена. Не уровень 3 —
+            // TOTP-код клиентское приложение не посчитает, а субъекта
+            // аутентифицирует сам refresh-токен. CORS запрещающий: refresh-токену
+            // не место в браузере, его предъявляет бэкенд клиента.
+            .service(
+                web::resource("/tokens/refresh")
+                    .wrap(Auth::new(AuthLevel::ProxySecret, auth.clone()))
+                    .wrap(RateLimit::per_ip(verify_limiter.clone()))
+                    .wrap(deny_cors())
+                    .route(web::post().to(refresh_token_impl::<RedisClient>)),
             )
             .service(
                 web::resource("/tokens/{jti}")
