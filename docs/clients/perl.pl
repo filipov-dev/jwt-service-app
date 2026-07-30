@@ -205,7 +205,7 @@ sub revoke_subject {
 }
 
 # Демонстрация полного жизненного цикла токена.
-my $issued = issue_token('svc-a', 'svc-b', 1);
+my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
 printf "выпущен: %s...\n", substr($issued->{token}, 0, 32);
 
 my $refreshed = refresh_tokens($issued->{refresh_token});
