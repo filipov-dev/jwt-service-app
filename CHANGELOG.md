@@ -12,6 +12,22 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.13.2] - 2026-07-31
+
+### Внутреннее
+
+- bump peter-evans/dockerhub-description from 3 to 5
+- bump docker/build-push-action from 6 to 7
+- bump docker/setup-buildx-action from 3 to 4
+- bump chrono from 0.4.39 to 0.4.45
+- bump utoipa from 5.3.1 to 5.5.0
+- bump uuid from 1.13.2 to 1.24.0
+- bump reqwest from 0.12.12 to 0.13.4
+- bump actions/checkout from 4 to 7
+- bump actix-cors from 0.7.0 to 0.7.1
+- bump docker/login-action from 3 to 4.5.2
+- версия 1.13.2, deps-коммиты в разделе «Внутреннее» changelog'а
+
 ## [1.13.1] - 2026-07-31
 
 ### Документация
@@ -293,6 +309,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.13.2]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.12.3...v1.13.0
 [1.12.3]: https://github.com/filipov-dev/jwt-service-app/compare/v1.12.2...v1.12.3

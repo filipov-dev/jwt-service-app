@@ -53,7 +53,9 @@ bucket_for() {
         security) echo security ;;
         perf | revert) echo changed ;;
         docs) echo docs ;;
-        refactor | style | test | ci | build | chore) echo internal ;;
+        # `deps` — префикс коммитов dependabot (см. .github/dependabot.yml).
+        # Без него обновления зависимостей сыпались в «Прочее».
+        refactor | style | test | ci | build | chore | deps) echo internal ;;
         *) echo other ;;
     esac
 }
