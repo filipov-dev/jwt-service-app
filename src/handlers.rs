@@ -4,6 +4,9 @@
 //! - `POST /tokens` — выпуск токена ([`create_token`]);
 //! - `POST /tokens/verify` — проверка токена ([`verify_token`]);
 //! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]);
+//! - `POST /tokens/refresh` — обмен refresh-токена ([`refresh_token`]);
+//! - `DELETE /subjects/{sub}/tokens` — массовый отзыв токенов субъекта
+//!   ([`revoke_subject_tokens`]);
 //! - `GET /livez`, `GET /readyz` — пробы ([`livez`], [`readyz`]);
 //! - `GET /metrics` — метрики Prometheus ([`metrics`]).
 //!
@@ -18,9 +21,10 @@ use tracing::{debug, error, info};
 use crate::error::*;
 use crate::jwt::JwtManager;
 use crate::key::KeyManager;
-use crate::models::jwt::{JtiStore, JwtError};
+use crate::models::jwt::{subject_group, JtiStore, JwtError};
 use crate::models::{
-    ErrorResponse, ReadinessResponse, TokenRequest, TokenResponse, TokenVerifyRequest,
+    ErrorResponse, ReadinessResponse, RefreshRequest, RevokeGroupResponse, TokenRequest,
+    TokenResponse, TokenVerifyRequest,
 };
 use crate::redis::RedisClient;
 
@@ -80,10 +84,41 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
         .to_str()
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
-    match JwtManager::generate_token(host_header, &req.sub, &req.aud, req.ttl, &keys, store).await {
-        Ok(token) => {
+    let issued = if req.refresh {
+        JwtManager::generate_token_pair(
+            host_header,
+            &req.sub,
+            &req.aud,
+            req.ttl,
+            req.claims.clone(),
+            &keys,
+            store,
+        )
+        .await
+        .map(|(token, refresh)| (token, Some(refresh)))
+    } else {
+        JwtManager::generate_token(
+            host_header,
+            &req.sub,
+            &req.aud,
+            req.ttl,
+            req.claims.clone(),
+            &keys,
+            store,
+        )
+        .await
+        .map(|token| (token, None))
+    };
+
+    match issued {
+        // Имя `refresh` намеренно не совпадает с полем: обработчик обмена ниже
+        // называется `refresh_token`, и одноимённая переменная затеняла бы его.
+        Ok((token, refresh)) => {
             crate::metrics::record_token_issued();
-            Ok(HttpResponse::Ok().json(TokenResponse { token }))
+            Ok(HttpResponse::Ok().json(TokenResponse {
+                token,
+                refresh_token: refresh,
+            }))
         }
         Err(e) => {
             // Уровень по вине: некорректный запрос клиента (422) — DEBUG,
@@ -179,20 +214,24 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
     path = "/tokens/{jti}",
     security(("totp" = [])),
     responses(
-        (status = 204),
+        (status = 204, description = "Токен отозван. Идемпотентно: несуществующий `jti` — тоже 204"),
         (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 404, body = ErrorResponse),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)")
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
     )
 )]
 /// Отзывает токен по его идентификатору `jti`.
 ///
 /// Удаляет запись `jti` из Redis; после этого проверка соответствующего токена
-/// в [`verify_token`] будет неуспешной. Операция идемпотентна.
+/// в [`verify_token`] будет неуспешной.
 ///
 /// # Ответы
-/// - `204 No Content` — всегда, даже если `jti` не существовал. Ошибка Redis
-///   логируется, но наружу не пробрасывается.
+/// - `204 No Content` — токен отозван. **Идемпотентно**: несуществующий `jti`
+///   тоже даёт `204`, потому что желаемое состояние достигнуто — такого токена
+///   нет;
+/// - `500 Internal Server Error` — хранилище недоступно, отзыв **не выполнен**.
+///   Отличать этот случай от успеха обязательно: вызывающий отзывает
+///   скомпрометированный токен и должен узнать, что попытка не удалась.
 #[delete("/tokens/{jti}")]
 pub async fn revoke_token(
     jti: web::Path<String>,
@@ -212,14 +251,146 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
         Ok(_) => {
             crate::metrics::record_token_revoked();
             info!("Токен отозван");
+            Ok(HttpResponse::NoContent().finish())
         }
         Err(e) => {
             // Отказ хранилища — наша вина, ERROR.
+            //
+            // Раньше ошибка проглатывалась и наружу всё равно уходил `204`:
+            // вызывающий считал скомпрометированный токен отозванным и не
+            // повторял попытку, хотя токен оставался активным. Молчаливый
+            // «успех» здесь опаснее честной ошибки.
             error!("Не удалось отозвать токен: {}", e);
+            Err(Error::Internal("Failed to revoke token".into()))
         }
-    };
+    }
+}
 
-    Ok(HttpResponse::NoContent().finish())
+#[utoipa::path(
+    delete,
+    path = "/subjects/{sub}/tokens",
+    params(("sub" = String, Path, description = "Субъект (claim `sub`), чьи токены отзываются")),
+    security(("totp" = [])),
+    responses(
+        (status = 200, body = RevokeGroupResponse),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
+    )
+)]
+/// Отзывает все активные токены субъекта.
+///
+/// Нужно при компрометации: гасить токены по одному через
+/// `DELETE /tokens/{jti}` вызывающий не может — он не знает их `jti`.
+///
+/// # Ответы
+/// - `200 OK` — [`RevokeGroupResponse`] с числом отозванных токенов (уже
+///   истёкшие не считаются, они и так невалидны);
+/// - `500 Internal Server Error` — хранилище недоступно. В отличие от
+///   `DELETE /tokens/{jti}`, ошибка **не** проглатывается: молчаливый «успех»
+///   при неудавшемся отзыве скомпрометированных токенов опаснее честной ошибки.
+#[delete("/subjects/{sub}/tokens")]
+pub async fn revoke_subject_tokens(
+    sub: web::Path<String>,
+    redis: web::Data<RedisClient>,
+) -> Result<HttpResponse, Error> {
+    revoke_subject_tokens_impl(sub, redis).await
+}
+
+/// Реализация [`revoke_subject_tokens`], обобщённая по хранилищу.
+pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
+    sub: web::Path<String>,
+    store: web::Data<S>,
+) -> Result<HttpResponse, Error> {
+    match store.revoke_group(&subject_group(&sub)).await {
+        Ok(revoked) => {
+            for _ in 0..revoked {
+                crate::metrics::record_token_revoked();
+            }
+            info!(revoked, "Отозваны все токены субъекта");
+            Ok(HttpResponse::Ok().json(RevokeGroupResponse { revoked }))
+        }
+        Err(e) => {
+            // Отказ хранилища — наша вина, ERROR.
+            error!("Не удалось отозвать токены субъекта: {}", e);
+            Err(Error::Internal("Failed to revoke subject tokens".into()))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/tokens/refresh",
+    request_body = RefreshRequest,
+    security(("totp" = [])),
+    responses(
+        (status = 200, body = TokenResponse),
+        (status = 400, body = ErrorResponse),
+        (status = 401, body = ErrorResponse, description = "Уровень 3: нет TOTP-кода, либо refresh-токен неизвестен/использован"),
+        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 500, body = ErrorResponse)
+    )
+)]
+/// Обменивает refresh-токен на новую пару access + refresh.
+///
+/// Старый refresh после обмена не работает: выдаётся новый, из той же семьи.
+/// Предъявление уже использованного токена означает утечку — тогда гасится вся
+/// семья, включая выданные по ней access-токены (см.
+/// [`JwtManager::refresh_token_pair`]).
+///
+/// Уровень доступа 3 (TOTP), как и у `POST /tokens`: обмен — это выпуск токена,
+/// просто основанием служит предъявленный refresh, а не запрос доверенного
+/// бэкенда. Ручку дёргает тот же internal-клиент, что выпускает токены; конечное
+/// приложение с сервисом напрямую не общается.
+///
+/// # Ответы
+/// - `200 OK` — [`TokenResponse`] с новыми `token` и `refresh_token`;
+/// - `401 Unauthorized` — токен неизвестен, истёк или уже использован (детали
+///   наружу не раскрываются, как и при проверке токена);
+/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
+#[post("/tokens/refresh")]
+pub async fn refresh_token(
+    request: web::Json<RefreshRequest>,
+    redis: web::Data<RedisClient>,
+    keys: web::Data<KeyManager>,
+    host: actix_web::HttpRequest,
+) -> Result<HttpResponse, Error> {
+    refresh_token_impl(request, redis, keys, host).await
+}
+
+/// Реализация [`refresh_token`], обобщённая по хранилищу.
+pub async fn refresh_token_impl<S: JtiStore + 'static>(
+    request: web::Json<RefreshRequest>,
+    store: web::Data<S>,
+    keys: web::Data<KeyManager>,
+    host: actix_web::HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let host_header = host
+        .headers()
+        .get("Host")
+        .ok_or(Error::Validation("Missing Host header".into()))?
+        .to_str()
+        .map_err(|_| Error::Validation("Invalid Host header".into()))?;
+
+    match JwtManager::refresh_token_pair(&request.refresh_token, host_header, &keys, store).await {
+        Ok((token, refresh)) => {
+            crate::metrics::record_token_issued();
+            Ok(HttpResponse::Ok().json(TokenResponse {
+                token,
+                refresh_token: Some(refresh),
+            }))
+        }
+        Err(JwtError::NotValid) => {
+            // Причину не раскрываем: неизвестный, истёкший и переигранный токен
+            // снаружи неразличимы — как и при проверке access-токена.
+            debug!("Обмен refresh-токена не удался");
+            Err(Error::Unauthorized("Invalid refresh token".into()))
+        }
+        Err(e) => {
+            error!("Не удалось обменять refresh-токен: {}", e);
+            Err(Error::Internal(e.to_string()))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -326,7 +497,7 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
-    use crate::models::jwt::{JsonWebToken, JtiError, TokenClaims, TokenHeaders};
+    use crate::models::jwt::{JsonWebToken, JtiError, RefreshRecord, TokenClaims, TokenHeaders};
     use crate::models::TokenResponse;
     use actix_web::http::header::HeaderValue;
     use actix_web::http::StatusCode;
@@ -337,7 +508,7 @@ mod tests {
     use openssl::pkey::{PKey, Private};
     use parking_lot::Mutex as PlMutex;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::env;
     use std::sync::Mutex;
     use wiremock::matchers::{method, path};
@@ -355,14 +526,25 @@ mod tests {
     }
 
     /// In-memory реализация [`JtiStore`] для тестов HTTP-слоя.
+    ///
+    /// Группы ведутся по-настоящему (`group -> набор jti`), иначе тесты
+    /// массового отзыва проверяли бы только код ответа, но не сам отзыв.
     struct MockStore {
         jtis: PlMutex<HashSet<String>>,
+        groups: PlMutex<HashMap<String, HashSet<String>>>,
+        /// Записи refresh-токенов и признак использования.
+        refreshes: PlMutex<HashMap<String, (RefreshRecord, bool)>>,
+        /// Отпечатки уже предъявленных TOTP-кодов.
+        used_codes: PlMutex<HashSet<String>>,
     }
 
     impl MockStore {
         fn new() -> Self {
             Self {
                 jtis: PlMutex::new(HashSet::new()),
+                groups: PlMutex::new(HashMap::new()),
+                refreshes: PlMutex::new(HashMap::new()),
+                used_codes: PlMutex::new(HashSet::new()),
             }
         }
     }
@@ -380,6 +562,135 @@ mod tests {
         async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
             self.jtis.lock().remove(jti);
             Ok(())
+        }
+
+        async fn add_to_group(
+            &self,
+            group: &str,
+            jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            self.groups
+                .lock()
+                .entry(group.to_string())
+                .or_default()
+                .insert(jti.to_string());
+            Ok(())
+        }
+
+        async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
+            let members = self.groups.lock().remove(group).unwrap_or_default();
+
+            let mut refreshes = self.refreshes.lock();
+            let mut jtis = self.jtis.lock();
+
+            // В группе семьи лежат и `jti`, и ключи refresh-записей — гасим и то,
+            // и другое, как это делает `DEL` в Redis.
+            let revoked = members
+                .iter()
+                .filter(|member| {
+                    let refresh_removed = member
+                        .strip_prefix("refresh:")
+                        .is_some_and(|id| refreshes.remove(id).is_some());
+                    jtis.remove(*member) || refresh_removed
+                })
+                .count();
+
+            Ok(revoked as u64)
+        }
+
+        async fn store_refresh(
+            &self,
+            id: &str,
+            record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            self.refreshes
+                .lock()
+                .insert(id.to_string(), (record.clone(), false));
+            Ok(())
+        }
+
+        async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Ok(self
+                .refreshes
+                .lock()
+                .get(id)
+                .map(|(record, _)| record.clone()))
+        }
+
+        async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
+            let mut refreshes = self.refreshes.lock();
+
+            match refreshes.get_mut(id) {
+                // Уже использован — повторное предъявление.
+                Some((_, true)) => Ok(false),
+                Some((_, used)) => {
+                    *used = true;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+
+        async fn claim_totp_code(&self, hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            // `insert` возвращает false, если элемент уже был — это и есть повтор.
+            Ok(self.used_codes.lock().insert(hash.to_string()))
+        }
+    }
+
+    /// [`JtiStore`], у которого любая операция падает: имитирует недоступное
+    /// хранилище.
+    ///
+    /// Нужен там, где проверяется не результат операции, а честность ответа при
+    /// сбое: `MockStore` всегда успешен и такую ветку не покрывает.
+    struct UnavailableStore;
+
+    impl JtiStore for UnavailableStore {
+        async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn check_jti(&self, _jti: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn delete_jti(&self, _jti: &str) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn add_to_group(
+            &self,
+            _group: &str,
+            _jti: &str,
+            _expires_at: i64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn revoke_group(&self, _group: &str) -> Result<u64, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn store_refresh(
+            &self,
+            _id: &str,
+            _record: &RefreshRecord,
+            _ttl: u64,
+        ) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn get_refresh(&self, _id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn mark_refresh_used(&self, _id: &str) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
+        async fn claim_totp_code(&self, _hash: &str, _ttl: u64) -> Result<bool, JtiError> {
+            Err(JtiError::BadConnection)
         }
     }
 
@@ -469,6 +780,32 @@ mod tests {
                     "/tokens/{jti}",
                     web::delete().to(revoke_token_impl::<MockStore>),
                 )
+                .route(
+                    "/subjects/{sub}/tokens",
+                    web::delete().to(revoke_subject_tokens_impl::<MockStore>),
+                )
+                .route(
+                    "/tokens/refresh",
+                    web::post().to(refresh_token_impl::<MockStore>),
+                )
+        }};
+    }
+
+    /// Выпускает токен на субъект `$sub` через тестовое приложение.
+    ///
+    /// Макрос, а не функция: тип приложения из `init_service` не выписывается
+    /// без вороха дженериков (та же причина, что у `token_app!`).
+    macro_rules! issue_token {
+        ($app:expr, $sub:expr) => {{
+            let req = test::TestRequest::post()
+                .uri("/tokens")
+                .insert_header(("Host", "example.com"))
+                .set_json(json!({ "sub": $sub, "aud": ["api1"] }))
+                .to_request();
+            let resp = test::call_service($app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let issued: TokenResponse = test::read_body_json(resp).await;
+            issued.token
         }};
     }
 
@@ -733,6 +1070,7 @@ mod tests {
             iat: now - 3600,
             nbf: now - 3600,
             jti: "expired-jti".into(),
+            extra: Default::default(),
         };
         let token = JsonWebToken::create_new(headers, claims, key.pkey.clone())
             .to_string()
@@ -771,6 +1109,7 @@ mod tests {
             iat: now,
             nbf: now,
             jti: "forged-jti".into(),
+            extra: Default::default(),
         };
         let token = JsonWebToken::create_new(headers, claims, attacker.pkey.clone())
             .to_string()
@@ -811,5 +1150,286 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[actix_web::test]
+    async fn revoke_reports_store_failure_instead_of_204() {
+        // Хранилище недоступно — отзыв не выполнен, и клиент обязан это узнать.
+        // Прежнее поведение (всегда `204`) означало, что вызывающий считал
+        // скомпрометированный токен погашенным и не повторял попытку.
+        let store = web::Data::new(UnavailableStore);
+        let app = test::init_service(App::new().app_data(store).route(
+            "/tokens/{jti}",
+            web::delete().to(revoke_token_impl::<UnavailableStore>),
+        ))
+        .await;
+
+        let req = test::TestRequest::delete()
+            .uri("/tokens/some-jti")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[actix_web::test]
+    async fn revoking_subject_kills_all_its_tokens() {
+        let _guard = env_guard();
+        let key = make_key("kid-bulk");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store.clone())).await;
+
+        // Три токена на одного субъекта и один — на другого.
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(issue_token!(&app, "victim"));
+        }
+        let bystander = issue_token!(&app, "bystander");
+
+        let req = test::TestRequest::delete()
+            .uri("/subjects/victim/tokens")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: RevokeGroupResponse = test::read_body_json(resp).await;
+        assert_eq!(body.revoked, 3);
+
+        // Токены субъекта больше не проходят проверку...
+        for token in &tokens {
+            assert!(!store.check_jti(&jti_of(token)).await.unwrap());
+        }
+        // ...а чужой не задет.
+        assert!(store.check_jti(&jti_of(&bystander)).await.unwrap());
+    }
+
+    #[actix_web::test]
+    async fn revoking_unknown_subject_is_idempotent() {
+        let _guard = env_guard();
+        let key = make_key("kid-none");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::delete()
+            .uri("/subjects/nobody/tokens")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        // Нечего отзывать — это не ошибка.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: RevokeGroupResponse = test::read_body_json(resp).await;
+        assert_eq!(body.revoked, 0);
+    }
+
+    /// Выпускает пару access + refresh через тестовое приложение.
+    macro_rules! issue_pair {
+        ($app:expr, $sub:expr) => {{
+            let req = test::TestRequest::post()
+                .uri("/tokens")
+                .insert_header(("Host", "example.com"))
+                .set_json(json!({ "sub": $sub, "aud": ["api1"], "refresh": true }))
+                .to_request();
+            let resp = test::call_service($app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let issued: TokenResponse = test::read_body_json(resp).await;
+            let refresh = issued.refresh_token.clone().expect("нет refresh-токена");
+            (issued.token, refresh)
+        }};
+    }
+
+    /// Обменивает refresh-токен, возвращая ответ целиком.
+    macro_rules! exchange {
+        ($app:expr, $refresh:expr) => {{
+            let req = test::TestRequest::post()
+                .uri("/tokens/refresh")
+                .insert_header(("Host", "example.com"))
+                .set_json(json!({ "refresh_token": $refresh }))
+                .to_request();
+            test::call_service($app, req).await
+        }};
+    }
+
+    #[actix_web::test]
+    async fn refresh_is_absent_unless_requested() {
+        let _guard = env_guard();
+        let key = make_key("kid-norefresh");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({ "sub": "user1", "aud": ["api1"] }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Контракт прежних клиентов не изменился: поля в ответе нет.
+        let issued: TokenResponse = test::read_body_json(resp).await;
+        assert!(issued.refresh_token.is_none());
+    }
+
+    #[actix_web::test]
+    async fn refresh_rotates_and_old_token_stops_working() {
+        let _guard = env_guard();
+        let key = make_key("kid-rotate");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store.clone())).await;
+
+        let (_access, refresh) = issue_pair!(&app, "user1");
+
+        // Обмен выдаёт новую пару...
+        let resp = exchange!(&app, &refresh);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let refreshed: TokenResponse = test::read_body_json(resp).await;
+        let new_refresh = refreshed.refresh_token.expect("нет нового refresh-токена");
+        assert_ne!(new_refresh, refresh);
+
+        // ...а новый access-токен валиден.
+        let req = test::TestRequest::post()
+            .uri("/tokens/verify")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({ "token": refreshed.token, "audience": "api1" }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn reused_refresh_kills_the_whole_family() {
+        let _guard = env_guard();
+        let key = make_key("kid-reuse");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store.clone())).await;
+
+        let (first_access, refresh) = issue_pair!(&app, "user1");
+
+        // Законный обмен.
+        let resp = exchange!(&app, &refresh);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let refreshed: TokenResponse = test::read_body_json(resp).await;
+        let new_refresh = refreshed.refresh_token.expect("нет нового refresh-токена");
+
+        // Повторное предъявление старого токена — сигнал кражи.
+        let resp = exchange!(&app, &refresh);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Гасится вся семья: и выданные access-токены...
+        assert!(!store.check_jti(&jti_of(&first_access)).await.unwrap());
+        assert!(!store.check_jti(&jti_of(&refreshed.token)).await.unwrap());
+
+        // ...и refresh, выданный в законном обмене.
+        let resp = exchange!(&app, &new_refresh);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn unknown_refresh_is_rejected() {
+        let _guard = env_guard();
+        let key = make_key("kid-unknown-refresh");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let resp = exchange!(&app, "no-such-token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn custom_claims_land_in_issued_token() {
+        let _guard = env_guard();
+        let key = make_key("kid-claims");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({
+                "sub": "user1",
+                "aud": ["api1"],
+                "claims": { "role": "admin", "tenant": 42 }
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let issued: TokenResponse = test::read_body_json(resp).await;
+
+        // Разбираем payload и проверяем, что claims лежат рядом с
+        // зарегистрированными — потребитель токена ищет `role`, не `extra.role`.
+        let payload = issued.token.split('.').nth(1).expect("нет сегмента claims");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
+
+        assert_eq!(value["role"], "admin");
+        assert_eq!(value["tenant"], 42);
+        assert_eq!(value["sub"], "user1");
+    }
+
+    #[actix_web::test]
+    async fn reserved_custom_claim_gives_422() {
+        let _guard = env_guard();
+        let key = make_key("kid-reserved");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        // Подмена `exp` позволила бы обойти границы TTL — ручка обязана отказать.
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({
+                "sub": "user1",
+                "aud": ["api1"],
+                "claims": { "exp": 9999999999u64 }
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[actix_web::test]
+    async fn token_without_claims_is_unchanged() {
+        let _guard = env_guard();
+        let key = make_key("kid-noclaims");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        // Контракт прежних клиентов: без поля `claims` payload остаётся ровно
+        // таким, каким был до появления этой возможности.
+        let token = issue_token!(&app, "user1");
+        let payload = token.split('.').nth(1).expect("нет сегмента claims");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
+
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 7, "лишние поля в payload: {keys:?}");
     }
 }

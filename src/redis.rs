@@ -6,7 +6,8 @@
 //! естественное «протухание».
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{AsyncCommands, RedisError};
+use redis::{AsyncCommands, ExistenceCheck, RedisError, SetExpiry, SetOptions};
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use tokio::sync::OnceCell;
 use tracing::error;
 
 use crate::metrics::record_redis_command;
-use crate::models::jwt::{JtiError, JtiStore};
+use crate::models::jwt::{refresh_key, totp_code_key, JtiError, JtiStore, RefreshRecord};
 
 /// Таймаут ожидания ответа на команду (`REDIS_RESPONSE_TIMEOUT_MS`).
 ///
@@ -206,6 +207,246 @@ impl JtiStore for RedisClient {
             Err(e) => {
                 error!("Redis: EXISTS не выполнился: {}", e);
                 record_redis_command("check_jti", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Добавляет `jti` в ZSET группы со score, равным времени истечения
+    /// (`ZADD`).
+    ///
+    /// ZSET, а не SET: у элементов множества нет собственного TTL, и истёкшие
+    /// `jti` копились бы в индексе мёртвым грузом. Score = момент истечения
+    /// позволяет отрезать их одной командой (см. [`RedisClient::revoke_group`]).
+    ///
+    /// TTL самой группы продлевается до времени жизни самого долгого токена в
+    /// ней: иначе индекс пережил бы все свои токены и остался висеть в памяти.
+    #[tracing::instrument(name = "redis.add_to_group", skip_all, err(level = "debug"))]
+    async fn add_to_group(&self, group: &str, jti: &str, expires_at: i64) -> Result<(), JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let result: Result<(), RedisError> = async {
+            conn.zadd::<&str, i64, &str, ()>(group, jti, expires_at)
+                .await?;
+            conn.expire_at::<&str, ()>(group, expires_at).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                record_redis_command("add_to_group", true, started.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Redis: ZADD в группу не выполнился: {}", e);
+                record_redis_command("add_to_group", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Отзывает все токены группы.
+    ///
+    /// Порядок: отрезаем протухшие записи по score, забираем оставшиеся `jti`,
+    /// удаляем их пачкой и саму группу.
+    ///
+    /// Атомарности здесь намеренно нет: параллельный выпуск токена во время
+    /// отзыва может добавить `jti` уже после `ZRANGE`, и такой токен уцелеет.
+    /// Окно — доли миллисекунды, а цена атомарности (Lua-скрипт или WATCH) выше
+    /// пользы: массовый отзыв делают при компрометации, и следом за ним обычно
+    /// меняют учётные данные субъекта.
+    #[tracing::instrument(name = "redis.revoke_group", skip_all, err(level = "debug"))]
+    async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let result: Result<u64, RedisError> = async {
+            // Протухшие токены отзывать незачем — они и так невалидны.
+            conn.zrembyscore::<&str, &str, i64, ()>(group, "-inf", now)
+                .await?;
+
+            let jtis: Vec<String> = conn.zrange(group, 0, -1).await?;
+
+            if !jtis.is_empty() {
+                conn.del::<&Vec<String>, ()>(&jtis).await?;
+            }
+            conn.del::<&str, ()>(group).await?;
+
+            Ok(jtis.len() as u64)
+        }
+        .await;
+
+        match result {
+            Ok(count) => {
+                record_redis_command("revoke_group", true, started.elapsed());
+                Ok(count)
+            }
+            Err(e) => {
+                error!("Redis: отзыв группы не выполнился: {}", e);
+                record_redis_command("revoke_group", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Сохраняет запись refresh-токена как HASH с TTL.
+    #[tracing::instrument(name = "redis.store_refresh", skip_all, err(level = "debug"))]
+    async fn store_refresh(
+        &self,
+        id: &str,
+        record: &RefreshRecord,
+        ttl: u64,
+    ) -> Result<(), JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+        let key = refresh_key(id);
+
+        // Аудитория — список, а в HASH значения плоские; кладём JSON-массивом.
+        let audience = match serde_json::to_string(&record.audience) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Redis: не сериализуется audience refresh-токена: {}", e);
+                return Err(JtiError::WrongOperation);
+            }
+        };
+
+        let result: Result<(), RedisError> = async {
+            conn.hset_multiple::<&str, &str, String, ()>(
+                &key,
+                &[
+                    ("sub", record.subject.clone()),
+                    ("aud", audience),
+                    ("family", record.family.clone()),
+                ],
+            )
+            .await?;
+            conn.expire::<&str, ()>(&key, ttl as i64).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                record_redis_command("store_refresh", true, started.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Redis: запись refresh-токена не выполнилась: {}", e);
+                record_redis_command("store_refresh", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Читает запись refresh-токена (`HGETALL`).
+    #[tracing::instrument(name = "redis.get_refresh", skip_all, err(level = "debug"))]
+    async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let fields: Result<HashMap<String, String>, RedisError> =
+            conn.hgetall(refresh_key(id)).await;
+
+        let fields = match fields {
+            Ok(v) => {
+                record_redis_command("get_refresh", true, started.elapsed());
+                v
+            }
+            Err(e) => {
+                error!("Redis: чтение refresh-токена не выполнилось: {}", e);
+                record_redis_command("get_refresh", false, started.elapsed());
+                return Err(classify(&e));
+            }
+        };
+
+        // Пустой HASH — ключа нет: истёк или отозван.
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        let (Some(subject), Some(audience), Some(family)) =
+            (fields.get("sub"), fields.get("aud"), fields.get("family"))
+        else {
+            // Запись есть, но неполная — так быть не должно; трактуем как
+            // отсутствие, чтобы не выпустить токен на мусорных данных.
+            error!("Redis: запись refresh-токена неполная");
+            return Ok(None);
+        };
+
+        let audience: Vec<String> = match serde_json::from_str(audience) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Redis: audience refresh-токена не разбирается: {}", e);
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(RefreshRecord {
+            subject: subject.clone(),
+            audience,
+            family: family.clone(),
+        }))
+    }
+
+    /// Помечает refresh-токен использованным (`HSETNX`).
+    ///
+    /// `HSETNX` возвращает `1`, только если поля ещё не было, — то есть операция
+    /// атомарна и «победитель» ровно один. На этом держится детектор повторного
+    /// использования: второй обмен тем же токеном получит `false`.
+    #[tracing::instrument(name = "redis.mark_refresh_used", skip_all, err(level = "debug"))]
+    async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        match conn
+            .hset_nx::<String, &str, u8, bool>(refresh_key(id), "used", 1)
+            .await
+        {
+            Ok(marked) => {
+                record_redis_command("mark_refresh_used", true, started.elapsed());
+                Ok(marked)
+            }
+            Err(e) => {
+                error!("Redis: пометка refresh-токена не выполнилась: {}", e);
+                record_redis_command("mark_refresh_used", false, started.elapsed());
+                Err(classify(&e))
+            }
+        }
+    }
+
+    /// Резервирует TOTP-код через `SET NX EX`.
+    ///
+    /// `SET NX` возвращает `nil`, если ключ уже существует, — то есть операция
+    /// атомарна и «победитель» ровно один. На этом держится защита от
+    /// переигрывания: второе предъявление того же кода получит `false`.
+    ///
+    /// Значение-заглушка `1`: важен сам факт наличия ключа, а TTL снимает запись
+    /// вместе с окном действия кода.
+    #[tracing::instrument(name = "redis.claim_totp_code", skip_all, err(level = "debug"))]
+    async fn claim_totp_code(&self, hash: &str, ttl: u64) -> Result<bool, JtiError> {
+        let mut conn = self.connection().await?;
+        let started = Instant::now();
+
+        let options = SetOptions::default()
+            .conditional_set(ExistenceCheck::NX)
+            .with_expiration(SetExpiry::EX(ttl));
+
+        match conn
+            .set_options::<String, u8, Option<String>>(totp_code_key(hash), 1, options)
+            .await
+        {
+            Ok(result) => {
+                record_redis_command("claim_totp_code", true, started.elapsed());
+                // `Some("OK")` — ключ создан нами, `None` — уже существовал.
+                Ok(result.is_some())
+            }
+            Err(e) => {
+                error!("Redis: резервирование TOTP-кода не выполнилось: {}", e);
+                record_redis_command("claim_totp_code", false, started.elapsed());
                 Err(classify(&e))
             }
         }
