@@ -1,0 +1,19 @@
+# Применение: kubectl apply -k deployments/prod/k8s/
+#
+# secret.example.yaml здесь намеренно НЕ перечислен: он образец, а не манифест
+# для применения. Заведите Secret через секрет-менеджер кластера либо скопируйте
+# образец в secret.yaml, заполните и добавьте его в resources локально.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+# `labels` (без includeSelectors), а не `commonLabels`: последний дописывает
+# метки и в selector Deployment'а, а selector после создания неизменяем — такой
+# манифест применился бы один раз, а на обновлении упал бы с ошибкой поля
+# spec.selector.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: jwt-platform

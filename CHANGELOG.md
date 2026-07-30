@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.13.4] - 2026-07-31
+
+### Документация
+
+- prod-манифесты для Docker Compose и Kubernetes (JWT-32)
+
 ## [1.13.3] - 2026-07-31
 
 ### Внутреннее
@@ -317,6 +323,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.13.4]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.3...v1.13.4
 [1.13.3]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.2...v1.13.3
 [1.13.2]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...v1.13.1

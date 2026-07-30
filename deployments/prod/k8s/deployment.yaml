@@ -1,0 +1,144 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwt-service-app
+  labels:
+    app.kubernetes.io/name: jwt-service-app
+spec:
+  # Три реплики: сервис без локального состояния (jti и refresh-токены лежат в
+  # Redis), поэтому масштабируется горизонтально без оговорок.
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jwt-service-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jwt-service-app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: app
+          # Тег пинится на версию, а не latest: с latest откат сводится к
+          # «надеемся, что реестр ещё помнит прошлый образ».
+          image: filipov/jwt-service-app:1.13.4
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          env:
+            # 0.0.0.0 обязателен: дефолт 127.0.0.1 слушает только петлю внутри
+            # контейнера, и kubelet не достучится даже до probe.
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: JWKS_SERVICE_URL
+              value: "http://jwks-service-app:8080"
+
+            - name: LOG_FORMAT
+              value: "json"
+            - name: RUST_LOG
+              value: "jwt_service_app=info"
+
+            - name: AUTH_TOTP_REPLAY_PROTECTION
+              value: "true"
+
+            # Адреса, с которых доверяем X-Forwarded-For. Здесь это pod-сеть
+            # ingress-контроллера, а НЕ сеть клиентов: запрос до сервиса
+            # доезжает от pod'а ingress-контроллера. Уточняется под кластер:
+            #   kubectl -n ingress-nginx get pods -o wide
+            # Оставить пустым нельзя — тогда ключом per-IP лимита станет адрес
+            # ingress-пода и все клиенты будут делить один лимит.
+            - name: RATE_LIMIT_TRUSTED_PROXIES
+              value: "10.244.0.0/16"
+
+            # Секреты — из Secret, а не value. Целиком через envFrom не берём:
+            # так в манифесте видно, какие именно переменные приходят снаружи.
+            - name: AUTH_PROXY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-service-app
+                  key: AUTH_PROXY_SECRET
+            - name: AUTH_TOTP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-service-app
+                  key: AUTH_TOTP_SECRET
+            - name: AUTH_TOTP_SECRET_NEXT
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-service-app
+                  key: AUTH_TOTP_SECRET_NEXT
+                  optional: true
+            - name: AUTH_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-service-app
+                  key: AUTH_METRICS_TOKEN
+                  optional: true
+            - name: GLITCHTIP_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-service-app
+                  key: GLITCHTIP_DSN
+                  optional: true
+
+          # /livez отвечает, пока жив HTTP-слой, и НЕ ходит в зависимости.
+          # Именно поэтому он тут: liveness на /readyz перезапускал бы поды
+          # при недоступном Redis — то есть в момент аварии зависимости мы бы
+          # ещё и укладывали сервис рестартами.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # /readyz проверяет Redis и сервис ключей: пока они недоступны, под
+          # выводится из балансировки, но не перезапускается.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # Отдельная startup-проба даёт время на первый прогрев, не заставляя
+          # ослаблять liveness: до её успеха liveness не считается.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              # CPU не лимитируем намеренно: throttling бьёт по хвостам задержек
+              # на криптографии (подпись/проверка), а requests уже гарантируют
+              # долю. Лимит по памяти есть — утечка не должна валить узел.
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      # Пересоздание пода не должно рвать запросы в полёте: под сначала уходит
+      # из endpoints, и только потом ему прилетает SIGTERM.
+      terminationGracePeriodSeconds: 30

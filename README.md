@@ -36,6 +36,10 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
   Monium, GlitchTip), сводная таблица переменных и готовые конфиги.
 - **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret`,
   `totp` и `metrics_token` для уровней 2, 3 и 4).
+- **Прод-деплой: Docker Compose и Kubernetes** —
+  [`deployments/prod/`](deployments/prod/README.md): манифесты с пробами на
+  `/livez` и `/readyz`, секреты из `.env`/`Secret`, заполненный
+  `RATE_LIMIT_TRUSTED_PROXIES`.
 - **Что изменилось между версиями образа** — [`CHANGELOG.md`](CHANGELOG.md):
   разделы собираются из истории коммитов, те же тексты уходят в описание
   каждого GitHub Release.

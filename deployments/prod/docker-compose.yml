@@ -1,0 +1,99 @@
+# Боевой стенд: сервис + Redis за обратным прокси.
+#
+# Отличия от dev-стенда (`deployments/dev/docker-compose.yml`), кроме очевидного
+# отсутствия Swagger UI и Redis Commander:
+#   * образ берётся из реестра, а не собирается локально;
+#   * секреты приходят из `.env` (см. `.env.example`), а не лежат в open-source;
+#   * порт сервиса НЕ публикуется на хост — наружу смотрит только прокси;
+#   * подсеть задана явно, чтобы `RATE_LIMIT_TRUSTED_PROXIES` был детерминирован.
+#
+# Запуск (имя проекта обязательно — папка называется `prod` у многих сервисов):
+#   docker compose -p jwt-prod --env-file .env up -d
+
+name: jwt-prod
+
+services:
+  app:
+    image: filipov/jwt-service-app:${JWT_SERVICE_VERSION:-latest}
+    restart: unless-stopped
+    # Порт наружу не публикуется: уровни 2 и 3 держатся на заголовках, которые
+    # проставляет прокси, а прямой доступ к контейнеру их обходит.
+    expose:
+      - "8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+
+      REDIS_URL: redis://redis:6379
+      JWKS_SERVICE_URL: ${JWKS_SERVICE_URL}
+
+      TOKEN_ALGORITHM: ${TOKEN_ALGORITHM:-RS256}
+      TOKEN_EXPIRATION_SECONDS: ${TOKEN_EXPIRATION_SECONDS:-3600}
+
+      # Секреты — только из .env, который в репозиторий не коммитится.
+      AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?нужен AUTH_PROXY_SECRET}
+      AUTH_TOTP_SECRET: ${AUTH_TOTP_SECRET:?нужен AUTH_TOTP_SECRET}
+      AUTH_TOTP_SECRET_NEXT: ${AUTH_TOTP_SECRET_NEXT:-}
+      AUTH_METRICS_TOKEN: ${AUTH_METRICS_TOKEN:-}
+
+      # Запрет переигрывания TOTP-кода: в проде включён, здесь Redis рядом.
+      AUTH_TOTP_REPLAY_PROTECTION: "true"
+
+      # Ключ per-IP лимита берётся из X-Forwarded-For, только если запрос пришёл
+      # с доверенного адреса. За прокси без этого списка все клиенты выглядят
+      # одним адресом (адресом прокси) и делят общий лимит на всех.
+      RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-172.31.0.0/16}
+
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-jwt_service_app=info}
+
+      GLITCHTIP_DSN: ${GLITCHTIP_DSN:-}
+      GLITCHTIP_ENVIRONMENT: ${GLITCHTIP_ENVIRONMENT:-prod}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # В runtime-образе нет ни curl, ни wget — только bash. Поэтому запрос
+      # делается через /dev/tcp: это встроенное в bash перенаправление, внешних
+      # утилит не требует. Проверять `nc`/`curl` бессмысленно — их там нет.
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/8080; printf "GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; grep -q "200 OK" <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF: в Redis лежат выданные jti и refresh-токены. Без персистентности
+    # перезапуск Redis «разотзывает» все отозванные токены и гасит живые сессии.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Подсеть зафиксирована, чтобы RATE_LIMIT_TRUSTED_PROXIES не приходилось
+        # править после каждого пересоздания сети: адрес прокси из этой подсети
+        # предсказуем. Меняете подсеть — меняйте и список доверенных прокси.
+        - subnet: 172.31.0.0/16

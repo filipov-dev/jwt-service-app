@@ -9,3 +9,8 @@ AGENTS_INTERNAL.md
 # Токены — настоящие подписанные JWT, им в репозитории не место.
 /deployments/load/tokens.json
 /deployments/load/summary.json
+
+# Боевое окружение: заполненные секреты уровней доступа. В репозитории лежат
+# только образцы — .env.example и k8s/secret.example.yaml.
+/deployments/prod/.env
+/deployments/prod/k8s/secret.yaml
