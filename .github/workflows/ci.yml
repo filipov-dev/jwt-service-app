@@ -32,6 +32,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Скрипты релиза — тоже код, и ломаются они молча уже в CI. shellcheck
+      # предустановлен на раннере, шаг занимает секунду.
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+
       # Форматирование проверяется первым: шаг быстрый и не требует сборки,
       # поэтому даёт обратную связь раньше остальных.
       - name: Format

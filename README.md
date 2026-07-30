@@ -36,3 +36,6 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
   Monium, GlitchTip), сводная таблица переменных и готовые конфиги.
 - **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret`,
   `totp` и `metrics_token` для уровней 2, 3 и 4).
+- **Что изменилось между версиями образа** — [`CHANGELOG.md`](CHANGELOG.md):
+  разделы собираются из истории коммитов, те же тексты уходят в описание
+  каждого GitHub Release.
