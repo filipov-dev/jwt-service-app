@@ -71,13 +71,25 @@ class JwtServiceClient(baseUrl: String, secret: String):
     *   получатель (claim `aud`)
     * @param withRefresh
     *   запросить refresh-токен для продления сессии
+    * @param claimsJson
+    *   произвольные claims JSON-объектом (например `{"role":"admin"}`) либо
+    *   `None`. Попадают в payload рядом с зарегистрированными; служебные имена
+    *   (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
+    *   сервис ответит `422`
     * @return
     *   тело ответа: `{"token": ..., "refresh_token": ...}`
     * @throws IllegalStateException
-    *   `401` — неверный код, `422` — параметры, `500` — JWKS или Redis
+    *   `401` — неверный код, `422` — параметры или запрещённый claim,
+    *   `500` — JWKS или Redis
     */
-  def issueToken(sub: String, aud: String, withRefresh: Boolean = false): String =
-    val body = s"""{"sub":"$sub","aud":["$aud"],"refresh":$withRefresh}"""
+  def issueToken(
+      sub: String,
+      aud: String,
+      withRefresh: Boolean = false,
+      claimsJson: Option[String] = None,
+  ): String =
+    val claimsPart = claimsJson.map(c => s""","claims":$c""").getOrElse("")
+    val body = s"""{"sub":"$sub","aud":["$aud"],"refresh":$withRefresh$claimsPart}"""
     val response = send(basicRequest.post(uri"$baseUrl/tokens").body(body))
 
     response.body.fold(
@@ -153,7 +165,8 @@ class JwtServiceClient(baseUrl: String, secret: String):
 
   val client = JwtServiceClient(service, secret)
 
-  val issued = client.issueToken("svc-a", "svc-b", withRefresh = true)
+  val issued = client.issueToken("svc-a", "svc-b", withRefresh = true,
+    claimsJson = Some("""{"role":"admin"}"""))
   println(s"выпущен: $issued")
 
   // В боевом коде разберите JSON библиотекой, а не регуляркой.

@@ -83,7 +83,7 @@ function request(method, path; body = nothing)
 end
 
 """
-    issue_token(sub, aud; with_refresh=false) -> Dict
+    issue_token(sub, aud; with_refresh=false, claims=Dict()) -> Dict
 
 Выпускает access-токен (`POST /tokens`).
 
@@ -91,12 +91,18 @@ end
 - `sub`: субъект, которому выдаётся токен (claim `sub`).
 - `aud`: список получателей (claim `aud`); не должен быть пустым.
 - `with_refresh`: запросить refresh-токен для продления сессии.
+- `claims`: произвольные claims (роли, scope, tenant) — попадают в payload рядом
+  с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`,
+  `nbf`, `jti`) переопределять нельзя: сервис ответит 422.
 
-Бросает ошибку при 401 (неверный код), 422 (некорректные параметры) и 500
-(недоступны JWKS или Redis).
+Бросает ошибку при 401 (неверный код), 422 (некорректные параметры или
+запрещённый claim) и 500 (недоступны JWKS или Redis).
 """
-function issue_token(sub, aud; with_refresh = false)
-    response = request("POST", "/tokens"; body = (sub = sub, aud = aud, refresh = with_refresh))
+function issue_token(sub, aud; with_refresh = false, claims = Dict())
+    body = Dict("sub" => sub, "aud" => aud, "refresh" => with_refresh)
+    isempty(claims) || (body["claims"] = claims)
+
+    response = request("POST", "/tokens"; body = body)
     response.status == 200 || error("выпуск не удался: $(response.status)")
 
     return JSON3.read(String(response.body), Dict)
@@ -157,7 +163,8 @@ end # module
 # Демонстрация полного жизненного цикла токена.
 using .JwtServiceClient
 
-issued = JwtServiceClient.issue_token("svc-a", ["svc-b"]; with_refresh = true)
+issued = JwtServiceClient.issue_token("svc-a", ["svc-b"]; with_refresh = true,
+                                      claims = Dict("role" => "admin"))
 println("выпущен: ", first(issued["token"], 32), "...")
 
 refreshed = JwtServiceClient.refresh_tokens(issued["refresh_token"])

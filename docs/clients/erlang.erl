@@ -20,7 +20,7 @@
 %%% @end
 -module(jwt_service_client).
 
--export([issue_token/3, refresh_tokens/1, revoke_token/1, revoke_subject/1, main/0]).
+-export([issue_token/4, refresh_tokens/1, revoke_token/1, revoke_subject/1, main/0]).
 
 %% Значение claim `iss'. Должно совпадать при выпуске и проверке токена.
 -define(ISSUER_HOST, "example.com").
@@ -48,12 +48,25 @@ totp_code() ->
 %% @param Sub Субъект, которому выдаётся токен (claim `sub').
 %% @param Aud Получатель (claim `aud').
 %% @param WithRefresh Запросить refresh-токен для продления сессии.
+%% @param ClaimsJson Произвольные claims JSON-строкой (например
+%%        `<<"{\"role\":\"admin\"}">>') либо `undefined'. Попадают в payload рядом
+%%        с зарегистрированными; служебные имена (`iss', `sub', `aud', `exp',
+%%        `iat', `nbf', `jti') переопределять нельзя — сервис ответит `422'.
 %% @returns `{ok, Body}' либо `{error, Status}': `401' — неверный код,
-%%          `422' — некорректные параметры, `500' — JWKS или Redis недоступны.
--spec issue_token(string(), string(), boolean()) -> {ok, binary()} | {error, term()}.
-issue_token(Sub, Aud, WithRefresh) ->
-    Body = iolist_to_binary(io_lib:format(
-        "{\"sub\":\"~s\",\"aud\":[\"~s\"],\"refresh\":~p}", [Sub, Aud, WithRefresh])),
+%%          `422' — некорректные параметры или запрещённый claim,
+%%          `500' — JWKS или Redis недоступны.
+-spec issue_token(string(), string(), boolean(), binary() | undefined) ->
+    {ok, binary()} | {error, term()}.
+issue_token(Sub, Aud, WithRefresh, ClaimsJson) ->
+    ClaimsPart = case ClaimsJson of
+        undefined -> <<>>;
+        Json -> iolist_to_binary([<<",\"claims\":">>, Json])
+    end,
+    Body = iolist_to_binary([
+        io_lib:format("{\"sub\":\"~s\",\"aud\":[\"~s\"],\"refresh\":~p", [Sub, Aud, WithRefresh]),
+        ClaimsPart,
+        <<"}">>
+    ]),
     request(post, "/tokens", Body, 200).
 
 %% @doc Обменивает refresh-токен на новую пару (`POST /tokens/refresh').
@@ -121,7 +134,7 @@ request(Method, Path, Body, Expected) ->
 %% @doc Демонстрирует полный жизненный цикл токена.
 -spec main() -> ok.
 main() ->
-    {ok, Issued} = issue_token("svc-a", "svc-b", true),
+    {ok, Issued} = issue_token("svc-a", "svc-b", true, <<"{\"role\":\"admin\"}">>),
     io:format("выпущен: ~s~n", [Issued]),
 
     %% В боевом коде разберите JSON библиотекой (например, jsx) и достаньте

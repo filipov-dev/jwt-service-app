@@ -107,14 +107,23 @@ Public Class JwtServiceClient
     ''' <param name="subject">Субъект, которому выдаётся токен (claim <c>sub</c>).</param>
     ''' <param name="audience">Получатель (claim <c>aud</c>).</param>
     ''' <param name="withRefresh">Запросить refresh-токен для продления сессии.</param>
+    ''' <param name="claimsJson">
+    ''' Произвольные claims JSON-объектом (например <c>{"role":"admin"}</c>) либо
+    ''' <c>Nothing</c>. Попадают в payload рядом с зарегистрированными; служебные
+    ''' имена (<c>iss</c>, <c>sub</c>, <c>aud</c>, <c>exp</c>, <c>iat</c>,
+    ''' <c>nbf</c>, <c>jti</c>) переопределять нельзя — сервис ответит <c>422</c>.
+    ''' </param>
     ''' <returns>Тело ответа с полями <c>token</c> и, если запрашивался, <c>refresh_token</c>.</returns>
     ''' <exception cref="InvalidOperationException">
-    ''' <c>401</c> — неверный код, <c>422</c> — параметры, <c>500</c> — JWKS или Redis.
+    ''' <c>401</c> — неверный код, <c>422</c> — параметры или запрещённый claim,
+    ''' <c>500</c> — JWKS или Redis.
     ''' </exception>
     Public Function IssueToken(subject As String, audience As String,
-                               Optional withRefresh As Boolean = False) As String
+                               Optional withRefresh As Boolean = False,
+                               Optional claimsJson As String = Nothing) As String
 
-        Dim body = $"{{""sub"":""{subject}"",""aud"":[""{audience}""],""refresh"":{withRefresh.ToString().ToLower()}}}"
+        Dim claimsPart = If(claimsJson Is Nothing, "", $",""claims"":{claimsJson}")
+        Dim body = $"{{""sub"":""{subject}"",""aud"":[""{audience}""],""refresh"":{withRefresh.ToString().ToLower()}{claimsPart}}}"
         Dim result = Request(HttpMethod.Post, "/tokens", body)
 
         If result.Status <> 200 Then
@@ -192,7 +201,8 @@ Module Program
     Sub Main()
         Dim client = JwtServiceClient.FromEnv()
 
-        Dim issued = client.IssueToken("svc-a", "svc-b", withRefresh:=True)
+        Dim issued = client.IssueToken("svc-a", "svc-b", withRefresh:=True,
+                                       claimsJson:="{""role"":""admin""}")
         Console.WriteLine($"выпущен: {issued}")
 
         Using document = JsonDocument.Parse(issued)

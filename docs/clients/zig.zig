@@ -96,21 +96,34 @@ fn request(
 /// Выпускает access-токен (`POST /tokens`).
 ///
 /// `sub` — субъект (claim `sub`), `aud` — получатель (claim `aud`),
-/// `with_refresh` — запросить refresh-токен для продления сессии.
+/// `with_refresh` — запросить refresh-токен для продления сессии,
+/// `claims_json` — произвольные claims JSON-объектом (например
+/// `{"role":"admin"}`) либо `null`.
 ///
-/// Ошибки: `401` — неверный код, `422` — некорректные параметры,
-/// `500` — недоступны JWKS или Redis.
+/// Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
+/// имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
+/// сервис ответит `422`.
+///
+/// Ошибки: `401` — неверный код, `422` — некорректные параметры или запрещённый
+/// claim, `500` — недоступны JWKS или Redis.
 pub fn issueToken(
     allocator: std.mem.Allocator,
     sub: []const u8,
     aud: []const u8,
     with_refresh: bool,
+    claims_json: ?[]const u8,
     response: *std.ArrayList(u8),
 ) !void {
+    const claims_part = if (claims_json) |json|
+        try std.fmt.allocPrint(allocator, ",\"claims\":{s}", .{json})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(claims_part);
+
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"sub\":\"{s}\",\"aud\":[\"{s}\"],\"refresh\":{}}}",
-        .{ sub, aud, with_refresh },
+        "{{\"sub\":\"{s}\",\"aud\":[\"{s}\"],\"refresh\":{}{s}}}",
+        .{ sub, aud, with_refresh, claims_part },
     );
     defer allocator.free(body);
 
@@ -186,7 +199,7 @@ pub fn main() !void {
     var response = std.ArrayList(u8).init(allocator);
     defer response.deinit();
 
-    try issueToken(allocator, "svc-a", "svc-b", true, &response);
+    try issueToken(allocator, "svc-a", "svc-b", true, "{\"role\":\"admin\"}", &response);
     std.debug.print("выпущен: {s}\n", .{response.items});
 
     // В боевом коде разберите JSON через std.json и достаньте refresh_token.

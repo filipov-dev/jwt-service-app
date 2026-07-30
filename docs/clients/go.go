@@ -108,12 +108,25 @@ func (c *Client) do(method, path string, body any) (*http.Response, error) {
 // IssueToken выпускает access-токен (POST /tokens).
 //
 // sub — субъект (claim sub), aud — список получателей (claim aud, не пустой),
-// withRefresh — запросить вместе с токеном refresh для продления сессии.
+// withRefresh — запросить вместе с токеном refresh для продления сессии,
+// claims — произвольные claims (роли, scope, tenant), которые попадут в payload
+// рядом с зарегистрированными; nil, если они не нужны.
 //
-// Возвращает ошибку при 401 (неверный код), 422 (некорректные параметры) и
-// 500 (недоступны JWKS или Redis).
-func (c *Client) IssueToken(sub string, aud []string, withRefresh bool) (*TokenResponse, error) {
+// Служебные имена (iss, sub, aud, exp, iat, nbf, jti) переопределять нельзя —
+// сервис ответит 422. Число ключей и объём ограничены на сервере.
+//
+// Возвращает ошибку при 401 (неверный код), 422 (некорректные параметры или
+// запрещённый claim) и 500 (недоступны JWKS или Redis).
+func (c *Client) IssueToken(
+	sub string,
+	aud []string,
+	withRefresh bool,
+	claims map[string]any,
+) (*TokenResponse, error) {
 	payload := map[string]any{"sub": sub, "aud": aud, "refresh": withRefresh}
+	if len(claims) > 0 {
+		payload["claims"] = claims
+	}
 
 	response, err := c.do(http.MethodPost, "/tokens", payload)
 	if err != nil {
@@ -204,7 +217,8 @@ func (c *Client) RevokeSubject(sub string) (int, error) {
 func main() {
 	client := NewClient()
 
-	issued, err := client.IssueToken("svc-a", []string{"svc-b"}, true)
+	issued, err := client.IssueToken("svc-a", []string{"svc-b"}, true,
+		map[string]any{"role": "admin"})
 	if err != nil {
 		panic(err)
 	}

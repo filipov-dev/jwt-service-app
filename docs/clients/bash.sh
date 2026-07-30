@@ -37,18 +37,29 @@ totp_code() {
 # Аргументы:
 #   $1 — субъект (claim sub);
 #   $2 — получатель (claim aud);
-#   $3 — "true", чтобы запросить refresh-токен (по умолчанию false).
+#   $3 — "true", чтобы запросить refresh-токен (по умолчанию false);
+#   $4 — JSON-объект с произвольными claims (по умолчанию пусто).
+#
+# Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
+# имена (iss, sub, aud, exp, iat, nbf, jti) переопределять нельзя — будет 422.
+# Число ключей и объём ограничены на сервере.
+#
 # Вывод: JSON вида {"token":"...","refresh_token":"..."}.
-# Код возврата: ненулевой при 401 (неверный код), 422 (параметры), 500 (JWKS/Redis).
+# Код возврата: ненулевой при 401 (неверный код), 422 (параметры или запрещённый
+# claim), 500 (JWKS/Redis).
 issue_token() {
-  local sub="$1" aud="$2" with_refresh="${3:-false}"
+  local sub="$1" aud="$2" with_refresh="${3:-false}" claims="${4:-}"
+
+  local body="{\"sub\":\"$sub\",\"aud\":[\"$aud\"],\"refresh\":$with_refresh"
+  [ -n "$claims" ] && body="$body,\"claims\":$claims"
+  body="$body}"
 
   curl -sS --fail-with-body \
     -X POST "$SERVICE/tokens" \
     -H "X-TOTP-Code: $(totp_code)" \
     -H "Host: $ISSUER_HOST" \
     -H "Content-Type: application/json" \
-    -d "{\"sub\":\"$sub\",\"aud\":[\"$aud\"],\"refresh\":$with_refresh}"
+    -d "$body"
 }
 
 # Обменивает refresh-токен на новую пару (POST /tokens/refresh).
@@ -112,7 +123,7 @@ revoke_subject() {
 main() {
   local issued refresh_token refreshed
 
-  issued="$(issue_token svc-a svc-b true)"
+  issued="$(issue_token svc-a svc-b true '{"role":"admin"}')"
   echo "выпущен: $(jq -r '.token[:32]' <<<"$issued")..."
 
   refresh_token="$(jq -r '.refresh_token' <<<"$issued")"

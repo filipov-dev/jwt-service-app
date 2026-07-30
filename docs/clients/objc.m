@@ -44,13 +44,18 @@ static NSString *const kIssuerHost = @"example.com";
  * @param subject     Субъект, которому выдаётся токен (claim `sub`).
  * @param audience    Получатель (claim `aud`).
  * @param withRefresh Запросить refresh-токен для продления сессии.
+ * @param claimsJson Произвольные claims JSON-объектом (например
+ *        `@"{\"role\":\"admin\"}"`) либо `nil`. Попадают в payload рядом с
+ *        зарегистрированными; служебные имена (`iss`, `sub`, `aud`, `exp`,
+ *        `iat`, `nbf`, `jti`) переопределять нельзя — сервис ответит `422`.
  *
  * @return Тело ответа; `nil` при ошибке. Коды: `401` — неверный код,
- *         `422` — параметры, `500` — недоступны JWKS или Redis.
+ *         `422` — параметры или запрещённый claim, `500` — JWKS или Redis.
  */
 - (nullable NSString *)issueTokenForSubject:(NSString *)subject
                                    audience:(NSString *)audience
-                                withRefresh:(BOOL)withRefresh;
+                                withRefresh:(BOOL)withRefresh
+                                 claimsJson:(nullable NSString *)claimsJson;
 
 /**
  * @brief Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
@@ -186,10 +191,14 @@ static NSString *const kIssuerHost = @"example.com";
 
 - (nullable NSString *)issueTokenForSubject:(NSString *)subject
                                    audience:(NSString *)audience
-                                withRefresh:(BOOL)withRefresh {
+                                withRefresh:(BOOL)withRefresh
+                                 claimsJson:(nullable NSString *)claimsJson {
+    NSString *claimsPart =
+        claimsJson ? [NSString stringWithFormat:@",\"claims\":%@", claimsJson] : @"";
+
     NSString *body = [NSString
-        stringWithFormat:@"{\"sub\":\"%@\",\"aud\":[\"%@\"],\"refresh\":%@}", subject, audience,
-                         withRefresh ? @"true" : @"false"];
+        stringWithFormat:@"{\"sub\":\"%@\",\"aud\":[\"%@\"],\"refresh\":%@%@}", subject,
+                         audience, withRefresh ? @"true" : @"false", claimsPart];
 
     NSInteger status = 0;
     NSString *response = [self request:@"POST" path:@"/tokens" body:body status:&status];
@@ -239,7 +248,8 @@ int main(void) {
 
         NSLog(@"выпущен: %@", [client issueTokenForSubject:@"svc-a"
                                                  audience:@"svc-b"
-                                              withRefresh:YES]);
+                                              withRefresh:YES
+                                               claimsJson:@"{\"role\":\"admin\"}"]);
 
         // В боевом коде разберите JSON через NSJSONSerialization.
         NSLog(@"обновлён: %@", [client refreshTokens:@"положите-сюда-refresh_token"]);

@@ -22,6 +22,7 @@ module Main (main) where
 
 import Crypto.Hash.Algorithms (SHA1 (..))
 import Data.Aeson (Value, encode, object, (.=))
+import Data.Aeson.Types (Pair)
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.OTP (totp)
@@ -71,15 +72,20 @@ request method path body = do
 
 -- | Выпускает access-токен (@POST \/tokens@).
 --
--- Аргументы: субъект (claim @sub@), получатель (claim @aud@) и признак того,
--- нужен ли refresh-токен для продления сессии.
+-- Аргументы: субъект (claim @sub@), получатель (claim @aud@), признак того,
+-- нужен ли refresh-токен, и список произвольных claims (пустой, если не нужны).
 --
--- Коды ошибок: @401@ — неверный код, @422@ — некорректные параметры,
--- @500@ — недоступны JWKS или Redis.
-issueToken :: String -> String -> Bool -> IO (Int, LBS.ByteString)
-issueToken sub aud withRefresh =
-  request "POST" "/tokens" . Just $
-    object ["sub" .= sub, "aud" .= [aud], "refresh" .= withRefresh]
+-- Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
+-- имена (@iss@, @sub@, @aud@, @exp@, @iat@, @nbf@, @jti@) переопределять нельзя —
+-- сервис ответит @422@.
+--
+-- Коды ошибок: @401@ — неверный код, @422@ — некорректные параметры или
+-- запрещённый claim, @500@ — недоступны JWKS или Redis.
+issueToken :: String -> String -> Bool -> [Pair] -> IO (Int, LBS.ByteString)
+issueToken sub aud withRefresh claims =
+  request "POST" "/tokens" . Just . object $
+    ["sub" .= sub, "aud" .= [aud], "refresh" .= withRefresh]
+      ++ ["claims" .= object claims | not (null claims)]
 
 -- | Обменивает refresh-токен на новую пару (@POST \/tokens\/refresh@).
 --
@@ -114,7 +120,7 @@ revokeSubject sub = request "DELETE" ("/subjects/" ++ sub ++ "/tokens") Nothing
 -- | Демонстрирует полный жизненный цикл токена.
 main :: IO ()
 main = do
-  (_, issued) <- issueToken "svc-a" "svc-b" True
+  (_, issued) <- issueToken "svc-a" "svc-b" True ["role" .= ("admin" :: String)]
   putStrLn $ "выпущен: " ++ show issued
 
   -- В боевом коде разберите JSON через aeson и достаньте refresh_token.

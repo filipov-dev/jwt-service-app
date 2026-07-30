@@ -120,14 +120,26 @@ static long request(const char *method, const char *path, const char *body) {
  * @param sub          Субъект, которому выдаётся токен (claim `sub`).
  * @param aud          Получатель (claim `aud`).
  * @param with_refresh Запросить refresh-токен для продления сессии.
+ * @param claims_json  Произвольные claims JSON-объектом (например
+ *                     `{"role":"admin"}`) либо `NULL`. Попадают в payload рядом
+ *                     с зарегистрированными; служебные имена (`iss`, `sub`,
+ *                     `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
+ *                     сервис ответит `422`.
  *
- * @return HTTP-код: `200` — успех, `401` — неверный код, `422` — параметры,
- *         `500` — недоступны JWKS или Redis.
+ * @return HTTP-код: `200` — успех, `401` — неверный код, `422` — параметры или
+ *         запрещённый claim, `500` — недоступны JWKS или Redis.
  */
-long issue_token(const char *sub, const char *aud, int with_refresh) {
-    char body[256];
-    snprintf(body, sizeof(body), "{\"sub\":\"%s\",\"aud\":[\"%s\"],\"refresh\":%s}",
-             sub, aud, with_refresh ? "true" : "false");
+long issue_token(const char *sub, const char *aud, int with_refresh, const char *claims_json) {
+    char body[1024];
+
+    if (claims_json) {
+        snprintf(body, sizeof(body),
+                 "{\"sub\":\"%s\",\"aud\":[\"%s\"],\"refresh\":%s,\"claims\":%s}",
+                 sub, aud, with_refresh ? "true" : "false", claims_json);
+    } else {
+        snprintf(body, sizeof(body), "{\"sub\":\"%s\",\"aud\":[\"%s\"],\"refresh\":%s}",
+                 sub, aud, with_refresh ? "true" : "false");
+    }
 
     return request("POST", "/tokens", body);
 }
@@ -195,7 +207,7 @@ long revoke_subject(const char *sub) {
  * @return `0` при успехе.
  */
 int main(void) {
-    printf("выпуск: %ld\n", issue_token("svc-a", "svc-b", 1));
+    printf("выпуск: %ld\n", issue_token("svc-a", "svc-b", 1, "{\"role\":\"admin\"}"));
 
     /* В боевом коде разберите JSON ответа и достаньте refresh_token. */
     printf("обмен: %ld\n", refresh_tokens("положите-сюда-refresh_token"));

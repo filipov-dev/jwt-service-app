@@ -106,13 +106,20 @@ class JwtServiceClient {
      * @param sub субъект, которому выдаётся токен (claim {@code sub})
      * @param aud список получателей (claim {@code aud}); не должен быть пустым
      * @param withRefresh запросить refresh-токен для продления сессии
+     * @param claims произвольные claims (роли, scope, tenant) — попадают в payload
+     *        рядом с зарегистрированными. Служебные имена ({@code iss},
+     *        {@code sub}, {@code aud}, {@code exp}, {@code iat}, {@code nbf},
+     *        {@code jti}) переопределять нельзя, сервис ответит {@code 422}
      * @return разобранное тело ответа с полями {@code token} и,
      *         если запрашивался, {@code refresh_token}
      * @throws IllegalStateException {@code 401} — неверный код,
-     *         {@code 422} — параметры, {@code 500} — JWKS или Redis
+     *         {@code 422} — параметры или запрещённый claim, {@code 500} — JWKS/Redis
      */
-    Map issueToken(String sub, List<String> aud, boolean withRefresh = false) {
-        def body = JsonOutput.toJson([sub: sub, aud: aud, refresh: withRefresh])
+    Map issueToken(String sub, List<String> aud, boolean withRefresh = false, Map claims = [:]) {
+        def payload = [sub: sub, aud: aud, refresh: withRefresh]
+        if (claims) payload.claims = claims
+
+        def body = JsonOutput.toJson(payload)
         def response = request('POST', '/tokens', body)
 
         if (response.statusCode() != 200) {
@@ -190,7 +197,7 @@ class JwtServiceClient {
 // Демонстрация полного жизненного цикла токена.
 def client = JwtServiceClient.fromEnv()
 
-def issued = client.issueToken('svc-a', ['svc-b'], true)
+def issued = client.issueToken('svc-a', ['svc-b'], true, [role: 'admin'])
 println "выпущен: ${issued.token.take(32)}..."
 
 def refreshed = client.refreshTokens(issued.refresh_token as String)

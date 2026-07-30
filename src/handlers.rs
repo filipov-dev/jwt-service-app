@@ -85,13 +85,29 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
         .map_err(|_| Error::Validation("Invalid Host header".into()))?;
 
     let issued = if req.refresh {
-        JwtManager::generate_token_pair(host_header, &req.sub, &req.aud, req.ttl, &keys, store)
-            .await
-            .map(|(token, refresh)| (token, Some(refresh)))
+        JwtManager::generate_token_pair(
+            host_header,
+            &req.sub,
+            &req.aud,
+            req.ttl,
+            req.claims.clone(),
+            &keys,
+            store,
+        )
+        .await
+        .map(|(token, refresh)| (token, Some(refresh)))
     } else {
-        JwtManager::generate_token(host_header, &req.sub, &req.aud, req.ttl, &keys, store)
-            .await
-            .map(|token| (token, None))
+        JwtManager::generate_token(
+            host_header,
+            &req.sub,
+            &req.aud,
+            req.ttl,
+            req.claims.clone(),
+            &keys,
+            store,
+        )
+        .await
+        .map(|token| (token, None))
     };
 
     match issued {
@@ -1054,6 +1070,7 @@ mod tests {
             iat: now - 3600,
             nbf: now - 3600,
             jti: "expired-jti".into(),
+            extra: Default::default(),
         };
         let token = JsonWebToken::create_new(headers, claims, key.pkey.clone())
             .to_string()
@@ -1092,6 +1109,7 @@ mod tests {
             iat: now,
             nbf: now,
             jti: "forged-jti".into(),
+            extra: Default::default(),
         };
         let token = JsonWebToken::create_new(headers, claims, attacker.pkey.clone())
             .to_string()
@@ -1331,5 +1349,87 @@ mod tests {
 
         let resp = exchange!(&app, "no-such-token");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn custom_claims_land_in_issued_token() {
+        let _guard = env_guard();
+        let key = make_key("kid-claims");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({
+                "sub": "user1",
+                "aud": ["api1"],
+                "claims": { "role": "admin", "tenant": 42 }
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let issued: TokenResponse = test::read_body_json(resp).await;
+
+        // Разбираем payload и проверяем, что claims лежат рядом с
+        // зарегистрированными — потребитель токена ищет `role`, не `extra.role`.
+        let payload = issued.token.split('.').nth(1).expect("нет сегмента claims");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
+
+        assert_eq!(value["role"], "admin");
+        assert_eq!(value["tenant"], 42);
+        assert_eq!(value["sub"], "user1");
+    }
+
+    #[actix_web::test]
+    async fn reserved_custom_claim_gives_422() {
+        let _guard = env_guard();
+        let key = make_key("kid-reserved");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        // Подмена `exp` позволила бы обойти границы TTL — ручка обязана отказать.
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({
+                "sub": "user1",
+                "aud": ["api1"],
+                "claims": { "exp": 9999999999u64 }
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[actix_web::test]
+    async fn token_without_claims_is_unchanged() {
+        let _guard = env_guard();
+        let key = make_key("kid-noclaims");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        // Контракт прежних клиентов: без поля `claims` payload остаётся ровно
+        // таким, каким был до появления этой возможности.
+        let token = issue_token!(&app, "user1");
+        let payload = token.split('.').nth(1).expect("нет сегмента claims");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
+
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 7, "лишние поля в payload: {keys:?}");
     }
 }

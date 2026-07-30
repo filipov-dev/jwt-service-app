@@ -6,7 +6,7 @@ jwt-service-client — клиент jwt-service-app для эндпоинтов 
 
 =head1 SYNOPSIS
 
-    my $issued = issue_token('svc-a', 'svc-b', 1);
+    my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
     my $refreshed = refresh_tokens($issued->{refresh_token});
     my $count = revoke_subject('svc-a');
 
@@ -98,12 +98,17 @@ sub request {
 
 =head2 issue_token
 
-    my $issued = issue_token($sub, $aud, $with_refresh);
+    my $issued = issue_token($sub, $aud, $with_refresh, { role => 'admin' });
 
 Выпускает access-токен (C<POST /tokens>).
 
-Параметры: субъект (claim C<sub>), получатель (claim C<aud>) и признак того,
-нужен ли refresh-токен для продления сессии.
+Параметры: субъект (claim C<sub>), получатель (claim C<aud>), признак того,
+нужен ли refresh-токен для продления сессии, и необязательная ссылка на хеш с
+произвольными claims.
+
+Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
+имена (C<iss>, C<sub>, C<aud>, C<exp>, C<iat>, C<nbf>, C<jti>) переопределять
+нельзя — сервис ответит C<422>. Число ключей и объём ограничены на сервере.
 
 Возвращает ссылку на хеш с полями C<token> и, если запрашивался,
 C<refresh_token>.
@@ -114,13 +119,16 @@ C<refresh_token>.
 =cut
 
 sub issue_token {
-    my ($sub, $aud, $with_refresh) = @_;
+    my ($sub, $aud, $with_refresh, $claims) = @_;
 
-    my $response = request('POST', '/tokens', {
+    my $body = {
         sub     => $sub,
         aud     => [$aud],
         refresh => $with_refresh ? JSON::PP::true : JSON::PP::false,
-    });
+    };
+    $body->{claims} = $claims if $claims && %$claims;
+
+    my $response = request('POST', '/tokens', $body);
 
     die 'выпуск не удался: ' . $response->code unless $response->code == 200;
     return decode_json($response->content);
@@ -197,7 +205,7 @@ sub revoke_subject {
 }
 
 # Демонстрация полного жизненного цикла токена.
-my $issued = issue_token('svc-a', 'svc-b', 1);
+my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
 printf "выпущен: %s...\n", substr($issued->{token}, 0, 32);
 
 my $refreshed = refresh_tokens($issued->{refresh_token});

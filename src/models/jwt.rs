@@ -22,6 +22,7 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::env;
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -172,6 +173,74 @@ pub struct TokenClaims {
     pub nbf: usize,
     /// JWT ID — уникальный идентификатор (UUID v4), ключ в [`JtiStore`].
     pub jti: String,
+    /// Произвольные claims, переданные клиентом (роли, scope, tenant и т.п.).
+    ///
+    /// `flatten` — потому что в JWT они должны лежать **рядом** с
+    /// зарегистрированными, а не во вложенном объекте: потребитель токена ищет
+    /// `role`, а не `extra.role`.
+    ///
+    /// Служебные имена сюда попасть не могут — их отбрасывает
+    /// [`validate_custom_claims`], иначе клиент подменил бы `exp` или `iss`.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+/// Имена claims, которые формирует сервис. Переопределять их клиенту нельзя.
+///
+/// Подмена `exp` позволила бы обойти границы `TOKEN_TTL_MIN/MAX_SECONDS`, а
+/// подмена `iss` или `sub` — выпустить токен от чужого имени.
+pub const RESERVED_CLAIMS: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "jti"];
+
+/// Проверяет набор пользовательских claims перед выпуском токена.
+///
+/// # Errors
+/// [`JwtError::UnprocessableEntity`], если claims:
+/// - переопределяют служебное имя (см. [`RESERVED_CLAIMS`]);
+/// - превышают лимит по числу ключей (`TOKEN_CLAIMS_MAX_COUNT`);
+/// - превышают лимит по объёму в байтах (`TOKEN_CLAIMS_MAX_BYTES`).
+///
+/// Лимиты нужны не из вредности: токен ездит в заголовках HTTP, и раздутый
+/// payload ломает прокси с их ограничением на размер заголовка.
+///
+/// Содержимое claims **не логируется** — там бывают персональные данные; в лог
+/// уходит только имя конфликтующего ключа либо сам факт превышения лимита.
+pub fn validate_custom_claims(claims: &Map<String, Value>) -> Result<(), JwtError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+
+    let max_count = env_u64("TOKEN_CLAIMS_MAX_COUNT", 32) as usize;
+    if claims.len() > max_count {
+        debug!(
+            "Слишком много пользовательских claims: {} > {}",
+            claims.len(),
+            max_count
+        );
+        return Err(JwtError::UnprocessableEntity);
+    }
+
+    for name in claims.keys() {
+        if RESERVED_CLAIMS.contains(&name.as_str()) {
+            // Имя ключа логировать безопасно, значение — нет.
+            debug!("Попытка переопределить служебный claim: {}", name);
+            return Err(JwtError::UnprocessableEntity);
+        }
+    }
+
+    let max_bytes = env_u64("TOKEN_CLAIMS_MAX_BYTES", 4096) as usize;
+    let size = serde_json::to_vec(claims)
+        .map_err(|_| JwtError::Serialization)?
+        .len();
+
+    if size > max_bytes {
+        debug!(
+            "Пользовательские claims слишком объёмные: {} > {} байт",
+            size, max_bytes
+        );
+        return Err(JwtError::UnprocessableEntity);
+    }
+
+    Ok(())
 }
 
 impl TokenClaims {
@@ -201,8 +270,13 @@ impl TokenClaims {
         subject: &str,
         audience: &[String],
         ttl: Option<u64>,
+        extra: Map<String, Value>,
         store: Data<T>,
     ) -> Result<Self, JwtError> {
+        // Проверяем до всякой работы: смысла ходить в хранилище за `jti`, если
+        // claims всё равно отвергнем, нет.
+        validate_custom_claims(&extra)?;
+
         let expiration_seconds = match ttl {
             Some(requested) => {
                 let min = env_u64("TOKEN_TTL_MIN_SECONDS", 1);
@@ -272,6 +346,7 @@ impl TokenClaims {
             iat: now.timestamp() as usize,
             nbf: now.timestamp() as usize,
             jti,
+            extra,
         };
 
         if !jwt.is_verify(issuer, first_audience, store).await {
@@ -631,6 +706,15 @@ mod tests {
     use openssl::rsa::Rsa;
     use parking_lot::Mutex;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+
+    /// Блокировка окружения: лимиты claims читаются из переменных процесса, а
+    /// тесты бегут параллельно.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// In-memory реализация [`JtiStore`] для тестов.
     struct MockStore {
@@ -859,6 +943,7 @@ mod tests {
             iat: now,
             nbf: now,
             jti: "jti-1".to_string(),
+            extra: Default::default(),
         }
     }
 
@@ -1000,9 +1085,16 @@ mod tests {
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
-        let claims = TokenClaims::create_new("issuer", "subject", &audience, None, store.clone())
-            .await
-            .unwrap();
+        let claims = TokenClaims::create_new(
+            "issuer",
+            "subject",
+            &audience,
+            None,
+            Map::new(),
+            store.clone(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(claims.iss, "issuer");
         assert_eq!(claims.sub, "subject");
@@ -1017,7 +1109,8 @@ mod tests {
     #[actix_web::test]
     async fn create_new_rejects_empty_audience() {
         let store = Data::new(MockStore::new());
-        let result = TokenClaims::create_new("issuer", "subject", &[], None, store).await;
+        let result =
+            TokenClaims::create_new("issuer", "subject", &[], None, Map::new(), store).await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 
@@ -1027,10 +1120,16 @@ mod tests {
         let audience = vec!["api1".to_string()];
 
         let before = Utc::now().timestamp() as usize;
-        let claims =
-            TokenClaims::create_new("issuer", "subject", &audience, Some(120), store.clone())
-                .await
-                .unwrap();
+        let claims = TokenClaims::create_new(
+            "issuer",
+            "subject",
+            &audience,
+            Some(120),
+            Map::new(),
+            store.clone(),
+        )
+        .await
+        .unwrap();
         let after = Utc::now().timestamp() as usize;
 
         // exp = iat + ttl, с поправкой на возможный сдвиг секунды при замере.
@@ -1044,7 +1143,9 @@ mod tests {
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
-        let result = TokenClaims::create_new("issuer", "subject", &audience, Some(0), store).await;
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, Some(0), Map::new(), store)
+                .await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 
@@ -1054,8 +1155,15 @@ mod tests {
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
-        let result =
-            TokenClaims::create_new("issuer", "subject", &audience, Some(86401), store).await;
+        let result = TokenClaims::create_new(
+            "issuer",
+            "subject",
+            &audience,
+            Some(86401),
+            Map::new(),
+            store,
+        )
+        .await;
         assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 
@@ -1065,7 +1173,8 @@ mod tests {
         let store = Data::new(FailingStore);
         let audience = vec!["api1".to_string()];
 
-        let result = TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, None, Map::new(), store).await;
         assert!(matches!(result, Err(JwtError::StoreError)));
     }
 
@@ -1077,7 +1186,8 @@ mod tests {
         let store = Data::new(FailingGroupStore::new());
         let audience = vec!["api1".to_string()];
 
-        let result = TokenClaims::create_new("issuer", "subject", &audience, None, store).await;
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, None, Map::new(), store).await;
         assert!(matches!(result, Err(JwtError::StoreError)));
     }
 
@@ -1240,5 +1350,110 @@ mod tests {
                 "подпись {alg} не прошла проверку тем же дайджестом (рассогласование sign/verify)"
             );
         }
+    }
+
+    #[test]
+    fn custom_claims_reject_reserved_names() {
+        // Подмена `exp` обошла бы границы TTL, подмена `iss` или `sub` —
+        // позволила бы выпустить токен от чужого имени.
+        for name in RESERVED_CLAIMS {
+            let mut claims = Map::new();
+            claims.insert((*name).to_string(), Value::from("подмена"));
+
+            assert!(
+                matches!(
+                    validate_custom_claims(&claims),
+                    Err(JwtError::UnprocessableEntity)
+                ),
+                "служебный claim {name} обязан отклоняться"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_claims_accept_ordinary_names() {
+        let mut claims = Map::new();
+        claims.insert("role".to_string(), Value::from("admin"));
+        claims.insert("scope".to_string(), Value::from(vec!["read", "write"]));
+        claims.insert("tenant_id".to_string(), Value::from(42));
+
+        assert!(validate_custom_claims(&claims).is_ok());
+    }
+
+    #[test]
+    fn empty_custom_claims_are_allowed() {
+        // Пустой набор — самый частый случай: клиент про claims не знает.
+        assert!(validate_custom_claims(&Map::new()).is_ok());
+    }
+
+    #[test]
+    fn custom_claims_respect_count_limit() {
+        let _guard = env_guard();
+        env::set_var("TOKEN_CLAIMS_MAX_COUNT", "3");
+
+        let mut claims = Map::new();
+        for i in 0..4 {
+            claims.insert(format!("claim_{i}"), Value::from(i));
+        }
+
+        assert!(matches!(
+            validate_custom_claims(&claims),
+            Err(JwtError::UnprocessableEntity)
+        ));
+
+        env::remove_var("TOKEN_CLAIMS_MAX_COUNT");
+    }
+
+    #[test]
+    fn custom_claims_respect_size_limit() {
+        let _guard = env_guard();
+        env::set_var("TOKEN_CLAIMS_MAX_BYTES", "64");
+
+        let mut claims = Map::new();
+        // Один ключ, но значение заведомо больше лимита: токен ездит в
+        // заголовках, и раздутый payload ломает прокси.
+        claims.insert("blob".to_string(), Value::from("x".repeat(128)));
+
+        assert!(matches!(
+            validate_custom_claims(&claims),
+            Err(JwtError::UnprocessableEntity)
+        ));
+
+        env::remove_var("TOKEN_CLAIMS_MAX_BYTES");
+    }
+
+    #[actix_web::test]
+    async fn create_new_puts_custom_claims_alongside_registered() {
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let mut extra = Map::new();
+        extra.insert("role".to_string(), Value::from("admin"));
+
+        let claims = TokenClaims::create_new("issuer", "subject", &audience, None, extra, store)
+            .await
+            .expect("claims формируются");
+
+        // В сериализованном виде пользовательские claims лежат рядом с
+        // зарегистрированными, а не во вложенном объекте: потребитель ищет
+        // `role`, а не `extra.role`.
+        let value = serde_json::to_value(&claims).unwrap();
+        assert_eq!(value["role"], "admin");
+        assert_eq!(value["sub"], "subject");
+        assert!(value.get("extra").is_none());
+    }
+
+    #[actix_web::test]
+    async fn create_new_rejects_reserved_custom_claim() {
+        let store = Data::new(MockStore::new());
+        let audience = vec!["api1".to_string()];
+
+        let mut extra = Map::new();
+        extra.insert("exp".to_string(), Value::from(9_999_999_999_u64));
+
+        let result =
+            TokenClaims::create_new("issuer", "subject", &audience, None, extra, store).await;
+
+        assert!(matches!(result, Err(JwtError::UnprocessableEntity)));
     }
 }

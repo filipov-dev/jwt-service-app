@@ -83,12 +83,22 @@ let request (method: HttpMethod) (path: string) (body: string option) : int * st
 /// Выпускает access-токен (`POST /tokens`).
 ///
 /// `sub` — субъект (claim `sub`), `aud` — получатель (claim `aud`),
-/// `withRefresh` — запросить refresh-токен для продления сессии.
+/// `withRefresh` — запросить refresh-токен для продления сессии,
+/// `claimsJson` — произвольные claims JSON-объектом (например `{"role":"admin"}`)
+/// либо `None`.
 ///
-/// Ошибки: `401` — неверный код, `422` — некорректные параметры,
-/// `500` — недоступны JWKS или Redis.
-let issueToken (sub: string) (aud: string) (withRefresh: bool) : string =
-    let body = sprintf """{"sub":"%s","aud":["%s"],"refresh":%b}""" sub aud withRefresh
+/// Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
+/// имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
+/// сервис ответит `422`.
+///
+/// Ошибки: `401` — неверный код, `422` — некорректные параметры или запрещённый
+/// claim, `500` — недоступны JWKS или Redis.
+let issueToken (sub: string) (aud: string) (withRefresh: bool) (claimsJson: string option) : string =
+    let claimsPart =
+        claimsJson |> Option.map (sprintf ",\"claims\":%s") |> Option.defaultValue ""
+
+    let body =
+        sprintf """{"sub":"%s","aud":["%s"],"refresh":%b%s}""" sub aud withRefresh claimsPart
 
     match request HttpMethod.Post "/tokens" (Some body) with
     | 200, text -> text
@@ -134,7 +144,7 @@ let revokeSubject (sub: string) : int =
     | status, _ -> failwithf "массовый отзыв не удался: %d" status
 
 // Демонстрация полного жизненного цикла токена.
-let issued = issueToken "svc-a" "svc-b" true
+let issued = issueToken "svc-a" "svc-b" true (Some """{"role":"admin"}""")
 printfn "выпущен: %s" issued
 
 // В боевом коде разберите JSON и достаньте refresh_token.

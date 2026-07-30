@@ -45,15 +45,24 @@ defmodule JwtServiceClient do
 
     * `sub` — субъект, которому выдаётся токен (claim `sub`);
     * `aud` — список получателей (claim `aud`), не должен быть пустым;
-    * `with_refresh?` — запросить refresh-токен для продления сессии.
+    * `with_refresh?` — запросить refresh-токен для продления сессии;
+    * `claims` — произвольные claims (роли, scope, tenant), попадают в payload
+      рядом с зарегистрированными.
+
+  Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+  переопределять нельзя — сервис ответит `422`. Число ключей и объём ограничены
+  на сервере.
 
   Возвращает `{:ok, тело}` либо `{:error, статус}`: `401` — неверный код,
-  `422` — некорректные параметры, `500` — недоступны JWKS или Redis.
+  `422` — некорректные параметры или запрещённый claim, `500` — JWKS или Redis.
   """
-  @spec issue_token(String.t(), [String.t()], boolean()) ::
+  @spec issue_token(String.t(), [String.t()], boolean(), map()) ::
           {:ok, token_response()} | {:error, integer()}
-  def issue_token(sub, aud, with_refresh? \\ false) do
-    request(:post, "/tokens", %{sub: sub, aud: aud, refresh: with_refresh?}, 200)
+  def issue_token(sub, aud, with_refresh? \\ false, claims \\ %{}) do
+    body = %{sub: sub, aud: aud, refresh: with_refresh?}
+    body = if map_size(claims) > 0, do: Map.put(body, :claims, claims), else: body
+
+    request(:post, "/tokens", body, 200)
   end
 
   @doc """
@@ -132,7 +141,7 @@ defmodule JwtServiceClient do
 end
 
 # Демонстрация полного жизненного цикла токена.
-{:ok, issued} = JwtServiceClient.issue_token("svc-a", ["svc-b"], true)
+{:ok, issued} = JwtServiceClient.issue_token("svc-a", ["svc-b"], true, %{role: "admin"})
 IO.puts("выпущен: #{String.slice(issued["token"], 0, 32)}...")
 
 {:ok, refreshed} = JwtServiceClient.refresh_tokens(issued["refresh_token"])
