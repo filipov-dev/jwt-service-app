@@ -21,7 +21,7 @@ jobs:
     steps:
       # fetch-depth: 0 — нужна вся история и теги: описание релиза собирается по
       # коммитам от предыдущего тега, а при обычном shallow-клоне их нет.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
