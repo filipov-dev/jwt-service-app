@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwt-service-app
+  labels:
+    app.kubernetes.io/name: jwt-service-app
+spec:
+  # ClusterIP, а не LoadBalancer/NodePort: наружу сервис смотрит только через
+  # ingress, который ставит X-Proxy-Secret. Публикация Service напрямую даёт
+  # доступ в обход прокси, то есть в обход уровня 2.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: jwt-service-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
