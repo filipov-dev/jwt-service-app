@@ -12,6 +12,14 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.13.3] - 2026-07-31
+
+### Внутреннее
+
+- bump redis from 0.29.0 to 1.2.4
+- клиент Redis под API redis 1.x
+- версия 1.13.3
+
 ## [1.13.2] - 2026-07-31
 
 ### Внутреннее
@@ -309,6 +317,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.13.3]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.2...v1.13.3
 [1.13.2]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.12.3...v1.13.0
