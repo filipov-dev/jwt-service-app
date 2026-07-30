@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
@@ -31,6 +31,11 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # Скрипты релиза — тоже код, и ломаются они молча уже в CI. shellcheck
+      # предустановлен на раннере, шаг занимает секунду.
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
 
       # Форматирование проверяется первым: шаг быстрый и не требует сборки,
       # поэтому даёт обратную связь раньше остальных.

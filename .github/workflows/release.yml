@@ -7,28 +7,46 @@ on:
     paths:
       - Cargo.toml
 
+# Явный блок обнуляет всё неперечисленное, поэтому здесь оба права:
+# contents — создать тег и релиз, actions — дёрнуть docker.yml через
+# workflow_dispatch (без него шаг с curl получит 403).
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      # fetch-depth: 0 — нужна вся история и теги: описание релиза собирается по
+      # коммитам от предыдущего тега, а при обычном shallow-клоне их нет.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Get version from Cargo.toml
-        id: version
         run: |
-          echo "VERSION=$(grep -m1 'version' Cargo.toml | cut -d '"' -f 2)" >> $GITHUB_ENV
+          echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)" >> "$GITHUB_ENV"
 
-      - name: Create Release
-        uses: actions/create-release@v1
+      - name: Build release notes
+        run: |
+          # Тот же скрипт, что собирает CHANGELOG.md, — разделы и формулировки
+          # в описании релиза и в файле совпадают по построению.
+          scripts/changelog.sh > notes.md
+          cat notes.md
+
+      # gh вместо actions/create-release@v1: тот заархивирован ещё в 2021-м и
+      # тело релиза принимает только строкой, а у нас многострочный markdown.
+      # gh есть на раннере из коробки и создаёт тег сам.
+      - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ env.VERSION }}
-          release_name: v${{ env.VERSION }}
-          body: ${{ github.event.head_commit.message }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file notes.md \
+            --target "${GITHUB_SHA}"
 
       - name: Trigger another workflow
         run: |

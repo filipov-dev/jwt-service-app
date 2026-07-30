@@ -32,6 +32,28 @@ pub struct TokenRequest {
     #[schema(example = 3600, nullable = true)]
     #[serde(default)]
     pub ttl: Option<u64>,
+
+    /// Выдать вместе с токеном refresh-токен для продления сессии.
+    ///
+    /// По умолчанию `false` — контракт существующих клиентов не меняется, а
+    /// refresh появляется только у тех, кто его осознанно попросил.
+    #[schema(example = false)]
+    #[serde(default)]
+    pub refresh: bool,
+
+    /// Произвольные claims, которые попадут в payload токена рядом с
+    /// зарегистрированными (роли, scope, tenant, внутренний id).
+    ///
+    /// Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+    /// переопределять **нельзя** — попытка даёт `422`. Иначе клиент подменил бы
+    /// `exp` и обошёл границы `TOKEN_TTL_MIN_SECONDS` / `TOKEN_TTL_MAX_SECONDS`.
+    ///
+    /// Ограничения по числу ключей и суммарному объёму задают
+    /// `TOKEN_CLAIMS_MAX_COUNT` и `TOKEN_CLAIMS_MAX_BYTES`: токен ездит в
+    /// заголовках, и раздутый payload ломает прокси.
+    #[schema(example = json!({"role": "admin", "scope": ["read", "write"]}))]
+    #[serde(default)]
+    pub claims: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Тело запроса на проверку токена (`POST /tokens/verify`).
@@ -52,6 +74,32 @@ pub struct TokenResponse {
     /// Подписанный JWT.
     #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
     pub token: String,
+
+    /// Refresh-токен, если он запрашивался.
+    ///
+    /// Непрозрачная строка, а не JWT: разбирать её клиенту незачем, она лишь
+    /// предъявляется в `POST /tokens/refresh`. Отсутствует в ответе, когда
+    /// refresh не запрашивали.
+    #[schema(nullable = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// Тело запроса на обмен refresh-токена (`POST /tokens/refresh`).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RefreshRequest {
+    /// Refresh-токен, полученный при выпуске или предыдущем обмене.
+    pub refresh_token: String,
+}
+
+/// Результат массового отзыва токенов субъекта.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RevokeGroupResponse {
+    /// Сколько активных токенов было отозвано.
+    ///
+    /// Уже истёкшие в счёт не идут: они и так невалидны, отзывать их незачем.
+    #[schema(example = 3)]
+    pub revoked: u64,
 }
 
 /// Унифицированное тело ответа об ошибке.
@@ -147,4 +195,95 @@ pub struct Jwk {
 pub struct Jwks {
     /// Список доступных публичных ключей.
     pub keys: Vec<Jwk>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Тесты сериализации DTO.
+    //!
+    //! Проверяется то, что видит клиент: форма JSON и поведение дефолтов.
+    //! Обе вещи — часть публичного контракта, а не деталь реализации.
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn token_response_omits_refresh_when_absent() {
+        let response = TokenResponse {
+            token: "header.payload.signature".to_string(),
+            refresh_token: None,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+
+        // Ключа быть не должно вовсе — не `null`. Иначе прежние клиенты увидели
+        // бы в ответе новое поле, которого не ждали (см. `skip_serializing_if`).
+        assert_eq!(value, json!({ "token": "header.payload.signature" }));
+        assert!(!value.as_object().unwrap().contains_key("refresh_token"));
+    }
+
+    #[test]
+    fn token_response_includes_refresh_when_present() {
+        let response = TokenResponse {
+            token: "header.payload.signature".to_string(),
+            refresh_token: Some("refresh-id".to_string()),
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(value["refresh_token"], "refresh-id");
+    }
+
+    #[test]
+    fn token_request_defaults_are_optional() {
+        // Минимальное тело: ни `ttl`, ни `refresh` клиент присылать не обязан.
+        let request: TokenRequest =
+            serde_json::from_value(json!({ "sub": "user1", "aud": ["api1"] })).unwrap();
+
+        assert_eq!(request.sub, "user1");
+        assert_eq!(request.aud, vec!["api1".to_string()]);
+        assert!(request.ttl.is_none());
+        assert!(!request.refresh, "refresh по умолчанию выключен");
+    }
+
+    #[test]
+    fn token_request_reads_explicit_values() {
+        let request: TokenRequest = serde_json::from_value(
+            json!({ "sub": "user1", "aud": ["api1"], "ttl": 60, "refresh": true }),
+        )
+        .unwrap();
+
+        assert_eq!(request.ttl, Some(60));
+        assert!(request.refresh);
+    }
+
+    #[test]
+    fn jwk_keeps_unset_components_as_none() {
+        // OKP-ключ (EdDSA): заполнены `crv`/`x`, компоненты RSA отсутствуют.
+        let jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP", "alg": "EdDSA", "kid": "kid-1",
+            "crv": "Ed25519", "x": "AAAA",
+        }))
+        .unwrap();
+
+        assert_eq!(jwk.crv.as_deref(), Some("Ed25519"));
+        assert!(jwk.n.is_none());
+        assert!(jwk.e.is_none());
+        assert!(jwk.y.is_none());
+    }
+
+    #[test]
+    fn jwks_parses_empty_key_list() {
+        // Пустой список — штатный ответ сервиса ключей до выпуска первого ключа.
+        let jwks: Jwks = serde_json::from_value(json!({ "keys": [] })).unwrap();
+        assert!(jwks.keys.is_empty());
+    }
+
+    #[test]
+    fn error_response_has_no_details_by_default() {
+        let error = ErrorResponse::new("Invalid token");
+
+        assert_eq!(error.error, "Invalid token");
+        assert!(error.details.is_none());
+    }
 }
