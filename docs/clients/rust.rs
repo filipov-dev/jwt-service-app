@@ -52,6 +52,9 @@ struct IssueRequest<'a> {
     sub: &'a str,
     aud: &'a [String],
     refresh: bool,
+    /// Произвольные claims; поле опускается, когда их нет.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    claims: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Клиент сервиса выдачи токенов.
@@ -118,21 +121,27 @@ impl Client {
     /// # Аргументы
     /// - `sub` — субъект, которому выдаётся токен (claim `sub`);
     /// - `aud` — список получателей (claim `aud`); не должен быть пустым;
-    /// - `with_refresh` — запросить вместе с токеном refresh для продления сессии.
+    /// - `with_refresh` — запросить вместе с токеном refresh для продления сессии;
+    /// - `claims` — произвольные claims (роли, scope, tenant), попадают в payload
+    ///   рядом с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`,
+    ///   `exp`, `iat`, `nbf`, `jti`) переопределять нельзя — будет `422`. Число
+    ///   ключей и объём ограничены на сервере.
     ///
     /// # Errors
-    /// `401` — неверный TOTP-код, `422` — некорректные параметры,
-    /// `500` — недоступны JWKS или Redis.
+    /// `401` — неверный TOTP-код, `422` — некорректные параметры или запрещённый
+    /// claim, `500` — недоступны JWKS или Redis.
     pub fn issue_token(
         &self,
         sub: &str,
         aud: &[String],
         with_refresh: bool,
+        claims: serde_json::Map<String, serde_json::Value>,
     ) -> Result<TokenResponse, Box<dyn std::error::Error>> {
         let payload = IssueRequest {
             sub,
             aud,
             refresh: with_refresh,
+            claims,
         };
 
         let response = self.request(Method::POST, "/tokens", Some(&payload))?;
@@ -213,7 +222,10 @@ impl Client {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::from_env();
 
-    let issued = client.issue_token("svc-a", &["svc-b".to_string()], true)?;
+    let mut claims = serde_json::Map::new();
+    claims.insert("role".into(), serde_json::json!("admin"));
+
+    let issued = client.issue_token("svc-a", &["svc-b".to_string()], true, claims)?;
     println!("выпущен: {}...", &issued.token[..32]);
 
     let refresh = issued.refresh_token.expect("запрашивали refresh");

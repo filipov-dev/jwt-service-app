@@ -53,12 +53,20 @@
   "Выпускает access-токен (`POST /tokens`).
 
   `sub` — субъект (claim `sub`), `aud` — вектор получателей (claim `aud`),
-  `with-refresh?` — запросить refresh-токен для продления сессии.
+  `with-refresh?` — запросить refresh-токен для продления сессии,
+  `claims` — произвольные claims (роли, scope, tenant), попадают в payload рядом
+  с зарегистрированными.
+
+  Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+  переопределять нельзя — сервис ответит 422. Число ключей и объём ограничены на
+  сервере.
 
   Возвращает распарсенное тело ответа. Бросает ex-info при 401 (неверный код),
-  422 (некорректные параметры) и 500 (недоступны JWKS или Redis)."
-  [sub aud & {:keys [with-refresh?] :or {with-refresh? false}}]
-  (let [response (request :post "/tokens" {:sub sub :aud aud :refresh with-refresh?})]
+  422 (некорректные параметры или запрещённый claim) и 500 (JWKS или Redis)."
+  [sub aud & {:keys [with-refresh? claims] :or {with-refresh? false claims {}}}]
+  (let [body (cond-> {:sub sub :aud aud :refresh with-refresh?}
+               (seq claims) (assoc :claims claims))
+        response (request :post "/tokens" body)]
     (when (not= 200 (:status response))
       (throw (ex-info "выпуск не удался" {:status (:status response)})))
     (json/parse-string (:body response))))
@@ -108,7 +116,7 @@
 (defn -main
   "Демонстрирует полный жизненный цикл токена."
   [& _args]
-  (let [issued (issue-token "svc-a" ["svc-b"] :with-refresh? true)
+  (let [issued (issue-token "svc-a" ["svc-b"] :with-refresh? true :claims {:role "admin"})
         refreshed (refresh-tokens (get issued "refresh_token"))]
     (println "выпущен:" (subs (get issued "token") 0 32) "...")
     (println "обновлён:" (subs (get refreshed "token") 0 32) "...")

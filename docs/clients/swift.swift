@@ -110,14 +110,24 @@ struct JwtServiceClient {
     ///   - sub: субъект, которому выдаётся токен (claim `sub`).
     ///   - aud: список получателей (claim `aud`); не должен быть пустым.
     ///   - withRefresh: запросить refresh-токен для продления сессии.
+    ///   - claims: произвольные claims (роли, scope, tenant) — попадают в payload
+    ///     рядом с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`,
+    ///     `exp`, `iat`, `nbf`, `jti`) переопределять нельзя: сервис ответит
+    ///     `422`. Число ключей и объём ограничены на сервере.
     /// - Returns: выпущенный токен и, если запрашивался, refresh-токен.
     /// - Throws: ``ClientError/unexpectedStatus(_:)`` — `401` неверный код,
-    ///   `422` некорректные параметры, `500` недоступны JWKS или Redis.
-    func issueToken(sub: String, aud: [String], withRefresh: Bool = false) async throws -> TokenResponse {
-        let (data, status) = try await request(
-            "POST", "/tokens",
-            body: ["sub": sub, "aud": aud, "refresh": withRefresh]
-        )
+    ///   `422` некорректные параметры или запрещённый claim, `500` недоступны
+    ///   JWKS или Redis.
+    func issueToken(
+        sub: String,
+        aud: [String],
+        withRefresh: Bool = false,
+        claims: [String: Any] = [:]
+    ) async throws -> TokenResponse {
+        var body: [String: Any] = ["sub": sub, "aud": aud, "refresh": withRefresh]
+        if !claims.isEmpty { body["claims"] = claims }
+
+        let (data, status) = try await request("POST", "/tokens", body: body)
 
         guard status == 200 else { throw ClientError.unexpectedStatus(status) }
         return try JSONDecoder().decode(TokenResponse.self, from: data)
@@ -183,7 +193,8 @@ guard let client = JwtServiceClient(baseURL: service, secret: secret) else {
     fatalError("некорректный AUTH_TOTP_SECRET")
 }
 
-let issued = try await client.issueToken(sub: "svc-a", aud: ["svc-b"], withRefresh: true)
+let issued = try await client.issueToken(
+    sub: "svc-a", aud: ["svc-b"], withRefresh: true, claims: ["role": "admin"])
 print("выпущен:", issued.token.prefix(32), "...")
 
 let refreshed = try await client.refreshTokens(issued.refreshToken!)

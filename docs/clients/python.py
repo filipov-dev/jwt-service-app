@@ -47,18 +47,29 @@ def auth_headers() -> dict:
     return {"X-TOTP-Code": totp_code(), "Host": ISSUER_HOST}
 
 
-def issue_token(sub: str, aud: list, with_refresh: bool = False) -> dict:
+def issue_token(
+    sub: str,
+    aud: list,
+    with_refresh: bool = False,
+    claims: dict = None,
+) -> dict:
     """Выпускает access-токен (``POST /tokens``).
 
     :param sub: Субъект, которому выдаётся токен (claim ``sub``).
     :param aud: Список получателей (claim ``aud``); не должен быть пустым.
     :param with_refresh: Запросить вместе с токеном refresh для продления сессии.
+    :param claims: Произвольные claims (роли, scope, tenant), попадают в payload
+        рядом с зарегистрированными. Служебные имена (``iss``, ``sub``, ``aud``,
+        ``exp``, ``iat``, ``nbf``, ``jti``) переопределять нельзя — будет 422.
+        Число ключей и объём ограничены на сервере.
     :return: ``{"token": ..., "refresh_token": ...}``; ``refresh_token``
         присутствует, только если он запрашивался.
     :raises requests.HTTPError: 401 — неверный TOTP-код, 422 — некорректные
-        параметры, 500 — недоступны JWKS или Redis.
+        параметры или запрещённый claim, 500 — недоступны JWKS или Redis.
     """
     payload = {"sub": sub, "aud": aud, "refresh": with_refresh}
+    if claims:
+        payload["claims"] = claims
 
     response = requests.post(f"{SERVICE}/tokens", headers=auth_headers(), json=payload)
     response.raise_for_status()
@@ -121,7 +132,7 @@ def revoke_subject(sub: str) -> int:
 
 def main() -> None:
     """Демонстрирует полный жизненный цикл токена."""
-    issued = issue_token("svc-a", ["svc-b"], with_refresh=True)
+    issued = issue_token("svc-a", ["svc-b"], with_refresh=True, claims={"role": "admin"})
     print("выпущен:", issued["token"][:32], "...")
 
     refreshed = refresh_tokens(issued["refresh_token"])

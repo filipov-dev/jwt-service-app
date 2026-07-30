@@ -11,6 +11,7 @@ use crate::models::jwt::{
 };
 use actix_web::web::Data;
 use chrono::Utc;
+use serde_json::{Map, Value};
 use std::env;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -57,6 +58,7 @@ impl JwtManager {
         subject: &str,
         audience: &[String],
         ttl: Option<u64>,
+        extra: Map<String, Value>,
         key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<String, JwtError> {
@@ -65,7 +67,7 @@ impl JwtManager {
             JwtError::KeyError
         })?;
 
-        let claims = TokenClaims::create_new(issuer, subject, audience, ttl, store).await?;
+        let claims = TokenClaims::create_new(issuer, subject, audience, ttl, extra, store).await?;
 
         let headers = TokenHeaders::create_new(jwk.kid);
 
@@ -83,14 +85,22 @@ impl JwtManager {
         subject: &str,
         audience: &[String],
         ttl: Option<u64>,
+        extra: Map<String, Value>,
         key_manager: &KeyManager,
         store: Data<T>,
     ) -> Result<(String, String), JwtError> {
         let family = Uuid::new_v4().to_string();
 
-        let access =
-            Self::generate_token(issuer, subject, audience, ttl, key_manager, store.clone())
-                .await?;
+        let access = Self::generate_token(
+            issuer,
+            subject,
+            audience,
+            ttl,
+            extra,
+            key_manager,
+            store.clone(),
+        )
+        .await?;
         Self::register_access_in_family(&access, &family, store.clone()).await?;
 
         let refresh = Self::issue_refresh(subject, audience, &family, store).await?;
@@ -147,11 +157,17 @@ impl JwtManager {
             return Err(JwtError::NotValid);
         }
 
+        // Пользовательские claims при обмене НЕ переносятся: мы их не храним в
+        // записи refresh-токена. Сохранять их означало бы продлевать роли и
+        // scope, выданные когда-то давно, без нового решения о правах. Клиенту,
+        // которому нужны claims в обновлённом токене, следует выпускать пару
+        // заново через `POST /tokens`.
         let access = Self::generate_token(
             issuer,
             &record.subject,
             &record.audience,
             None,
+            Map::new(),
             key_manager,
             store.clone(),
         )

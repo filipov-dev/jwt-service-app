@@ -92,14 +92,23 @@ end
 -- @tparam string sub Субъект, которому выдаётся токен (claim `sub`).
 -- @tparam table aud Список получателей (claim `aud`); не должен быть пустым.
 -- @tparam ?boolean with_refresh Запросить refresh-токен для продления сессии.
+-- @tparam ?table claims Произвольные claims (роли, scope, tenant) — попадают в
+--   payload рядом с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`,
+--   `exp`, `iat`, `nbf`, `jti`) переопределять нельзя, сервис ответит 422.
 -- @treturn table Ответ с полями `token` и, если запрашивался, `refresh_token`.
--- @raise Ошибка при 401 (неверный код), 422 (параметры), 500 (JWKS или Redis).
-function M.issue_token(sub, aud, with_refresh)
-  local status, body = do_request('POST', '/tokens', {
+-- @raise Ошибка при 401 (неверный код), 422 (параметры или запрещённый claim),
+--   500 (JWKS или Redis).
+function M.issue_token(sub, aud, with_refresh, claims)
+  local payload = {
     sub = sub,
     aud = aud,
     refresh = with_refresh or false,
-  })
+  }
+  if claims and next(claims) then
+    payload.claims = claims
+  end
+
+  local status, body = do_request('POST', '/tokens', payload)
 
   assert(status == 200, 'выпуск не удался: ' .. status)
   return json.decode(body)
@@ -152,7 +161,7 @@ function M.revoke_subject(sub)
 end
 
 -- Демонстрация полного жизненного цикла токена.
-local issued = M.issue_token('svc-a', { 'svc-b' }, true)
+local issued = M.issue_token('svc-a', { 'svc-b' }, true, { role = 'admin' })
 print('выпущен: ' .. issued.token:sub(1, 32) .. '...')
 
 local refreshed = M.refresh_tokens(issued.refresh_token)

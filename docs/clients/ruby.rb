@@ -45,10 +45,18 @@ class JwtServiceClient
   # @param sub [String] субъект, которому выдаётся токен (claim +sub+)
   # @param aud [Array<String>] список получателей (claim +aud+), не пустой
   # @param with_refresh [Boolean] запросить refresh для продления сессии
+  # @param claims [Hash] произвольные claims (роли, scope, tenant) — попадают в
+  #   payload рядом с зарегистрированными. Служебные имена (+iss+, +sub+, +aud+,
+  #   +exp+, +iat+, +nbf+, +jti+) переопределять нельзя, будет 422. Число ключей
+  #   и объём ограничены на сервере.
   # @return [Hash] +{"token" => ..., "refresh_token" => ...}+
-  # @raise [RuntimeError] 401 — неверный код, 422 — параметры, 500 — JWKS/Redis
-  def issue_token(sub, aud, with_refresh: false)
-    response = request(Net::HTTP::Post, '/tokens', sub: sub, aud: aud, refresh: with_refresh)
+  # @raise [RuntimeError] 401 — неверный код, 422 — параметры или запрещённый
+  #   claim, 500 — JWKS/Redis
+  def issue_token(sub, aud, with_refresh: false, claims: {})
+    body = { sub: sub, aud: aud, refresh: with_refresh }
+    body[:claims] = claims unless claims.empty?
+
+    response = request(Net::HTTP::Post, '/tokens', body)
     raise "выпуск не удался: #{response.code}" unless response.code == '200'
 
     JSON.parse(response.body)
@@ -125,7 +133,7 @@ end
 if __FILE__ == $PROGRAM_NAME
   client = JwtServiceClient.from_env
 
-  issued = client.issue_token('svc-a', ['svc-b'], with_refresh: true)
+  issued = client.issue_token('svc-a', ['svc-b'], with_refresh: true, claims: { role: 'admin' })
   puts "выпущен: #{issued['token'][0, 32]}..."
 
   refreshed = client.refresh_tokens(issued['refresh_token'])

@@ -72,7 +72,13 @@ class JwtServiceClient {
   /// Выпускает access-токен (`POST /tokens`).
   ///
   /// [sub] — субъект (claim `sub`), [aud] — список получателей (claim `aud`,
-  /// не пустой), [withRefresh] — запросить refresh-токен для продления сессии.
+  /// не пустой), [withRefresh] — запросить refresh-токен для продления сессии,
+  /// [claims] — произвольные claims (роли, scope, tenant), попадают в payload
+  /// рядом с зарегистрированными.
+  ///
+  /// Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+  /// переопределять нельзя — сервис ответит `422`. Число ключей и объём
+  /// ограничены на сервере.
   ///
   /// Возвращает `{"token": ..., "refresh_token": ...}`; `refresh_token`
   /// присутствует, только если запрашивался.
@@ -83,11 +89,15 @@ class JwtServiceClient {
     String sub,
     List<String> aud, {
     bool withRefresh = false,
+    Map<String, dynamic> claims = const {},
   }) async {
+    final body = <String, dynamic>{'sub': sub, 'aud': aud, 'refresh': withRefresh};
+    if (claims.isNotEmpty) body['claims'] = claims;
+
     final response = await http.post(
       Uri.parse('$baseUrl/tokens'),
       headers: _headers(),
-      body: jsonEncode({'sub': sub, 'aud': aud, 'refresh': withRefresh}),
+      body: jsonEncode(body),
     );
 
     if (response.statusCode != 200) {
@@ -165,7 +175,8 @@ class JwtServiceClient {
 Future<void> main() async {
   final client = JwtServiceClient.fromEnv();
 
-  final issued = await client.issueToken('svc-a', ['svc-b'], withRefresh: true);
+  final issued = await client.issueToken('svc-a', ['svc-b'],
+      withRefresh: true, claims: {'role': 'admin'});
   print('выпущен: ${issued['token'].toString().substring(0, 32)}...');
 
   final refreshed = await client.refreshTokens(issued['refresh_token'] as String);

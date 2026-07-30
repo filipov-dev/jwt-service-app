@@ -120,25 +120,36 @@ function New-ServiceToken {
     .PARAMETER WithRefresh
         Запросить refresh-токен для продления сессии.
 
+    .PARAMETER Claims
+        Хеш-таблица произвольных claims (роли, scope, tenant): попадают в payload
+        рядом с зарегистрированными. Служебные имена (iss, sub, aud, exp, iat,
+        nbf, jti) переопределять нельзя — сервис ответит 422. Число ключей и
+        объём ограничены на сервере.
+
     .OUTPUTS
         Объект с полями token и, если запрашивался, refresh_token.
 
     .NOTES
-        Ошибки: 401 — неверный TOTP-код, 422 — некорректные параметры,
-        500 — недоступны JWKS или Redis.
+        Ошибки: 401 — неверный TOTP-код, 422 — некорректные параметры или
+        запрещённый claim, 500 — недоступны JWKS или Redis.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string[]]$Audience,
-        [switch]$WithRefresh
+        [switch]$WithRefresh,
+        [hashtable]$Claims
     )
 
-    return Invoke-LevelThreeRequest -Method 'POST' -Path '/tokens' -Body @{
+    $body = @{
         sub     = $Subject
         aud     = $Audience
         refresh = [bool]$WithRefresh
     }
+
+    if ($Claims -and $Claims.Count -gt 0) { $body.claims = $Claims }
+
+    return Invoke-LevelThreeRequest -Method 'POST' -Path '/tokens' -Body $body
 }
 
 function Update-ServiceToken {
@@ -216,7 +227,7 @@ function Remove-SubjectTokens {
 }
 
 # Демонстрация полного жизненного цикла токена.
-$issued = New-ServiceToken -Subject 'svc-a' -Audience 'svc-b' -WithRefresh
+$issued = New-ServiceToken -Subject 'svc-a' -Audience 'svc-b' -WithRefresh -Claims @{ role = 'admin' }
 Write-Host "выпущен: $($issued.token.Substring(0, 32))..."
 
 $refreshed = Update-ServiceToken -RefreshToken $issued.refresh_token

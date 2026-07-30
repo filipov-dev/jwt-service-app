@@ -104,21 +104,32 @@ final class JwtServiceClient
     /**
      * Выпускает access-токен (POST /tokens).
      *
-     * @param string        $sub         Субъект, которому выдаётся токен.
-     * @param list<string>  $aud         Список получателей; не должен быть пустым.
-     * @param bool          $withRefresh Запросить refresh для продления сессии.
+     * @param string             $sub         Субъект, которому выдаётся токен.
+     * @param list<string>       $aud         Список получателей; не пустой.
+     * @param bool               $withRefresh Запросить refresh для продления сессии.
+     * @param array<string,mixed> $claims     Произвольные claims (роли, scope,
+     *                                        tenant): попадают в payload рядом с
+     *                                        зарегистрированными. Служебные имена
+     *                                        (iss, sub, aud, exp, iat, nbf, jti)
+     *                                        переопределять нельзя — будет 422.
      *
      * @return array{token:string, refresh_token?:string} Выпущенный токен.
      *
-     * @throws RuntimeException 401 — неверный код, 422 — параметры, 500 — JWKS/Redis.
+     * @throws RuntimeException 401 — неверный код, 422 — параметры или
+     *                          запрещённый claim, 500 — JWKS/Redis.
      */
-    public function issueToken(string $sub, array $aud, bool $withRefresh = false): array
-    {
-        $response = $this->request('POST', '/tokens', [
-            'sub' => $sub,
-            'aud' => $aud,
-            'refresh' => $withRefresh,
-        ]);
+    public function issueToken(
+        string $sub,
+        array $aud,
+        bool $withRefresh = false,
+        array $claims = [],
+    ): array {
+        $body = ['sub' => $sub, 'aud' => $aud, 'refresh' => $withRefresh];
+        if ($claims !== []) {
+            $body['claims'] = $claims;
+        }
+
+        $response = $this->request('POST', '/tokens', $body);
 
         if ($response['status'] !== 200) {
             throw new RuntimeException("выпуск не удался: {$response['status']}");
@@ -200,7 +211,7 @@ final class JwtServiceClient
 
 $client = JwtServiceClient::fromEnv();
 
-$issued = $client->issueToken('svc-a', ['svc-b'], true);
+$issued = $client->issueToken('svc-a', ['svc-b'], true, ['role' => 'admin']);
 echo 'выпущен: ', substr($issued['token'], 0, 32), "...\n";
 
 $refreshed = $client->refreshTokens($issued['refresh_token']);

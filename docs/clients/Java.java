@@ -110,13 +110,22 @@ public final class Java {
      * @param sub         субъект, которому выдаётся токен (claim {@code sub})
      * @param aud         получатель (claim {@code aud})
      * @param withRefresh запросить refresh-токен для продления сессии
+     * @param claimsJson  произвольные claims в виде JSON-объекта (например
+     *                    {@code {"role":"admin"}}) либо {@code null}. Попадают в
+     *                    payload рядом с зарегистрированными; служебные имена
+     *                    ({@code iss}, {@code sub}, {@code aud}, {@code exp},
+     *                    {@code iat}, {@code nbf}, {@code jti}) переопределять
+     *                    нельзя — сервис ответит {@code 422}
      * @return тело ответа: {@code {"token": ..., "refresh_token": ...}}
-     * @throws Exception {@code 401} — неверный код, {@code 422} — параметры,
-     *                   {@code 500} — недоступны JWKS или Redis
+     * @throws Exception {@code 401} — неверный код, {@code 422} — параметры или
+     *                   запрещённый claim, {@code 500} — JWKS или Redis
      */
-    public String issueToken(String sub, String aud, boolean withRefresh) throws Exception {
+    public String issueToken(String sub, String aud, boolean withRefresh, String claimsJson)
+            throws Exception {
+        String claimsPart = claimsJson == null ? "" : ",\"claims\":" + claimsJson;
         String body = """
-                {"sub":"%s","aud":["%s"],"refresh":%b}""".formatted(sub, aud, withRefresh);
+                {"sub":"%s","aud":["%s"],"refresh":%b%s}"""
+                .formatted(sub, aud, withRefresh, claimsPart);
 
         HttpResponse<String> response = request("POST", "/tokens", body);
         if (response.statusCode() != 200) {
@@ -196,7 +205,7 @@ public final class Java {
     public static void main(String[] args) throws Exception {
         Java client = Java.fromEnv();
 
-        String issued = client.issueToken("svc-a", "svc-b", true);
+        String issued = client.issueToken("svc-a", "svc-b", true, "{\"role\":\"admin\"}");
         System.out.println("выпущен: " + issued);
 
         // В боевом коде разберите JSON и достаньте refresh_token библиотекой.

@@ -57,16 +57,23 @@ function authHeaders() {
  * @param {string[]} aud Список получателей (claim `aud`); не должен быть пустым.
  * @param {boolean} [withRefresh=false] Запросить вместе с токеном refresh для
  *   продления сессии.
+ * @param {Object<string, *>} [claims={}] Произвольные claims (роли, scope,
+ *   tenant) — попадают в payload рядом с зарегистрированными. Служебные имена
+ *   (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя,
+ *   будет `422`. Число ключей и объём ограничены на сервере.
  * @returns {Promise<{token: string, refresh_token?: string}>} Выпущенный токен;
  *   `refresh_token` присутствует, только если запрашивался.
  * @throws {Error} 401 — неверный TOTP-код, 422 — некорректные параметры,
  *   500 — недоступны JWKS или Redis.
  */
-export async function issueToken(sub, aud, withRefresh = false) {
+export async function issueToken(sub, aud, withRefresh = false, claims = {}) {
+  const body = { sub, aud, refresh: withRefresh };
+  if (Object.keys(claims).length > 0) body.claims = claims;
+
   const response = await fetch(`${SERVICE}/tokens`, {
     method: 'POST',
     headers: authHeaders(),
-    body: JSON.stringify({ sub, aud, refresh: withRefresh }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) throw new Error(`выпуск не удался: ${response.status}`);
@@ -140,7 +147,7 @@ export async function revokeSubject(sub) {
 
 /** Демонстрирует полный жизненный цикл токена. */
 async function main() {
-  const issued = await issueToken('svc-a', ['svc-b'], true);
+  const issued = await issueToken('svc-a', ['svc-b'], true, { role: 'admin' });
   console.log('выпущен:', issued.token.slice(0, 32), '...');
 
   const refreshed = await refreshTokens(issued.refresh_token);

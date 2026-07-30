@@ -7,6 +7,7 @@
 //   JWT_SERVICE_URL  — базовый URL сервиса, по умолчанию http://localhost:8080.
 
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
@@ -84,14 +85,27 @@ public sealed class JwtServiceClient
     /// <param name="sub">Субъект, которому выдаётся токен (claim <c>sub</c>).</param>
     /// <param name="aud">Список получателей (claim <c>aud</c>); не должен быть пустым.</param>
     /// <param name="withRefresh">Запросить refresh-токен для продления сессии.</param>
+    /// <param name="claims">
+    /// Произвольные claims (роли, scope, tenant) — попадают в payload рядом с
+    /// зарегистрированными. Служебные имена (<c>iss</c>, <c>sub</c>, <c>aud</c>,
+    /// <c>exp</c>, <c>iat</c>, <c>nbf</c>, <c>jti</c>) переопределять нельзя:
+    /// сервис ответит <c>422</c>. Число ключей и объём ограничены на сервере.
+    /// </param>
     /// <returns>Выпущенный токен и, если запрашивался, refresh-токен.</returns>
     /// <exception cref="HttpRequestException">
-    /// <c>401</c> — неверный код, <c>422</c> — параметры, <c>500</c> — JWKS или Redis.
+    /// <c>401</c> — неверный код, <c>422</c> — параметры или запрещённый claim,
+    /// <c>500</c> — JWKS или Redis.
     /// </exception>
-    public async Task<TokenResponse> IssueTokenAsync(string sub, string[] aud, bool withRefresh = false)
+    public async Task<TokenResponse> IssueTokenAsync(
+        string sub,
+        string[] aud,
+        bool withRefresh = false,
+        IDictionary<string, object>? claims = null)
     {
         var request = Request(HttpMethod.Post, "/tokens");
-        request.Content = JsonContent.Create(new { sub, aud, refresh = withRefresh });
+        request.Content = claims is null or { Count: 0 }
+            ? JsonContent.Create(new { sub, aud, refresh = withRefresh })
+            : JsonContent.Create(new { sub, aud, refresh = withRefresh, claims });
 
         var response = await _http.SendAsync(request);
         response.EnsureSuccessStatusCode();
@@ -168,7 +182,9 @@ public static class Program
     {
         var client = JwtServiceClient.FromEnv();
 
-        var issued = await client.IssueTokenAsync("svc-a", new[] { "svc-b" }, withRefresh: true);
+        var issued = await client.IssueTokenAsync(
+            "svc-a", new[] { "svc-b" }, withRefresh: true,
+            claims: new Dictionary<string, object> { ["role"] = "admin" });
         Console.WriteLine($"выпущен: {issued.Token[..32]}...");
 
         var refreshed = await client.RefreshTokensAsync(issued.RefreshToken!);

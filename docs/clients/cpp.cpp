@@ -68,15 +68,24 @@ public:
      * @param sub          Субъект, которому выдаётся токен (claim `sub`).
      * @param aud          Получатель (claim `aud`).
      * @param with_refresh Запросить refresh-токен для продления сессии.
+     * @param claims_json  Произвольные claims JSON-объектом (например
+     *                     `{"role":"admin"}`) либо пустая строка. Попадают в
+     *                     payload рядом с зарегистрированными; служебные имена
+     *                     (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+     *                     переопределять нельзя — сервис ответит `422`.
      *
-     * @return HTTP-код и тело ответа. `401` — неверный код, `422` — параметры,
-     *         `500` — недоступны JWKS или Redis.
+     * @return HTTP-код и тело ответа. `401` — неверный код, `422` — параметры или
+     *         запрещённый claim, `500` — недоступны JWKS или Redis.
      */
     std::pair<int, std::string> IssueToken(const std::string& sub,
                                            const std::string& aud,
-                                           bool with_refresh = false) {
-        const std::string body = "{\"sub\":\"" + sub + "\",\"aud\":[\"" + aud +
-                                 "\"],\"refresh\":" + (with_refresh ? "true" : "false") + "}";
+                                           bool with_refresh = false,
+                                           const std::string& claims_json = "") {
+        std::string body = "{\"sub\":\"" + sub + "\",\"aud\":[\"" + aud +
+                           "\"],\"refresh\":" + (with_refresh ? "true" : "false");
+
+        if (!claims_json.empty()) body += ",\"claims\":" + claims_json;
+        body += "}";
 
         return Request("POST", "/tokens", body);
     }
@@ -206,7 +215,7 @@ private:
 int main() {
     auto client = jwt_service::Client::FromEnv();
 
-    auto [issue_status, issued] = client.IssueToken("svc-a", "svc-b", true);
+    auto [issue_status, issued] = client.IssueToken("svc-a", "svc-b", true, R"({"role":"admin"})");
     std::cout << "выпуск: " << issue_status << " " << issued << "\n";
 
     // В боевом коде разберите JSON ответа и достаньте refresh_token.

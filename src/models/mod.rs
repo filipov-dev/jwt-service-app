@@ -40,6 +40,20 @@ pub struct TokenRequest {
     #[schema(example = false)]
     #[serde(default)]
     pub refresh: bool,
+
+    /// Произвольные claims, которые попадут в payload токена рядом с
+    /// зарегистрированными (роли, scope, tenant, внутренний id).
+    ///
+    /// Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+    /// переопределять **нельзя** — попытка даёт `422`. Иначе клиент подменил бы
+    /// `exp` и обошёл границы `TOKEN_TTL_MIN_SECONDS` / `TOKEN_TTL_MAX_SECONDS`.
+    ///
+    /// Ограничения по числу ключей и суммарному объёму задают
+    /// `TOKEN_CLAIMS_MAX_COUNT` и `TOKEN_CLAIMS_MAX_BYTES`: токен ездит в
+    /// заголовках, и раздутый payload ломает прокси.
+    #[schema(example = json!({"role": "admin", "scope": ["read", "write"]}))]
+    #[serde(default)]
+    pub claims: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Тело запроса на проверку токена (`POST /tokens/verify`).

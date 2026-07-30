@@ -69,13 +69,21 @@ do_request <- function(method, path, body = NULL) {
 #' @param sub Субъект, которому выдаётся токен (claim \code{sub}).
 #' @param aud Вектор получателей (claim \code{aud}); не должен быть пустым.
 #' @param with_refresh Запросить refresh-токен для продления сессии.
+#' @param claims Именованный список произвольных claims (роли, scope, tenant):
+#'   попадают в payload рядом с зарегистрированными. Служебные имена
+#'   (\code{iss}, \code{sub}, \code{aud}, \code{exp}, \code{iat},
+#'   \code{nbf}, \code{jti}) переопределять нельзя — сервис ответит 422.
 #' @return Список с полями \code{token} и, если запрашивался, \code{refresh_token}.
 #' @examples
 #' \dontrun{
-#' issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE)
+#' issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE,
+#'                       claims = list(role = "admin"))
 #' }
-issue_token <- function(sub, aud, with_refresh = FALSE) {
-  response <- do_request(POST, "/tokens", list(sub = sub, aud = aud, refresh = with_refresh))
+issue_token <- function(sub, aud, with_refresh = FALSE, claims = NULL) {
+  body <- list(sub = sub, aud = aud, refresh = with_refresh)
+  if (!is.null(claims) && length(claims) > 0) body$claims <- claims
+
+  response <- do_request(POST, "/tokens", body)
 
   if (status_code(response) != 200) {
     stop(sprintf("выпуск не удался: %d", status_code(response)))
@@ -141,7 +149,7 @@ revoke_subject <- function(sub) {
 }
 
 # Демонстрация полного жизненного цикла токена.
-issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE)
+issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE, claims = list(role = "admin"))
 cat("выпущен:", substr(issued$token, 1, 32), "...\n")
 
 refreshed <- refresh_tokens(issued$refresh_token)
