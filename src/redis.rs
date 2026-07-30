@@ -91,15 +91,18 @@ impl RedisClient {
 
         let client = redis::Client::open(url)?;
 
+        // `Option` у таймаутов — с redis 1.0: `None` означает «без таймаута»,
+        // и раз он выражается явно, значение стало опциональным. У нас таймаут
+        // есть всегда, поэтому оба — `Some`.
         let config = ConnectionManagerConfig::new()
-            .set_response_timeout(Duration::from_millis(env_millis(
+            .set_response_timeout(Some(Duration::from_millis(env_millis(
                 "REDIS_RESPONSE_TIMEOUT_MS",
                 DEFAULT_RESPONSE_TIMEOUT_MS,
-            )))
-            .set_connection_timeout(Duration::from_millis(env_millis(
+            ))))
+            .set_connection_timeout(Some(Duration::from_millis(env_millis(
                 "REDIS_CONNECT_TIMEOUT_MS",
                 DEFAULT_CONNECT_TIMEOUT_MS,
-            )))
+            ))))
             // Дефолт — 6 попыток с экспоненциальной задержкой, суммарно больше
             // шести секунд. Для нас это неприемлемо: пока идут ретраи, висит
             // обработчик запроса (в том числе `/readyz`, который обязан отвечать
@@ -107,7 +110,7 @@ impl RedisClient {
             // мгновенный обрыв, а более долгую недоступность правильнее показать
             // в readiness, чем прятать за ожиданием.
             .set_number_of_retries(1)
-            .set_max_delay(REFRESH_MAX_DELAY_MS);
+            .set_max_delay(Duration::from_millis(REFRESH_MAX_DELAY_MS));
 
         Ok(Self {
             client,
@@ -497,7 +500,9 @@ mod tests {
     #[test]
     fn other_errors_mean_wrong_operation() {
         // Ответ не того типа — сбой не связи, а самой команды.
-        let type_error = RedisError::from((redis::ErrorKind::TypeError, "unexpected type"));
+        // `UnexpectedReturnType` — это переименованный в redis 1.0 `TypeError`.
+        let type_error =
+            RedisError::from((redis::ErrorKind::UnexpectedReturnType, "unexpected type"));
         assert!(matches!(classify(&type_error), JtiError::WrongOperation));
     }
 
