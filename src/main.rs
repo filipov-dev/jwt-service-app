@@ -32,6 +32,7 @@ mod models;
 mod rate_limit;
 mod redis;
 mod sentry_glitchtip;
+mod server;
 mod tracing_otel;
 
 use crate::auth::{Auth, AuthConfig, AuthLevel};
@@ -48,6 +49,7 @@ use crate::models::{
 };
 use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
+use crate::server::ServerConfig;
 
 /// Корневой описатель OpenAPI-документации.
 ///
@@ -277,7 +279,8 @@ pub async fn openapi_spec() -> impl Responder {
 ///    недоступен на старте).
 /// 5. Поднимает `HttpServer`: на публичную ручку `/tokens/verify` навешивает
 ///    разрешающий CORS, на остальные — запрещающий (`deny_cors`), и регистрирует
-///    маршруты, включая выдачу OpenAPI.
+///    маршруты, включая выдачу OpenAPI. Число воркеров и таймауты соединений
+///    берутся из [`ServerConfig`], а не из дефолтов actix (см. `server.rs`).
 ///
 /// # Panics
 ///
@@ -347,6 +350,12 @@ async fn main() -> std::io::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Число воркеров и таймауты соединений: на дефолтах actix воркеров было бы
+    // по числу ядер ХОСТА (см. `server.rs`), а медленный клиент мог удерживать
+    // воркер сколь угодно долго.
+    let server_config = ServerConfig::from_env();
+    server_config.log_summary();
+
     info!("Starting server on {}:{}", host, port);
 
     HttpServer::new(move || {
@@ -367,6 +376,9 @@ async fn main() -> std::io::Result<()> {
                 )
             })
     })
+    .workers(server_config.workers)
+    .client_request_timeout(server_config.client_request_timeout)
+    .keep_alive(server_config.keep_alive)
     .bind((host, port))?
     .run()
     .await?;
