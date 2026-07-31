@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.14.0] - 2026-07-31
+
+### Добавлено
+
+- воркеры actix по квоте CPU и явные таймауты соединений (JWT-37)
+
 ## [1.13.5] - 2026-07-31
 
 ### Внутреннее
@@ -329,6 +335,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.14.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.5...v1.14.0
 [1.13.5]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.4...v1.13.5
 [1.13.4]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.3...v1.13.4
 [1.13.3]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.2...v1.13.3
