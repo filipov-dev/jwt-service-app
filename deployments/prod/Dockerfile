@@ -8,6 +8,15 @@
 # (edition 2024) не парсится более старым cargo.
 FROM rust:1.90-slim-bookworm AS chef
 
+# Пин тулчейна образа поверх `rust-toolchain.toml` в корне репозитория.
+# `RUSTUP_TOOLCHAIN` приоритетнее toolchain-файла, и без него cargo внутри
+# образа скачивал бы свежий stable: во-первых, версия компилятора релизного
+# бинаря перестала бы быть воспроизводимой, во-вторых — `cargo chef cook`
+# выполняется ДО копирования исходников (и toolchain-файла), поэтому
+# зависимости собрались бы одним компилятором, а `cargo build` — другим, и
+# весь кеш слоя с зависимостями пересобирался бы каждый раз.
+ENV RUSTUP_TOOLCHAIN=1.90.0
+
 # openssl-sys требует pkg-config и заголовки libssl на этапе сборки.
 RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \

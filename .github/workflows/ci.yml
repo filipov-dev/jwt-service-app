@@ -24,6 +24,10 @@ jobs:
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
+      # Канал совпадает с `rust-toolchain.toml` в корне (channel = "stable"),
+      # поэтому cargo, который читает toolchain-файл, получает ровно тот
+      # тулчейн, который поставил этот шаг. Компоненты продублированы намеренно:
+      # так они ставятся сразу, а не догружаются при первом вызове clippy.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
