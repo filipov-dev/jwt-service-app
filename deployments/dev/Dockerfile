@@ -6,9 +6,12 @@ FROM rust:1.90 as dev
 # Install cargo-watch for hot reload during development
 RUN cargo install cargo-watch
 
-# Add Rust tools for linting and formatting
-RUN rustup component add clippy
-RUN rustup component add rustfmt
+# Тулчейн под `rust-toolchain.toml` (channel = "stable") ставим на этапе сборки
+# образа: иначе rustup качал бы stable при первом же `cargo` внутри контейнера —
+# заново после каждого пересоздания. Линт в dev-контейнере должен идти той же
+# версией, что и в CI, ради чего toolchain-файл и заведён.
+RUN rustup toolchain install stable --component clippy,rustfmt && \
+    rustup default stable
 
 # Install cargo-audit for security vulnerability checks
 RUN cargo install cargo-audit
