@@ -1,35 +1,34 @@
 defmodule JwtServiceClient do
   @moduledoc """
-  Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+  jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 
-  Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-  токена и массовый отзыв токенов субъекта.
+  Dependencies: `{:nimble_totp, "~> 1.0"}`, `{:req, "~> 0.5"}`.
 
-  Зависимости: `{:nimble_totp, "~> 1.0"}`, `{:req, "~> 0.5"}`.
+  ## Environment
 
-  ## Окружение
+    * `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+    * `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
 
-    * `AUTH_TOTP_SECRET` — общий TOTP-секрет в base32 (обязательно);
-    * `JWT_SERVICE_URL` — базовый URL сервиса, по умолчанию `http://localhost:8080`.
-
-  > #### Один код — один запрос {: .warning}
+  > #### One code, one request {: .warning}
   >
-  > Код считается заново перед каждым запросом. При включённой на сервере защите
-  > от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное предъявление того
-  > же кода вернёт `401`, хотя сам код ещё не истёк.
+  > The code is recomputed before every request. With replay protection on
+  > (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already
+  > seen with `401`, even while that code is still inside its time window.
   """
 
-  @typedoc "Ответ на выпуск токена или обмен refresh-токена."
+  @typedoc "Reply of an issue or a refresh call."
   @type token_response :: %{String.t() => String.t()}
 
+  # Sent as the Host header and becomes the "iss" claim. Must be the same on
+  # issue and on verify, or the token will not verify.
   @issuer_host "example.com"
 
   @doc """
-  Вычисляет TOTP-код на текущий момент.
+  Computes a fresh TOTP code for right now.
 
-  Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
+  Service defaults: SHA-1, 6 digits, 30-second step.
 
-  Возвращает код из шести десятичных знаков.
+  Returns six decimal digits.
   """
   @spec totp_code() :: String.t()
   def totp_code do
@@ -39,22 +38,22 @@ defmodule JwtServiceClient do
   end
 
   @doc """
-  Выпускает access-токен (`POST /tokens`).
+  Issues an access token (`POST /tokens`).
 
-  ## Параметры
+  ## Parameters
 
-    * `sub` — субъект, которому выдаётся токен (claim `sub`);
-    * `aud` — список получателей (claim `aud`), не должен быть пустым;
-    * `with_refresh?` — запросить refresh-токен для продления сессии;
-    * `claims` — произвольные claims (роли, scope, tenant), попадают в payload
-      рядом с зарегистрированными.
+    * `sub` — subject the token is issued to (`sub` claim);
+    * `aud` — audience (`aud` claim), must not be empty;
+    * `with_refresh?` — also return a refresh token for extending the session;
+    * `claims` — custom claims (role, scope, tenant) that sit next to the
+      registered ones, so the consumer reads `role`, not `extra.role`.
 
-  Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
-  переопределять нельзя — сервис ответит `422`. Число ключей и объём ограничены
-  на сервере.
+  Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) are rejected
+  with `422` — change lifetime through `ttl`, not `exp`. Count and size are
+  capped server-side.
 
-  Возвращает `{:ok, тело}` либо `{:error, статус}`: `401` — неверный код,
-  `422` — некорректные параметры или запрещённый claim, `500` — JWKS или Redis.
+  Returns `{:ok, body}` or `{:error, status}`: `401` bad code, `422` bad
+  parameters or forbidden claim, `500` JWKS or Redis unavailable.
   """
   @spec issue_token(String.t(), [String.t()], boolean(), map()) ::
           {:ok, token_response()} | {:error, integer()}
@@ -66,19 +65,19 @@ defmodule JwtServiceClient do
   end
 
   @doc """
-  Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+  Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
 
-  Старый токен после обмена недействителен: сохраните новый и выбросьте
-  предыдущий.
+  The old token dies on exchange: store the new one and drop the previous.
 
-  > #### Не ретрайте обмен {: .error}
+  > #### Never retry the exchange {: .error}
   >
-  > При потере ответа не повторяйте обмен старым токеном. Повторное предъявление
-  > трактуется как кража и гасит всю семью — и refresh-токены, и выданные по ним
-  > access-токены. Надёжнее выпустить пару заново.
+  > When the reply is lost, do not repeat the exchange with the old token. A
+  > second presentation reads as theft, and the server revokes the whole family
+  > — refresh tokens and the access tokens issued from them. Issue a new pair
+  > instead.
 
-  Возвращает `{:ok, новая_пара}` либо `{:error, 401}`, если токен неизвестен,
-  истёк или уже использован.
+  Returns `{:ok, new_pair}` or `{:error, 401}` if the token is unknown, expired
+  or already used.
   """
   @spec refresh_tokens(String.t()) :: {:ok, token_response()} | {:error, integer()}
   def refresh_tokens(refresh_token) do
@@ -86,12 +85,12 @@ defmodule JwtServiceClient do
   end
 
   @doc """
-  Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+  Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
 
-  Идемпотентно: отзыв несуществующего `jti` — тоже успех.
+  Idempotent: revoking an unknown `jti` is success too.
 
-  Возвращает `:ok` либо `{:error, 500}`, если хранилище недоступно и отзыв **не
-  выполнен** — попытку следует повторить.
+  Returns `:ok` or `{:error, 500}` — the store is unreachable and the token is
+  **not** revoked, retry.
   """
   @spec revoke_token(String.t()) :: :ok | {:error, integer()}
   def revoke_token(jti) do
@@ -102,12 +101,12 @@ defmodule JwtServiceClient do
   end
 
   @doc """
-  Отзывает все активные токены субъекта (`DELETE /subjects/{sub}/tokens`).
+  Revokes every active token of a subject (`DELETE /subjects/{sub}/tokens`).
 
-  Нужен при компрометации: гасить токены по одному нельзя, их `jti` вызывающему
-  неизвестны.
+  The compromise path: tokens cannot be killed one by one because the caller
+  does not know their `jti`.
 
-  Возвращает `{:ok, количество}`; уже истёкшие токены не считаются.
+  Returns `{:ok, count}`; expired tokens do not count.
   """
   @spec revoke_subject(String.t()) :: {:ok, integer()} | {:error, integer()}
   def revoke_subject(sub) do
@@ -117,7 +116,7 @@ defmodule JwtServiceClient do
     end
   end
 
-  # Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+  # Sends a level 3 request.
   @spec request(atom(), String.t(), map() | nil, integer()) ::
           {:ok, map()} | {:error, integer()}
   defp request(method, path, body, expected_status) do
@@ -126,7 +125,7 @@ defmodule JwtServiceClient do
     options = [
       method: method,
       url: service <> path,
-      # Код считается здесь, а не переиспользуется: один код — один запрос.
+      # Computed here rather than reused: one code, one request.
       headers: [{"x-totp-code", totp_code()}, {"host", @issuer_host}]
     ]
 
@@ -140,12 +139,12 @@ defmodule JwtServiceClient do
   end
 end
 
-# Демонстрация полного жизненного цикла токена.
+# Full token lifecycle: issue, refresh, bulk revoke.
 {:ok, issued} = JwtServiceClient.issue_token("svc-a", ["svc-b"], true, %{role: "admin"})
-IO.puts("выпущен: #{String.slice(issued["token"], 0, 32)}...")
+IO.puts("issued: #{String.slice(issued["token"], 0, 32)}...")
 
 {:ok, refreshed} = JwtServiceClient.refresh_tokens(issued["refresh_token"])
-IO.puts("обновлён: #{String.slice(refreshed["token"], 0, 32)}...")
+IO.puts("refreshed: #{String.slice(refreshed["token"], 0, 32)}...")
 
 {:ok, count} = JwtServiceClient.revoke_subject("svc-a")
-IO.puts("отозвано токенов: #{count}")
+IO.puts("revoked: #{count}")

@@ -1,22 +1,19 @@
 """
-Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 
-Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-токена и массовый отзыв токенов субъекта.
+Dependencies: `using Pkg; Pkg.add(["HTTP", "JSON3"])` (SHA ships with stdlib).
 
-Зависимости: `using Pkg; Pkg.add(["HTTP", "JSON3"])` (SHA входит в stdlib).
+# Environment
+- `AUTH_TOTP_SECRET` — shared TOTP secret (see the base32 note below);
+- `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
 
-# Окружение
-- `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
-- `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
+This example treats the secret as raw bytes; add a base32 decoder for Google
+Authenticator compatibility.
 
-Пример трактует секрет как сырые байты; для совместимости с Google Authenticator
-добавьте декодер base32.
-
-!!! warning "Один код — один запрос"
-    Код считается заново перед каждым запросом. При включённой на сервере защите
-    от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное предъявление того
-    же кода вернёт 401, хотя сам код ещё не истёк.
+!!! warning "One code, one request"
+    The code is recomputed before every request. With replay protection on
+    (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already
+    seen with 401, even while that code is still inside its time window.
 """
 module JwtServiceClient
 
@@ -24,25 +21,26 @@ using HTTP
 using JSON3
 using SHA
 
-"""Значение claim `iss`. Должно совпадать при выпуске и проверке токена."""
+"""Sent as the Host header and becomes the `iss` claim. Must be the same on
+issue and on verify, or the token will not verify."""
 const ISSUER_HOST = "example.com"
 
 """
     service_url() -> String
 
-Базовый URL сервиса из окружения.
+Service base URL from the environment.
 """
 service_url() = get(ENV, "JWT_SERVICE_URL", "http://localhost:8080")
 
 """
     totp_code() -> String
 
-Вычисляет TOTP-код на текущий момент.
+Computes a fresh TOTP code for right now.
 
-Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-Усечение — по RFC 4226 §5.3.
+Service defaults: SHA-1, 6 digits, 30-second step. Truncation follows RFC 4226
+section 5.3.
 
-Возвращает строку из шести десятичных знаков.
+Returns six decimal digits.
 """
 function totp_code()
     secret = Vector{UInt8}(ENV["AUTH_TOTP_SECRET"])
@@ -63,16 +61,16 @@ end
 """
     request(method, path; body=nothing) -> HTTP.Response
 
-Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+Sends a level 3 request.
 
-# Аргументы
-- `method`: HTTP-метод строкой.
-- `path`: путь ручки, начиная со слеша.
-- `body`: тело запроса либо `nothing`, если тела нет.
+# Arguments
+- `method`: HTTP method.
+- `path`: endpoint path.
+- `body`: request body, or `nothing` when there is none.
 """
 function request(method, path; body = nothing)
     headers = [
-        # Код считается здесь, а не переиспользуется: один код — один запрос.
+        # Computed here rather than reused: one code, one request.
         "X-TOTP-Code" => totp_code(),
         "Host" => ISSUER_HOST,
         "Content-Type" => "application/json",
@@ -85,25 +83,26 @@ end
 """
     issue_token(sub, aud; with_refresh=false, claims=Dict()) -> Dict
 
-Выпускает access-токен (`POST /tokens`).
+Issues an access token (`POST /tokens`).
 
-# Аргументы
-- `sub`: субъект, которому выдаётся токен (claim `sub`).
-- `aud`: список получателей (claim `aud`); не должен быть пустым.
-- `with_refresh`: запросить refresh-токен для продления сессии.
-- `claims`: произвольные claims (роли, scope, tenant) — попадают в payload рядом
-  с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`,
-  `nbf`, `jti`) переопределять нельзя: сервис ответит 422.
+# Arguments
+- `sub`: subject the token is issued to (`sub` claim).
+- `aud`: audience (`aud` claim); must not be empty.
+- `with_refresh`: also return a refresh token for extending the session.
+- `claims`: custom claims (role, scope, tenant) — they sit next to the
+  registered ones, so the consumer reads `role`, not `extra.role`. Reserved
+  names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) give 422 — change
+  lifetime through `ttl`, not `exp`.
 
-Бросает ошибку при 401 (неверный код), 422 (некорректные параметры или
-запрещённый claim) и 500 (недоступны JWKS или Redis).
+Errors on 401 (bad code), 422 (bad parameters or forbidden claim) and 500 (JWKS
+or Redis unavailable).
 """
 function issue_token(sub, aud; with_refresh = false, claims = Dict())
     body = Dict("sub" => sub, "aud" => aud, "refresh" => with_refresh)
     isempty(claims) || (body["claims"] = claims)
 
     response = request("POST", "/tokens"; body = body)
-    response.status == 200 || error("выпуск не удался: $(response.status)")
+    response.status == 200 || error("issue failed: $(response.status)")
 
     return JSON3.read(String(response.body), Dict)
 end
@@ -111,19 +110,19 @@ end
 """
     refresh_tokens(refresh_token) -> Dict
 
-Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
 
-Старый токен после обмена недействителен: сохраните новый и выбросьте
-предыдущий.
+The old token dies on exchange: store the new one and drop the previous.
 
-!!! danger "Не ретрайте обмен"
-    При потере ответа не повторяйте обмен старым токеном. Повторное предъявление
-    трактуется как кража и гасит всю семью — и refresh-токены, и выданные по ним
-    access-токены. Надёжнее выпустить пару заново.
+!!! danger "Never retry the exchange"
+    When the reply is lost, do not repeat the exchange with the old token. A
+    second presentation reads as theft, and the server revokes the whole family
+    — refresh tokens and the access tokens issued from them. Issue a new pair
+    instead.
 """
 function refresh_tokens(refresh_token)
     response = request("POST", "/tokens/refresh"; body = (refresh_token = refresh_token,))
-    response.status == 200 || error("обмен не удался: $(response.status)")
+    response.status == 200 || error("refresh failed: $(response.status)")
 
     return JSON3.read(String(response.body), Dict)
 end
@@ -131,14 +130,14 @@ end
 """
     revoke_token(jti)
 
-Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
 
-Идемпотентно: отзыв несуществующего `jti` — тоже успех. Ошибка означает, что
-хранилище недоступно и отзыв **не выполнен**: попытку следует повторить.
+Idempotent: revoking an unknown `jti` is success too. An error means the store
+is unreachable and the token is **not** revoked: retry.
 """
 function revoke_token(jti)
     response = request("DELETE", "/tokens/$jti")
-    response.status == 204 || error("отзыв не удался: $(response.status)")
+    response.status == 204 || error("revoke failed: $(response.status)")
 
     return nothing
 end
@@ -146,28 +145,29 @@ end
 """
     revoke_subject(sub) -> Int
 
-Отзывает все активные токены субъекта (`DELETE /subjects/{sub}/tokens`).
+Revokes every active token of a subject (`DELETE /subjects/{sub}/tokens`).
 
-Нужен при компрометации: гасить токены по одному нельзя, их `jti` вызывающему
-неизвестны. Возвращает число отозванных токенов; истёкшие не считаются.
+The compromise path: tokens cannot be killed one by one because the caller does
+not know their `jti`. Returns the number of revoked tokens; expired ones do not
+count.
 """
 function revoke_subject(sub)
     response = request("DELETE", "/subjects/$sub/tokens")
-    response.status == 200 || error("массовый отзыв не удался: $(response.status)")
+    response.status == 200 || error("bulk revoke failed: $(response.status)")
 
     return JSON3.read(String(response.body), Dict)["revoked"]
 end
 
 end # module
 
-# Демонстрация полного жизненного цикла токена.
+# Full token lifecycle: issue, refresh, bulk revoke.
 using .JwtServiceClient
 
 issued = JwtServiceClient.issue_token("svc-a", ["svc-b"]; with_refresh = true,
                                       claims = Dict("role" => "admin"))
-println("выпущен: ", first(issued["token"], 32), "...")
+println("issued: ", first(issued["token"], 32), "...")
 
 refreshed = JwtServiceClient.refresh_tokens(issued["refresh_token"])
-println("обновлён: ", first(refreshed["token"], 32), "...")
+println("refreshed: ", first(refreshed["token"], 32), "...")
 
-println("отозвано токенов: ", JwtServiceClient.revoke_subject("svc-a"))
+println("revoked: ", JwtServiceClient.revoke_subject("svc-a"))

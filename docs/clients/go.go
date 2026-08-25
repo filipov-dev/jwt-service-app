@@ -1,17 +1,14 @@
-// Package main — клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+// Package main is a jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 //
-// Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-// токена и массовый отзыв токенов субъекта.
+// Install: go get github.com/pquerna/otp
 //
-// Зависимости: go get github.com/pquerna/otp
+// Env:
+//   - AUTH_TOTP_SECRET — shared TOTP secret, base32 (required);
+//   - JWT_SERVICE_URL — service base URL, default http://localhost:8080.
 //
-// Окружение:
-//   - AUTH_TOTP_SECRET — общий TOTP-секрет в base32 (обязательно);
-//   - JWT_SERVICE_URL — базовый URL сервиса, по умолчанию http://localhost:8080.
-//
-// Код считается заново перед каждым запросом: при включённой на сервере защите от
-// переигрывания (AUTH_TOTP_REPLAY_PROTECTION) повторное предъявление того же кода
-// вернёт 401, хотя сам код ещё не истёк.
+// The code is recomputed before every request: with replay protection on
+// (AUTH_TOTP_REPLAY_PROTECTION) the server rejects a code it has already seen
+// with 401, even while that code is still inside its time window.
 package main
 
 import (
@@ -26,34 +23,35 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-// issuerHost — значение claim iss. Должно совпадать при выпуске и проверке.
+// issuerHost is sent as the Host header and becomes the iss claim. It must be
+// the same on issue and on verify, or the token will not verify.
 const issuerHost = "example.com"
 
-// TokenResponse — ответ на выпуск токена или обмен refresh-токена.
+// TokenResponse is the reply of an issue or a refresh call.
 type TokenResponse struct {
-	// Token — подписанный JWT в формате header.payload.signature.
+	// Token is a signed JWT: header.payload.signature.
 	Token string `json:"token"`
-	// RefreshToken присутствует, только если запрашивался.
+	// RefreshToken is present only if it was requested.
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-// RevokeGroupResponse — ответ на массовый отзыв токенов субъекта.
+// RevokeGroupResponse is the reply of a bulk revoke call.
 type RevokeGroupResponse struct {
-	// Revoked — сколько активных токенов отозвано; истёкшие не считаются.
+	// Revoked is how many active tokens were killed; expired ones do not count.
 	Revoked int `json:"revoked"`
 }
 
-// Client — клиент сервиса выдачи токенов.
+// Client is a client of the token service, covering all four level 3 endpoints.
 type Client struct {
-	// BaseURL — базовый URL сервиса.
+	// BaseURL is the service base URL.
 	BaseURL string
-	// Secret — общий TOTP-секрет в base32.
+	// Secret is the shared TOTP secret, base32.
 	Secret string
-	// HTTP — используемый HTTP-клиент.
+	// HTTP is the underlying HTTP client.
 	HTTP *http.Client
 }
 
-// NewClient собирает клиент из переменных окружения.
+// NewClient builds a client from the environment.
 func NewClient() *Client {
 	service := os.Getenv("JWT_SERVICE_URL")
 	if service == "" {
@@ -67,16 +65,14 @@ func NewClient() *Client {
 	}
 }
 
-// totpCode вычисляет TOTP-код на текущий момент.
-//
-// Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
+// totpCode returns a fresh code for right now: SHA-1, 6 digits, 30-second step.
 func (c *Client) totpCode() (string, error) {
 	return totp.GenerateCode(c.Secret, time.Now())
 }
 
-// do выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+// do sends a level 3 request.
 //
-// body может быть nil для запросов без тела (отзыв).
+// body may be nil for requests without one (revocation).
 func (c *Client) do(method, path string, body any) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
@@ -92,7 +88,7 @@ func (c *Client) do(method, path string, body any) (*http.Response, error) {
 		return nil, err
 	}
 
-	// Код считается здесь, а не переиспользуется: один код — один запрос.
+	// Computed here rather than reused: one code, one request.
 	code, err := c.totpCode()
 	if err != nil {
 		return nil, err
@@ -105,18 +101,19 @@ func (c *Client) do(method, path string, body any) (*http.Response, error) {
 	return c.HTTP.Do(request)
 }
 
-// IssueToken выпускает access-токен (POST /tokens).
+// IssueToken issues an access token (POST /tokens).
 //
-// sub — субъект (claim sub), aud — список получателей (claim aud, не пустой),
-// withRefresh — запросить вместе с токеном refresh для продления сессии,
-// claims — произвольные claims (роли, scope, tenant), которые попадут в payload
-// рядом с зарегистрированными; nil, если они не нужны.
+// sub is the subject (sub claim), aud the audience (aud claim, must not be
+// empty), withRefresh also returns a refresh token for extending the session,
+// and claims are custom values (role, scope, tenant) placed next to the
+// registered ones, so the consumer reads role, not extra.role; pass nil when
+// they are not needed.
 //
-// Служебные имена (iss, sub, aud, exp, iat, nbf, jti) переопределять нельзя —
-// сервис ответит 422. Число ключей и объём ограничены на сервере.
+// Reserved names (iss, sub, aud, exp, iat, nbf, jti) are rejected with 422 —
+// change lifetime through ttl, not exp. Count and size are capped server-side.
 //
-// Возвращает ошибку при 401 (неверный код), 422 (некорректные параметры или
-// запрещённый claim) и 500 (недоступны JWKS или Redis).
+// Returns an error on 401 (bad code), 422 (bad parameters or forbidden claim)
+// and 500 (JWKS or Redis unavailable).
 func (c *Client) IssueToken(
 	sub string,
 	aud []string,
@@ -135,7 +132,7 @@ func (c *Client) IssueToken(
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("выпуск не удался: %s", response.Status)
+		return nil, fmt.Errorf("issue failed: %s", response.Status)
 	}
 
 	var issued TokenResponse
@@ -145,14 +142,14 @@ func (c *Client) IssueToken(
 	return &issued, nil
 }
 
-// RefreshTokens обменивает refresh-токен на новую пару (POST /tokens/refresh).
+// RefreshTokens exchanges a refresh token for a new pair (POST /tokens/refresh).
 //
-// Старый токен после обмена недействителен: сохраните новый и выбросьте
-// предыдущий.
+// The old token dies on exchange: store the new one and drop the previous.
 //
-// ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-// предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-// выданные по ним access-токены. Надёжнее выпустить пару заново.
+// Never retry an exchange with the old token when the reply is lost. A second
+// presentation reads as theft, and the server revokes the whole family —
+// refresh tokens and the access tokens issued from them. Issue a new pair
+// instead. 401 means the token is unknown, expired or already used.
 func (c *Client) RefreshTokens(refreshToken string) (*TokenResponse, error) {
 	payload := map[string]string{"refresh_token": refreshToken}
 
@@ -163,7 +160,7 @@ func (c *Client) RefreshTokens(refreshToken string) (*TokenResponse, error) {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("обмен не удался: %s", response.Status)
+		return nil, fmt.Errorf("refresh failed: %s", response.Status)
 	}
 
 	var refreshed TokenResponse
@@ -173,10 +170,10 @@ func (c *Client) RefreshTokens(refreshToken string) (*TokenResponse, error) {
 	return &refreshed, nil
 }
 
-// RevokeToken отзывает один токен по его jti (DELETE /tokens/{jti}).
+// RevokeToken revokes one token by its jti (DELETE /tokens/{jti}).
 //
-// Идемпотентно: отзыв несуществующего jti — тоже успех. Ошибка означает, что
-// хранилище недоступно и отзыв НЕ выполнен, — попытку следует повторить.
+// Idempotent: revoking an unknown jti is success too. An error means the store
+// is unreachable and the token is NOT revoked — retry.
 func (c *Client) RevokeToken(jti string) error {
 	response, err := c.do(http.MethodDelete, "/tokens/"+jti, nil)
 	if err != nil {
@@ -185,16 +182,16 @@ func (c *Client) RevokeToken(jti string) error {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("отзыв не удался: %s", response.Status)
+		return fmt.Errorf("revoke failed: %s", response.Status)
 	}
 	return nil
 }
 
-// RevokeSubject отзывает все активные токены субъекта.
+// RevokeSubject revokes every active token of a subject.
 //
-// Ручка DELETE /subjects/{sub}/tokens. Нужна при компрометации: гасить токены по
-// одному нельзя, их jti вызывающему неизвестны. Возвращает число отозванных
-// токенов; уже истёкшие не считаются.
+// Endpoint DELETE /subjects/{sub}/tokens. The compromise path: tokens cannot be
+// killed one by one because the caller does not know their jti. Returns the
+// number of revoked tokens; expired ones do not count.
 func (c *Client) RevokeSubject(sub string) (int, error) {
 	response, err := c.do(http.MethodDelete, "/subjects/"+sub+"/tokens", nil)
 	if err != nil {
@@ -203,7 +200,7 @@ func (c *Client) RevokeSubject(sub string) (int, error) {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("массовый отзыв не удался: %s", response.Status)
+		return 0, fmt.Errorf("bulk revoke failed: %s", response.Status)
 	}
 
 	var revoked RevokeGroupResponse
@@ -213,7 +210,7 @@ func (c *Client) RevokeSubject(sub string) (int, error) {
 	return revoked.Revoked, nil
 }
 
-// main демонстрирует полный жизненный цикл токена.
+// main runs the full token lifecycle: issue, refresh, bulk revoke.
 func main() {
 	client := NewClient()
 
@@ -222,17 +219,17 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("выпущен:", issued.Token[:32], "...")
+	fmt.Println("issued:", issued.Token[:32], "...")
 
 	refreshed, err := client.RefreshTokens(issued.RefreshToken)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("обновлён:", refreshed.Token[:32], "...")
+	fmt.Println("refreshed:", refreshed.Token[:32], "...")
 
 	count, err := client.RevokeSubject("svc-a")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("отозвано токенов:", count)
+	fmt.Println("revoked:", count)
 }

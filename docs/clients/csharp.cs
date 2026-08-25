@@ -1,10 +1,10 @@
-// Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+// jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 //
-// Зависимости: dotnet add package Otp.NET
+// Install: dotnet add package Otp.NET
 //
-// Окружение:
-//   AUTH_TOTP_SECRET — общий TOTP-секрет в base32 (обязательно);
-//   JWT_SERVICE_URL  — базовый URL сервиса, по умолчанию http://localhost:8080.
+// Env:
+//   AUTH_TOTP_SECRET — shared TOTP secret, base32 (required);
+//   JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
 
 using System;
 using System.Collections.Generic;
@@ -14,87 +14,93 @@ using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using OtpNet;
 
-/// <summary>Ответ на выпуск токена или обмен refresh-токена.</summary>
+/// <summary>Reply of an issue or a refresh call.</summary>
 public sealed record TokenResponse(
-    /// <summary>Подписанный JWT в формате header.payload.signature.</summary>
+    /// <summary>Signed JWT: header.payload.signature.</summary>
     [property: JsonPropertyName("token")] string Token,
-    /// <summary>Refresh-токен; присутствует, только если запрашивался.</summary>
+    /// <summary>Refresh token; present only if it was requested.</summary>
     [property: JsonPropertyName("refresh_token")] string? RefreshToken);
 
-/// <summary>Ответ на массовый отзыв токенов субъекта.</summary>
+/// <summary>Reply of a bulk revoke call.</summary>
 public sealed record RevokeGroupResponse(
-    /// <summary>Сколько активных токенов отозвано; истёкшие не считаются.</summary>
+    /// <summary>How many active tokens were revoked; expired ones do not count.</summary>
     [property: JsonPropertyName("revoked")] int Revoked);
 
 /// <summary>
-/// Клиент сервиса выдачи токенов, покрывающий все четыре ручки уровня 3.
+/// Client of the token service, covering all four level 3 endpoints.
 /// </summary>
 /// <remarks>
-/// TOTP-код считается <b>заново перед каждым запросом</b>. При включённой на
-/// сервере защите от переигрывания (<c>AUTH_TOTP_REPLAY_PROTECTION</c>) повторное
-/// предъявление того же кода вернёт <c>401</c>, хотя сам код ещё не истёк.
+/// The code is recomputed <b>before every request</b>. With replay protection on
+/// (<c>AUTH_TOTP_REPLAY_PROTECTION</c>) the server rejects a code it has already
+/// seen with <c>401</c>, even while that code is still inside its time window.
 /// </remarks>
 public sealed class JwtServiceClient
 {
-    /// <summary>Значение claim <c>iss</c>. Должно совпадать при выпуске и проверке.</summary>
+    /// <summary>
+    /// Sent as the Host header and becomes the <c>iss</c> claim. Must be the
+    /// same on issue and on verify, or the token will not verify.
+    /// </summary>
     private const string IssuerHost = "example.com";
 
     private readonly string _baseUrl;
     private readonly Totp _totp;
     private readonly HttpClient _http = new();
 
-    /// <summary>Создаёт клиент.</summary>
-    /// <param name="baseUrl">Базовый URL сервиса.</param>
-    /// <param name="secret">Общий TOTP-секрет в base32.</param>
+    /// <summary>Creates a client.</summary>
+    /// <param name="baseUrl">Service base URL.</param>
+    /// <param name="secret">Shared TOTP secret, base32.</param>
     public JwtServiceClient(string baseUrl, string secret)
     {
         _baseUrl = baseUrl;
-        // Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 с.
+        // Service defaults: SHA-1, 6 digits, 30-second step.
         _totp = new Totp(Base32Encoding.ToBytes(secret));
     }
 
-    /// <summary>Собирает клиент из переменных окружения.</summary>
-    /// <returns>Готовый клиент.</returns>
-    /// <exception cref="InvalidOperationException">Не задан AUTH_TOTP_SECRET.</exception>
+    /// <summary>Builds a client from the environment.</summary>
+    /// <returns>The client.</returns>
+    /// <exception cref="InvalidOperationException">AUTH_TOTP_SECRET is not set.</exception>
     public static JwtServiceClient FromEnv()
     {
         var service = Environment.GetEnvironmentVariable("JWT_SERVICE_URL")
                       ?? "http://localhost:8080";
         var secret = Environment.GetEnvironmentVariable("AUTH_TOTP_SECRET")
-                     ?? throw new InvalidOperationException("нужен AUTH_TOTP_SECRET");
+                     ?? throw new InvalidOperationException("AUTH_TOTP_SECRET is required");
 
         return new JwtServiceClient(service, secret);
     }
 
-    /// <summary>Собирает запрос со свежим TOTP-кодом.</summary>
-    /// <param name="method">HTTP-метод.</param>
-    /// <param name="path">Путь ручки, начиная со слеша.</param>
-    /// <returns>Готовый к отправке запрос.</returns>
+    /// <summary>
+    /// Builds a request with a code computed here rather than reused: one code,
+    /// one request.
+    /// </summary>
+    /// <param name="method">HTTP method.</param>
+    /// <param name="path">Endpoint path.</param>
+    /// <returns>The request, ready to send.</returns>
     private HttpRequestMessage Request(HttpMethod method, string path)
     {
         var request = new HttpRequestMessage(method, _baseUrl + path);
 
-        // Код считается здесь, а не переиспользуется: один код — один запрос.
         request.Headers.Add("X-TOTP-Code", _totp.ComputeTotp());
         request.Headers.Host = IssuerHost;
 
         return request;
     }
 
-    /// <summary>Выпускает access-токен (<c>POST /tokens</c>).</summary>
-    /// <param name="sub">Субъект, которому выдаётся токен (claim <c>sub</c>).</param>
-    /// <param name="aud">Список получателей (claim <c>aud</c>); не должен быть пустым.</param>
-    /// <param name="withRefresh">Запросить refresh-токен для продления сессии.</param>
+    /// <summary>Issues an access token (<c>POST /tokens</c>).</summary>
+    /// <param name="sub">Subject the token is issued to (<c>sub</c> claim).</param>
+    /// <param name="aud">Audience (<c>aud</c> claim); must not be empty.</param>
+    /// <param name="withRefresh">Also return a refresh token for extending the session.</param>
     /// <param name="claims">
-    /// Произвольные claims (роли, scope, tenant) — попадают в payload рядом с
-    /// зарегистрированными. Служебные имена (<c>iss</c>, <c>sub</c>, <c>aud</c>,
-    /// <c>exp</c>, <c>iat</c>, <c>nbf</c>, <c>jti</c>) переопределять нельзя:
-    /// сервис ответит <c>422</c>. Число ключей и объём ограничены на сервере.
+    /// Custom claims (role, scope, tenant). They sit next to the registered
+    /// ones, so the consumer reads <c>role</c>, not <c>extra.role</c>. Reserved
+    /// names (<c>iss</c>, <c>sub</c>, <c>aud</c>, <c>exp</c>, <c>iat</c>,
+    /// <c>nbf</c>, <c>jti</c>) are rejected with <c>422</c> — change lifetime
+    /// through <c>ttl</c>, not <c>exp</c>. Count and size are capped server-side.
     /// </param>
-    /// <returns>Выпущенный токен и, если запрашивался, refresh-токен.</returns>
+    /// <returns>The issued token and, if requested, a refresh token.</returns>
     /// <exception cref="HttpRequestException">
-    /// <c>401</c> — неверный код, <c>422</c> — параметры или запрещённый claim,
-    /// <c>500</c> — JWKS или Redis.
+    /// <c>401</c> bad code, <c>422</c> bad parameters or forbidden claim,
+    /// <c>500</c> JWKS or Redis unavailable.
     /// </exception>
     public async Task<TokenResponse> IssueTokenAsync(
         string sub,
@@ -111,24 +117,23 @@ public sealed class JwtServiceClient
         response.EnsureSuccessStatusCode();
 
         return await response.Content.ReadFromJsonAsync<TokenResponse>()
-               ?? throw new InvalidOperationException("пустой ответ");
+               ?? throw new InvalidOperationException("empty response");
     }
 
-    /// <summary>Обменивает refresh-токен на новую пару (<c>POST /tokens/refresh</c>).</summary>
+    /// <summary>Exchanges a refresh token for a new pair (<c>POST /tokens/refresh</c>).</summary>
     /// <remarks>
-    /// Старый токен после обмена недействителен: сохраните новый и выбросьте
-    /// предыдущий.
+    /// The old token dies on exchange: store the new one and drop the previous.
     /// <para>
-    /// <b>Внимание:</b> не повторяйте обмен старым токеном при потере ответа.
-    /// Повторное предъявление трактуется как кража и гасит всю семью — и
-    /// refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-    /// заново.
+    /// <b>Never retry</b> an exchange with the old token when the reply is lost.
+    /// A second presentation reads as theft, and the server revokes the whole
+    /// family — refresh tokens and the access tokens issued from them. Issue a
+    /// new pair instead.
     /// </para>
     /// </remarks>
-    /// <param name="refreshToken">Токен из выпуска или прошлого обмена.</param>
-    /// <returns>Новая пара access + refresh.</returns>
+    /// <param name="refreshToken">Token from an issue or a previous exchange.</param>
+    /// <returns>The new access + refresh pair.</returns>
     /// <exception cref="HttpRequestException">
-    /// <c>401</c> — токен неизвестен, истёк или уже использован.
+    /// <c>401</c> — token unknown, expired or already used.
     /// </exception>
     public async Task<TokenResponse> RefreshTokensAsync(string refreshToken)
     {
@@ -139,14 +144,17 @@ public sealed class JwtServiceClient
         response.EnsureSuccessStatusCode();
 
         return await response.Content.ReadFromJsonAsync<TokenResponse>()
-               ?? throw new InvalidOperationException("пустой ответ");
+               ?? throw new InvalidOperationException("empty response");
     }
 
-    /// <summary>Отзывает один токен по его <c>jti</c> (<c>DELETE /tokens/{jti}</c>).</summary>
-    /// <remarks>Идемпотентно: отзыв несуществующего <c>jti</c> — тоже успех.</remarks>
-    /// <param name="jti">Идентификатор токена из claim <c>jti</c>.</param>
+    /// <summary>Revokes one token by its <c>jti</c> (<c>DELETE /tokens/{jti}</c>).</summary>
+    /// <remarks>
+    /// Idempotent: revoking an unknown <c>jti</c> is success too — the desired
+    /// state holds either way.
+    /// </remarks>
+    /// <param name="jti">Token id from the <c>jti</c> claim.</param>
     /// <exception cref="HttpRequestException">
-    /// <c>500</c> — хранилище недоступно, отзыв НЕ выполнен: повторите попытку.
+    /// <c>500</c> — store unreachable, the token is NOT revoked: retry.
     /// </exception>
     public async Task RevokeTokenAsync(string jti)
     {
@@ -154,15 +162,16 @@ public sealed class JwtServiceClient
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary>Отзывает все активные токены субъекта.</summary>
+    /// <summary>Revokes every active token of a subject.</summary>
     /// <remarks>
-    /// Ручка <c>DELETE /subjects/{sub}/tokens</c>. Нужна при компрометации: гасить
-    /// токены по одному нельзя, их <c>jti</c> вызывающему неизвестны.
+    /// Endpoint <c>DELETE /subjects/{sub}/tokens</c>. The compromise path:
+    /// tokens cannot be killed one by one because the caller does not know
+    /// their <c>jti</c>.
     /// </remarks>
-    /// <param name="sub">Субъект, чьи токены гасятся.</param>
-    /// <returns>Число отозванных токенов; истёкшие не считаются.</returns>
+    /// <param name="sub">Subject whose tokens are killed.</param>
+    /// <returns>Number of revoked tokens; expired ones do not count.</returns>
     /// <exception cref="HttpRequestException">
-    /// <c>500</c> — хранилище недоступно, отзыв не выполнен.
+    /// <c>500</c> — store unreachable, nothing was revoked.
     /// </exception>
     public async Task<int> RevokeSubjectAsync(string sub)
     {
@@ -174,10 +183,10 @@ public sealed class JwtServiceClient
     }
 }
 
-/// <summary>Демонстрирует полный жизненный цикл токена.</summary>
+/// <summary>Full token lifecycle: issue, refresh, bulk revoke.</summary>
 public static class Program
 {
-    /// <summary>Точка входа.</summary>
+    /// <summary>Entry point.</summary>
     public static async Task Main()
     {
         var client = JwtServiceClient.FromEnv();
@@ -185,11 +194,11 @@ public static class Program
         var issued = await client.IssueTokenAsync(
             "svc-a", new[] { "svc-b" }, withRefresh: true,
             claims: new Dictionary<string, object> { ["role"] = "admin" });
-        Console.WriteLine($"выпущен: {issued.Token[..32]}...");
+        Console.WriteLine($"issued: {issued.Token[..32]}...");
 
         var refreshed = await client.RefreshTokensAsync(issued.RefreshToken!);
-        Console.WriteLine($"обновлён: {refreshed.Token[..32]}...");
+        Console.WriteLine($"refreshed: {refreshed.Token[..32]}...");
 
-        Console.WriteLine($"отозвано токенов: {await client.RevokeSubjectAsync("svc-a")}");
+        Console.WriteLine($"revoked: {await client.RevokeSubjectAsync("svc-a")}");
     }
 }

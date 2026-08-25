@@ -1,18 +1,15 @@
 /**
- * @file Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * @file jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
+ * Install: `npm i otplib` (Node 18+ ships `fetch`).
  *
- * Зависимости: `npm i otplib` (Node 18+ — `fetch` встроен).
+ * Env:
+ * - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+ * - `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
  *
- * Окружение:
- * - `AUTH_TOTP_SECRET` — общий TOTP-секрет в base32 (обязательно);
- * - `JWT_SERVICE_URL` — базовый URL сервиса, по умолчанию `http://localhost:8080`.
- *
- * ВАЖНО: код считается заново перед каждым запросом. При включённой на сервере
- * защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное предъявление
- * того же кода вернёт 401, хотя сам код ещё не истёк.
+ * The code is recomputed before every request. With replay protection on
+ * (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+ * with `401`, even while that code is still inside its time window.
  */
 
 import { authenticator } from 'otplib';
@@ -20,38 +17,39 @@ import { authenticator } from 'otplib';
 const SECRET: string = process.env.AUTH_TOTP_SECRET!;
 const SERVICE: string = process.env.JWT_SERVICE_URL ?? 'http://localhost:8080';
 
-/** Значение claim `iss`. Должно совпадать при выпуске и проверке токена. */
+/**
+ * Sent as the Host header and becomes the `iss` claim. Must be the same on
+ * issue and on verify, or the token will not verify.
+ */
 const ISSUER_HOST = 'example.com';
 
-/** Ответ на выпуск токена или обмен refresh-токена. */
+/** Reply of an issue or a refresh call. */
 export interface TokenResponse {
-  /** Подписанный JWT в формате `header.payload.signature`. */
+  /** Signed JWT: `header.payload.signature`. */
   token: string;
-  /** Refresh-токен; присутствует, только если запрашивался. */
+  /** Refresh token; present only if it was requested. */
   refresh_token?: string;
 }
 
-/** Ответ на массовый отзыв токенов субъекта. */
+/** Reply of a bulk revoke call. */
 export interface RevokeGroupResponse {
-  /** Сколько активных токенов отозвано; истёкшие не считаются. */
+  /** How many active tokens were revoked; expired ones do not count. */
   revoked: number;
 }
 
 /**
- * Вычисляет TOTP-код на текущий момент.
+ * Fresh code for right now: SHA-1, 6 digits, 30-second step.
  *
- * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
- *
- * @returns Код из шести десятичных знаков.
+ * @returns Six decimal digits.
  */
 function totpCode(): string {
   return authenticator.generate(SECRET);
 }
 
 /**
- * Собирает заголовки для запроса к ручке уровня 3.
+ * Headers with a code computed here, not reused: one code, one request.
  *
- * @returns Заголовки со свежим TOTP-кодом и `Host`.
+ * @returns Headers with a fresh code and `Host`.
  */
 function authHeaders(): Record<string, string> {
   return {
@@ -62,18 +60,19 @@ function authHeaders(): Record<string, string> {
 }
 
 /**
- * Выпускает access-токен (`POST /tokens`).
+ * Issue an access token (`POST /tokens`).
  *
- * @param sub Субъект, которому выдаётся токен (claim `sub`).
- * @param aud Список получателей (claim `aud`); не должен быть пустым.
- * @param withRefresh Запросить вместе с токеном refresh для продления сессии.
- * @param claims Произвольные claims (роли, scope, tenant) — попадают в payload
- *   рядом с зарегистрированными. Служебные имена (`iss`, `sub`, `aud`, `exp`,
- *   `iat`, `nbf`, `jti`) переопределять нельзя, будет `422`. Число ключей и
- *   объём ограничены на сервере.
- * @returns Выпущенный токен и, если запрашивался, refresh-токен.
- * @throws Error 401 — неверный TOTP-код, 422 — некорректные параметры,
- *   500 — недоступны JWKS или Redis.
+ * @param sub Subject the token is issued to (`sub` claim).
+ * @param aud Audience (`aud` claim); must not be empty.
+ * @param withRefresh Also return a refresh token for extending the session.
+ * @param claims Custom claims (role, scope, tenant). They sit next to the
+ *   registered ones, so the consumer reads `role`, not `extra.role`. Reserved
+ *   names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) are rejected with
+ *   `422` — change lifetime through `ttl`, not `exp`. Count and size are capped
+ *   server-side.
+ * @returns The issued token and, if requested, a refresh token.
+ * @throws Error 401 bad code, 422 bad parameters or forbidden claim,
+ *   500 JWKS or Redis unavailable.
  */
 export async function issueToken(
   sub: string,
@@ -90,23 +89,23 @@ export async function issueToken(
     body: JSON.stringify(body),
   });
 
-  if (!response.ok) throw new Error(`выпуск не удался: ${response.status}`);
+  if (!response.ok) throw new Error(`issue failed: ${response.status}`);
   return (await response.json()) as TokenResponse;
 }
 
 /**
- * Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+ * Exchange a refresh token for a new pair (`POST /tokens/refresh`).
  *
- * Старый токен после обмена недействителен: сохраните новый и выбросьте
- * предыдущий.
+ * The old token dies on exchange: store the new one and drop the previous.
  *
- * ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
- * предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
- * выданные по ним access-токены. Надёжнее выпустить пару заново.
+ * Never retry an exchange with the old token when the reply is lost. A second
+ * presentation reads as theft, and the server revokes the whole family —
+ * refresh tokens and the access tokens issued from them. Issue a new pair
+ * instead.
  *
- * @param refreshToken Токен, полученный при выпуске или прошлом обмене.
- * @returns Новая пара access + refresh.
- * @throws Error 401 — токен неизвестен, истёк или уже использован.
+ * @param refreshToken Token from an issue or a previous exchange.
+ * @returns The new access + refresh pair.
+ * @throws Error 401 — token unknown, expired or already used.
  */
 export async function refreshTokens(refreshToken: string): Promise<TokenResponse> {
   const response = await fetch(`${SERVICE}/tokens/refresh`, {
@@ -115,18 +114,18 @@ export async function refreshTokens(refreshToken: string): Promise<TokenResponse
     body: JSON.stringify({ refresh_token: refreshToken }),
   });
 
-  if (!response.ok) throw new Error(`обмен не удался: ${response.status}`);
+  if (!response.ok) throw new Error(`refresh failed: ${response.status}`);
   return (await response.json()) as TokenResponse;
 }
 
 /**
- * Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+ * Revoke one token by its `jti` (`DELETE /tokens/{jti}`).
  *
- * Идемпотентно: отзыв несуществующего `jti` — тоже успех, желаемое состояние
- * достигнуто.
+ * Idempotent: revoking an unknown `jti` is success too — the desired state
+ * holds either way.
  *
- * @param jti Идентификатор токена из claim `jti`.
- * @throws Error 500 — хранилище недоступно, отзыв НЕ выполнен (повторите).
+ * @param jti Token id from the `jti` claim.
+ * @throws Error 500 — store unreachable, the token is NOT revoked; retry.
  */
 export async function revokeToken(jti: string): Promise<void> {
   const response = await fetch(`${SERVICE}/tokens/${jti}`, {
@@ -134,18 +133,18 @@ export async function revokeToken(jti: string): Promise<void> {
     headers: authHeaders(),
   });
 
-  if (!response.ok) throw new Error(`отзыв не удался: ${response.status}`);
+  if (!response.ok) throw new Error(`revoke failed: ${response.status}`);
 }
 
 /**
- * Отзывает все активные токены субъекта (`DELETE /subjects/{sub}/tokens`).
+ * Revoke every active token of a subject (`DELETE /subjects/{sub}/tokens`).
  *
- * Нужен при компрометации: гасить токены по одному нельзя, их `jti` вызывающему
- * неизвестны.
+ * The compromise path: tokens cannot be killed one by one because the caller
+ * does not know their `jti`.
  *
- * @param sub Субъект, чьи токены гасятся.
- * @returns Число отозванных токенов; истёкшие не считаются.
- * @throws Error 500 — хранилище недоступно, отзыв не выполнен.
+ * @param sub Subject whose tokens are killed.
+ * @returns Number of revoked tokens; expired ones do not count.
+ * @throws Error 500 — store unreachable, nothing was revoked.
  */
 export async function revokeSubject(sub: string): Promise<number> {
   const response = await fetch(`${SERVICE}/subjects/${sub}/tokens`, {
@@ -153,20 +152,20 @@ export async function revokeSubject(sub: string): Promise<number> {
     headers: authHeaders(),
   });
 
-  if (!response.ok) throw new Error(`массовый отзыв не удался: ${response.status}`);
+  if (!response.ok) throw new Error(`bulk revoke failed: ${response.status}`);
   const body = (await response.json()) as RevokeGroupResponse;
   return body.revoked;
 }
 
-/** Демонстрирует полный жизненный цикл токена. */
+/** Full token lifecycle: issue, refresh, bulk revoke. */
 async function main(): Promise<void> {
   const issued = await issueToken('svc-a', ['svc-b'], true, { role: 'admin' });
-  console.log('выпущен:', issued.token.slice(0, 32), '...');
+  console.log('issued:', issued.token.slice(0, 32), '...');
 
   const refreshed = await refreshTokens(issued.refresh_token!);
-  console.log('обновлён:', refreshed.token.slice(0, 32), '...');
+  console.log('refreshed:', refreshed.token.slice(0, 32), '...');
 
-  console.log('отозвано токенов:', await revokeSubject('svc-a'));
+  console.log('revoked:', await revokeSubject('svc-a'));
 }
 
 main().catch((error) => {

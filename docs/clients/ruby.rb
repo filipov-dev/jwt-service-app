@@ -1,126 +1,127 @@
 # frozen_string_literal: true
 
-# Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+# jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 #
-# Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-# токена и массовый отзыв токенов субъекта.
+# Install: gem install rotp
 #
-# Зависимости: gem install rotp
+# Env:
+# * +AUTH_TOTP_SECRET+ — shared TOTP secret, base32 (required);
+# * +JWT_SERVICE_URL+ — service base URL, default http://localhost:8080.
 #
-# Окружение:
-# * +AUTH_TOTP_SECRET+ — общий TOTP-секрет в base32 (обязательно);
-# * +JWT_SERVICE_URL+ — базовый URL сервиса, по умолчанию http://localhost:8080.
-#
-# ВАЖНО: код считается заново перед каждым запросом. При включённой на сервере
-# защите от переигрывания (+AUTH_TOTP_REPLAY_PROTECTION+) повторное предъявление
-# того же кода вернёт 401, хотя сам код ещё не истёк.
+# The code is recomputed before every request. With replay protection on
+# (+AUTH_TOTP_REPLAY_PROTECTION+) the server rejects a code it has already seen
+# with 401, even while that code is still inside its time window.
 
 require 'json'
 require 'net/http'
 require 'rotp'
 require 'uri'
 
-# Клиент сервиса выдачи токенов.
+# Client of the token service, covering all four level 3 endpoints.
 class JwtServiceClient
-  # Значение claim +iss+. Должно совпадать при выпуске и проверке токена.
+  # Sent as the Host header and becomes the +iss+ claim. Must be the same on
+  # issue and on verify, or the token will not verify.
   ISSUER_HOST = 'example.com'
 
-  # @param base_url [String] базовый URL сервиса
-  # @param secret [String] общий TOTP-секрет в base32
+  # @param base_url [String] service base URL
+  # @param secret [String] shared TOTP secret, base32
   def initialize(base_url, secret)
     @base_url = base_url
     @totp = ROTP::TOTP.new(secret)
   end
 
-  # Собирает клиент из переменных окружения.
+  # Builds a client from the environment.
   #
   # @return [JwtServiceClient]
-  # @raise [KeyError] если не задан AUTH_TOTP_SECRET
+  # @raise [KeyError] if AUTH_TOTP_SECRET is not set
   def self.from_env
     new(ENV.fetch('JWT_SERVICE_URL', 'http://localhost:8080'), ENV.fetch('AUTH_TOTP_SECRET'))
   end
 
-  # Выпускает access-токен (+POST /tokens+).
+  # Issues an access token (+POST /tokens+).
   #
-  # @param sub [String] субъект, которому выдаётся токен (claim +sub+)
-  # @param aud [Array<String>] список получателей (claim +aud+), не пустой
-  # @param with_refresh [Boolean] запросить refresh для продления сессии
-  # @param claims [Hash] произвольные claims (роли, scope, tenant) — попадают в
-  #   payload рядом с зарегистрированными. Служебные имена (+iss+, +sub+, +aud+,
-  #   +exp+, +iat+, +nbf+, +jti+) переопределять нельзя, будет 422. Число ключей
-  #   и объём ограничены на сервере.
+  # @param sub [String] subject the token is issued to (+sub+ claim)
+  # @param aud [Array<String>] audience (+aud+ claim), must not be empty
+  # @param with_refresh [Boolean] also return a refresh token for extending the
+  #   session
+  # @param claims [Hash] custom claims (role, scope, tenant). They sit next to
+  #   the registered ones, so the consumer reads +role+, not +extra.role+.
+  #   Reserved names (+iss+, +sub+, +aud+, +exp+, +iat+, +nbf+, +jti+) are
+  #   rejected with 422 — change lifetime through +ttl+, not +exp+. Count and
+  #   size are capped server-side.
   # @return [Hash] +{"token" => ..., "refresh_token" => ...}+
-  # @raise [RuntimeError] 401 — неверный код, 422 — параметры или запрещённый
-  #   claim, 500 — JWKS/Redis
+  # @raise [RuntimeError] 401 bad code, 422 bad parameters or forbidden claim,
+  #   500 JWKS or Redis unavailable
   def issue_token(sub, aud, with_refresh: false, claims: {})
     body = { sub: sub, aud: aud, refresh: with_refresh }
     body[:claims] = claims unless claims.empty?
 
     response = request(Net::HTTP::Post, '/tokens', body)
-    raise "выпуск не удался: #{response.code}" unless response.code == '200'
+    raise "issue failed: #{response.code}" unless response.code == '200'
 
     JSON.parse(response.body)
   end
 
-  # Обменивает refresh-токен на новую пару (+POST /tokens/refresh+).
+  # Exchanges a refresh token for a new pair (+POST /tokens/refresh+).
   #
-  # Старый токен после обмена недействителен: сохраните новый и выбросьте
-  # предыдущий.
+  # The old token dies on exchange: store the new one and drop the previous.
   #
-  # ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-  # предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-  # выданные по ним access-токены. Надёжнее выпустить пару заново.
+  # Never retry an exchange with the old token when the reply is lost. A second
+  # presentation reads as theft, and the server revokes the whole family —
+  # refresh tokens and the access tokens issued from them. Issue a new pair
+  # instead.
   #
-  # @param refresh_token [String] токен из выпуска или прошлого обмена
-  # @return [Hash] новая пара +{"token" => ..., "refresh_token" => ...}+
-  # @raise [RuntimeError] 401 — токен неизвестен, истёк или уже использован
+  # @param refresh_token [String] token from an issue or a previous exchange
+  # @return [Hash] the new pair +{"token" => ..., "refresh_token" => ...}+
+  # @raise [RuntimeError] 401 — token unknown, expired or already used
   def refresh_tokens(refresh_token)
     response = request(Net::HTTP::Post, '/tokens/refresh', refresh_token: refresh_token)
-    raise "обмен не удался: #{response.code}" unless response.code == '200'
+    raise "refresh failed: #{response.code}" unless response.code == '200'
 
     JSON.parse(response.body)
   end
 
-  # Отзывает один токен по его +jti+ (+DELETE /tokens/{jti}+).
+  # Revokes one token by its +jti+ (+DELETE /tokens/{jti}+).
   #
-  # Идемпотентно: отзыв несуществующего +jti+ — тоже успех.
+  # Idempotent: revoking an unknown +jti+ is success too — the desired state
+  # holds either way.
   #
-  # @param jti [String] идентификатор токена из claim +jti+
+  # @param jti [String] token id from the +jti+ claim
   # @return [void]
-  # @raise [RuntimeError] 500 — хранилище недоступно, отзыв НЕ выполнен
+  # @raise [RuntimeError] 500 — store unreachable, the token is NOT revoked
   def revoke_token(jti)
     response = request(Net::HTTP::Delete, "/tokens/#{jti}")
-    raise "отзыв не удался: #{response.code}" unless response.code == '204'
+    raise "revoke failed: #{response.code}" unless response.code == '204'
   end
 
-  # Отзывает все активные токены субъекта.
+  # Revokes every active token of a subject.
   #
-  # Ручка +DELETE /subjects/{sub}/tokens+. Нужна при компрометации: гасить токены
-  # по одному нельзя, их +jti+ вызывающему неизвестны.
+  # Endpoint +DELETE /subjects/{sub}/tokens+. The compromise path: tokens cannot
+  # be killed one by one because the caller does not know their +jti+.
   #
-  # @param sub [String] субъект, чьи токены гасятся
-  # @return [Integer] число отозванных токенов; истёкшие не считаются
-  # @raise [RuntimeError] 500 — хранилище недоступно, отзыв не выполнен
+  # @param sub [String] subject whose tokens are killed
+  # @return [Integer] number of revoked tokens; expired ones do not count
+  # @raise [RuntimeError] 500 — store unreachable, nothing was revoked
   def revoke_subject(sub)
     response = request(Net::HTTP::Delete, "/subjects/#{sub}/tokens")
-    raise "массовый отзыв не удался: #{response.code}" unless response.code == '200'
+    raise "bulk revoke failed: #{response.code}" unless response.code == '200'
 
     JSON.parse(response.body)['revoked']
   end
 
   private
 
-  # Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+  # Sends a level 3 request.
   #
-  # @param klass [Class] класс запроса Net::HTTP
-  # @param path [String] путь ручки, начиная со слеша
-  # @param body [Hash, nil] тело запроса либо nil, если тела нет
+  # @param klass [Class] Net::HTTP request class
+  # @param path [String] endpoint path
+  # @param body [Hash, nil] request body, or nil when there is none
   # @return [Net::HTTPResponse]
   def request(klass, path, body = nil)
     uri = URI.join(@base_url, path)
     req = klass.new(uri)
 
-    # Код считается здесь, а не переиспользуется: один код — один запрос.
+    # Computed here rather than reused: one code, one request.
     req['X-TOTP-Code'] = @totp.now
     req['Host'] = ISSUER_HOST
     req['Content-Type'] = 'application/json'
@@ -131,13 +132,14 @@ class JwtServiceClient
 end
 
 if __FILE__ == $PROGRAM_NAME
+  # Full token lifecycle: issue, refresh, bulk revoke.
   client = JwtServiceClient.from_env
 
   issued = client.issue_token('svc-a', ['svc-b'], with_refresh: true, claims: { role: 'admin' })
-  puts "выпущен: #{issued['token'][0, 32]}..."
+  puts "issued: #{issued['token'][0, 32]}..."
 
   refreshed = client.refresh_tokens(issued['refresh_token'])
-  puts "обновлён: #{refreshed['token'][0, 32]}..."
+  puts "refreshed: #{refreshed['token'][0, 32]}..."
 
-  puts "отозвано токенов: #{client.revoke_subject('svc-a')}"
+  puts "revoked: #{client.revoke_subject('svc-a')}"
 end

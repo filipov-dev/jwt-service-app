@@ -1,18 +1,15 @@
-/** Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+/** jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
   *
-  * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-  * токена и массовый отзыв токенов субъекта.
+  * Dependencies: `com.eatthepath:java-otp`,
+  * `com.softwaremill.sttp.client3::core`, `commons-codec`.
   *
-  * Зависимости: `com.eatthepath:java-otp`, `com.softwaremill.sttp.client3::core`,
-  * `commons-codec`.
+  * Env:
+  *   - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+  *   - `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
   *
-  * Окружение:
-  *   - `AUTH_TOTP_SECRET` — общий TOTP-секрет в base32 (обязательно);
-  *   - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
-  *
-  * '''Код считается заново перед каждым запросом.''' При включённой на сервере
-  * защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное
-  * предъявление того же кода вернёт `401`, хотя сам код ещё не истёк.
+  * '''The code is recomputed before every request.''' With replay protection on
+  * (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+  * with `401`, even while that code is still inside its time window.
   */
 
 import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator
@@ -22,65 +19,67 @@ import sttp.client3.*
 import java.time.{Duration, Instant}
 import javax.crypto.spec.SecretKeySpec
 
-/** Клиент сервиса выдачи токенов.
+/** Client of the token service, covering all four level 3 endpoints.
   *
   * @param baseUrl
-  *   базовый URL сервиса
+  *   service base URL
   * @param secret
-  *   общий TOTP-секрет в base32
+  *   shared TOTP secret, base32
   */
 class JwtServiceClient(baseUrl: String, secret: String):
 
-  /** Значение claim `iss`. Должно совпадать при выпуске и проверке токена. */
+  /** Sent as the Host header and becomes the `iss` claim. Must be the same on
+    * issue and on verify, or the token will not verify.
+    */
   private val IssuerHost = "example.com"
 
   private val backend = HttpClientSyncBackend()
   private val key = SecretKeySpec(Base32().decode(secret), "HmacSHA1")
 
-  // Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
+  // Service defaults: SHA-1, 6 digits, 30-second step.
   private val totp = TimeBasedOneTimePasswordGenerator(Duration.ofSeconds(30), 6)
 
-  /** Вычисляет TOTP-код на текущий момент.
+  /** Fresh code for right now.
     *
     * @return
-    *   код из шести десятичных знаков
+    *   six decimal digits
     */
   private def totpCode(): String =
     f"${totp.generateOneTimePassword(key, Instant.now())}%06d"
 
-  /** Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+  /** Sends a level 3 request.
     *
     * @param request
-    *   заготовка запроса без заголовков авторизации
+    *   request without the auth headers
     * @return
-    *   ответ сервиса
+    *   the service reply
     */
   private def send(request: RequestT[Identity, Either[String, String], Any]) =
     request
-      // Код считается здесь, а не переиспользуется: один код — один запрос.
+      // Computed here rather than reused: one code, one request.
       .header("X-TOTP-Code", totpCode())
       .header("Host", IssuerHost)
       .contentType("application/json")
       .send(backend)
 
-  /** Выпускает access-токен (`POST /tokens`).
+  /** Issues an access token (`POST /tokens`).
     *
     * @param sub
-    *   субъект, которому выдаётся токен (claim `sub`)
+    *   subject the token is issued to (`sub` claim)
     * @param aud
-    *   получатель (claim `aud`)
+    *   audience (`aud` claim)
     * @param withRefresh
-    *   запросить refresh-токен для продления сессии
+    *   also return a refresh token for extending the session
     * @param claimsJson
-    *   произвольные claims JSON-объектом (например `{"role":"admin"}`) либо
-    *   `None`. Попадают в payload рядом с зарегистрированными; служебные имена
-    *   (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
-    *   сервис ответит `422`
+    *   custom claims as a JSON object (for example `{"role":"admin"}`) or
+    *   `None`. They sit next to the registered ones, so the consumer reads
+    *   `role`, not `extra.role`; reserved names (`iss`, `sub`, `aud`, `exp`,
+    *   `iat`, `nbf`, `jti`) give `422` — change lifetime through `ttl`
     * @return
-    *   тело ответа: `{"token": ..., "refresh_token": ...}`
+    *   response body: `{"token": ..., "refresh_token": ...}`
     * @throws IllegalStateException
-    *   `401` — неверный код, `422` — параметры или запрещённый claim,
-    *   `500` — JWKS или Redis
+    *   `401` bad code, `422` bad parameters or forbidden claim, `500` JWKS or
+    *   Redis unavailable
     */
   def issueToken(
       sub: String,
@@ -93,84 +92,84 @@ class JwtServiceClient(baseUrl: String, secret: String):
     val response = send(basicRequest.post(uri"$baseUrl/tokens").body(body))
 
     response.body.fold(
-      error => throw IllegalStateException(s"выпуск не удался: $error"),
+      error => throw IllegalStateException(s"issue failed: $error"),
       identity,
     )
 
-  /** Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+  /** Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
     *
-    * Старый токен после обмена недействителен: сохраните новый и выбросьте
-    * предыдущий.
+    * The old token dies on exchange: store the new one and drop the previous.
     *
-    * '''Внимание:''' не повторяйте обмен старым токеном при потере ответа.
-    * Повторное предъявление трактуется как кража и гасит всю семью — и
-    * refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-    * заново.
+    * '''Never retry''' an exchange with the old token when the reply is lost. A
+    * second presentation reads as theft, and the server revokes the whole
+    * family — refresh tokens and the access tokens issued from them. Issue a
+    * new pair instead.
     *
     * @param refreshToken
-    *   токен из выпуска или прошлого обмена
+    *   token from an issue or a previous exchange
     * @return
-    *   тело ответа с новой парой
+    *   response body with the new pair
     * @throws IllegalStateException
-    *   `401` — токен неизвестен, истёк или уже использован
+    *   `401` — token unknown, expired or already used
     */
   def refreshTokens(refreshToken: String): String =
     val body = s"""{"refresh_token":"$refreshToken"}"""
     val response = send(basicRequest.post(uri"$baseUrl/tokens/refresh").body(body))
 
     response.body.fold(
-      error => throw IllegalStateException(s"обмен не удался: $error"),
+      error => throw IllegalStateException(s"refresh failed: $error"),
       identity,
     )
 
-  /** Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+  /** Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
     *
-    * Идемпотентно: отзыв несуществующего `jti` — тоже успех.
+    * Idempotent: revoking an unknown `jti` is success too — the desired state
+    * holds either way.
     *
     * @param jti
-    *   идентификатор токена из claim `jti`
+    *   token id from the `jti` claim
     * @throws IllegalStateException
-    *   `500` — хранилище недоступно, отзыв НЕ выполнен
+    *   `500` — store unreachable, the token is NOT revoked; retry
     */
   def revokeToken(jti: String): Unit =
     val response = send(basicRequest.delete(uri"$baseUrl/tokens/$jti"))
 
     if response.code.code != 204 then
-      throw IllegalStateException(s"отзыв не удался: ${response.code}")
+      throw IllegalStateException(s"revoke failed: ${response.code}")
 
-  /** Отзывает все активные токены субъекта.
+  /** Revokes every active token of a subject.
     *
-    * Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить
-    * токены по одному нельзя, их `jti` вызывающему неизвестны.
+    * Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+    * cannot be killed one by one because the caller does not know their `jti`.
     *
     * @param sub
-    *   субъект, чьи токены гасятся
+    *   subject whose tokens are killed
     * @return
-    *   тело ответа `{"revoked": N}`; истёкшие токены не считаются
+    *   response body `{"revoked": N}`; expired tokens do not count
     * @throws IllegalStateException
-    *   `500` — хранилище недоступно, отзыв не выполнен
+    *   `500` — store unreachable, nothing was revoked
     */
   def revokeSubject(sub: String): String =
     val response = send(basicRequest.delete(uri"$baseUrl/subjects/$sub/tokens"))
 
     response.body.fold(
-      error => throw IllegalStateException(s"массовый отзыв не удался: $error"),
+      error => throw IllegalStateException(s"bulk revoke failed: $error"),
       identity,
     )
 
-/** Демонстрирует полный жизненный цикл токена. */
+/** Full token lifecycle: issue, refresh, bulk revoke. */
 @main def run(): Unit =
   val service = sys.env.getOrElse("JWT_SERVICE_URL", "http://localhost:8080")
-  val secret = sys.env.getOrElse("AUTH_TOTP_SECRET", sys.error("нужен AUTH_TOTP_SECRET"))
+  val secret = sys.env.getOrElse("AUTH_TOTP_SECRET", sys.error("AUTH_TOTP_SECRET is required"))
 
   val client = JwtServiceClient(service, secret)
 
   val issued = client.issueToken("svc-a", "svc-b", withRefresh = true,
     claimsJson = Some("""{"role":"admin"}"""))
-  println(s"выпущен: $issued")
+  println(s"issued: $issued")
 
-  // В боевом коде разберите JSON библиотекой, а не регуляркой.
+  // Real code should parse the JSON with a library, not a regex.
   val refreshToken = """"refresh_token":"([^"]+)"""".r.findFirstMatchIn(issued).get.group(1)
 
-  println(s"обновлён: ${client.refreshTokens(refreshToken)}")
-  println(s"массовый отзыв: ${client.revokeSubject("svc-a")}")
+  println(s"refreshed: ${client.refreshTokens(refreshToken)}")
+  println(s"bulk revoke: ${client.revokeSubject("svc-a")}")

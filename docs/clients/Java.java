@@ -1,20 +1,18 @@
 /**
- * Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * <p>Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв
- * одного токена и массовый отзыв токенов субъекта.
+ * <p>Dependencies: {@code com.eatthepath:java-otp}, {@code commons-codec}.
  *
- * <p>Зависимости: {@code com.eatthepath:java-otp}, {@code commons-codec}.
- *
- * <p>Окружение:
+ * <p>Env:
  * <ul>
- *   <li>{@code AUTH_TOTP_SECRET} — общий TOTP-секрет в base32 (обязательно);
- *   <li>{@code JWT_SERVICE_URL} — базовый URL, по умолчанию {@code http://localhost:8080}.
+ *   <li>{@code AUTH_TOTP_SECRET} — shared TOTP secret, base32 (required);
+ *   <li>{@code JWT_SERVICE_URL} — base URL, default {@code http://localhost:8080}.
  * </ul>
  *
- * <p><b>Код считается заново перед каждым запросом.</b> При включённой на сервере
- * защите от переигрывания ({@code AUTH_TOTP_REPLAY_PROTECTION}) повторное
- * предъявление того же кода вернёт {@code 401}, хотя сам код ещё не истёк.
+ * <p><b>The code is recomputed before every request.</b> With replay protection
+ * on ({@code AUTH_TOTP_REPLAY_PROTECTION}) the server rejects a code it has
+ * already seen with {@code 401}, even while that code is still inside its time
+ * window.
  */
 
 import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
@@ -30,7 +28,10 @@ import java.time.Instant;
 
 public final class Java {
 
-    /** Значение claim {@code iss}. Должно совпадать при выпуске и проверке. */
+    /**
+     * Sent as the Host header and becomes the {@code iss} claim. Must be the
+     * same on issue and on verify, or the token will not verify.
+     */
     private static final String ISSUER_HOST = "example.com";
 
     private final String baseUrl;
@@ -39,54 +40,54 @@ public final class Java {
     private final HttpClient http = HttpClient.newHttpClient();
 
     /**
-     * Создаёт клиент.
+     * Creates a client.
      *
-     * @param baseUrl базовый URL сервиса
-     * @param secret  общий TOTP-секрет в base32
-     * @throws Exception если алгоритм HMAC недоступен
+     * @param baseUrl service base URL
+     * @param secret  shared TOTP secret, base32
+     * @throws Exception if HMAC is unavailable
      */
     public Java(String baseUrl, String secret) throws Exception {
         this.baseUrl = baseUrl;
         this.key = new SecretKeySpec(new Base32().decode(secret), "HmacSHA1");
-        // Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 с.
+        // Service defaults: SHA-1, 6 digits, 30-second step.
         this.totp = new TimeBasedOneTimePasswordGenerator(Duration.ofSeconds(30), 6);
     }
 
     /**
-     * Собирает клиент из переменных окружения.
+     * Builds a client from the environment.
      *
-     * @return готовый клиент
-     * @throws Exception если секрет не задан или алгоритм недоступен
+     * @return the client
+     * @throws Exception if the secret is missing or HMAC is unavailable
      */
     public static Java fromEnv() throws Exception {
         String service = System.getenv().getOrDefault("JWT_SERVICE_URL", "http://localhost:8080");
         String secret = System.getenv("AUTH_TOTP_SECRET");
 
         if (secret == null) {
-            throw new IllegalStateException("нужен AUTH_TOTP_SECRET");
+            throw new IllegalStateException("AUTH_TOTP_SECRET is required");
         }
 
         return new Java(service, secret);
     }
 
     /**
-     * Вычисляет TOTP-код на текущий момент.
+     * Fresh code for right now: SHA-1, 6 digits, 30-second step.
      *
-     * @return код из шести десятичных знаков
-     * @throws Exception при сбое HMAC
+     * @return six decimal digits
+     * @throws Exception on HMAC failure
      */
     private String totpCode() throws Exception {
         return String.format("%06d", totp.generateOneTimePassword(key, Instant.now()));
     }
 
     /**
-     * Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+     * Sends a level 3 request.
      *
-     * @param method HTTP-метод
-     * @param path   путь ручки, начиная со слеша
-     * @param body   тело запроса либо {@code null}, если тела нет
-     * @return ответ сервиса
-     * @throws Exception при сбое сети или HMAC
+     * @param method HTTP method
+     * @param path   endpoint path
+     * @param body   request body, or {@code null} when there is none
+     * @return the service reply
+     * @throws Exception on network or HMAC failure
      */
     private HttpResponse<String> request(String method, String path, String body) throws Exception {
         HttpRequest.BodyPublisher publisher = body == null
@@ -94,7 +95,7 @@ public final class Java {
                 : HttpRequest.BodyPublishers.ofString(body);
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + path))
-                // Код считается здесь, а не переиспользуется: один код — один запрос.
+                // Computed here rather than reused: one code, one request.
                 .header("X-TOTP-Code", totpCode())
                 .header("Host", ISSUER_HOST)
                 .header("Content-Type", "application/json")
@@ -105,20 +106,21 @@ public final class Java {
     }
 
     /**
-     * Выпускает access-токен ({@code POST /tokens}).
+     * Issues an access token ({@code POST /tokens}).
      *
-     * @param sub         субъект, которому выдаётся токен (claim {@code sub})
-     * @param aud         получатель (claim {@code aud})
-     * @param withRefresh запросить refresh-токен для продления сессии
-     * @param claimsJson  произвольные claims в виде JSON-объекта (например
-     *                    {@code {"role":"admin"}}) либо {@code null}. Попадают в
-     *                    payload рядом с зарегистрированными; служебные имена
+     * @param sub         subject the token is issued to ({@code sub} claim)
+     * @param aud         audience ({@code aud} claim)
+     * @param withRefresh also return a refresh token for extending the session
+     * @param claimsJson  custom claims as a JSON object (for example
+     *                    {@code {"role":"admin"}}) or {@code null}. They sit
+     *                    next to the registered ones, so the consumer reads
+     *                    {@code role}, not {@code extra.role}; reserved names
      *                    ({@code iss}, {@code sub}, {@code aud}, {@code exp},
-     *                    {@code iat}, {@code nbf}, {@code jti}) переопределять
-     *                    нельзя — сервис ответит {@code 422}
-     * @return тело ответа: {@code {"token": ..., "refresh_token": ...}}
-     * @throws Exception {@code 401} — неверный код, {@code 422} — параметры или
-     *                   запрещённый claim, {@code 500} — JWKS или Redis
+     *                    {@code iat}, {@code nbf}, {@code jti}) give
+     *                    {@code 422} — change lifetime through {@code ttl}
+     * @return response body: {@code {"token": ..., "refresh_token": ...}}
+     * @throws Exception {@code 401} bad code, {@code 422} bad parameters or
+     *                   forbidden claim, {@code 500} JWKS or Redis unavailable
      */
     public String issueToken(String sub, String aud, boolean withRefresh, String claimsJson)
             throws Exception {
@@ -129,26 +131,25 @@ public final class Java {
 
         HttpResponse<String> response = request("POST", "/tokens", body);
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("выпуск не удался: " + response.statusCode());
+            throw new IllegalStateException("issue failed: " + response.statusCode());
         }
 
         return response.body();
     }
 
     /**
-     * Обменивает refresh-токен на новую пару ({@code POST /tokens/refresh}).
+     * Exchanges a refresh token for a new pair ({@code POST /tokens/refresh}).
      *
-     * <p>Старый токен после обмена недействителен: сохраните новый и выбросьте
-     * предыдущий.
+     * <p>The old token dies on exchange: store the new one and drop the previous.
      *
-     * <p><b>Внимание:</b> не повторяйте обмен старым токеном при потере ответа.
-     * Повторное предъявление трактуется как кража и гасит всю семью — и
-     * refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-     * заново.
+     * <p><b>Never retry</b> an exchange with the old token when the reply is
+     * lost. A second presentation reads as theft, and the server revokes the
+     * whole family — refresh tokens and the access tokens issued from them.
+     * Issue a new pair instead.
      *
-     * @param refreshToken токен из выпуска или прошлого обмена
-     * @return тело ответа с новой парой
-     * @throws Exception {@code 401} — токен неизвестен, истёк или уже использован
+     * @param refreshToken token from an issue or a previous exchange
+     * @return response body with the new pair
+     * @throws Exception {@code 401} — token unknown, expired or already used
      */
     public String refreshTokens(String refreshToken) throws Exception {
         String body = """
@@ -156,62 +157,65 @@ public final class Java {
 
         HttpResponse<String> response = request("POST", "/tokens/refresh", body);
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("обмен не удался: " + response.statusCode());
+            throw new IllegalStateException("refresh failed: " + response.statusCode());
         }
 
         return response.body();
     }
 
     /**
-     * Отзывает один токен по его {@code jti} ({@code DELETE /tokens/{jti}}).
+     * Revokes one token by its {@code jti} ({@code DELETE /tokens/{jti}}).
      *
-     * <p>Идемпотентно: отзыв несуществующего {@code jti} — тоже успех.
+     * <p>Idempotent: revoking an unknown {@code jti} is success too — the
+     * desired state holds either way.
      *
-     * @param jti идентификатор токена из claim {@code jti}
-     * @throws Exception {@code 500} — хранилище недоступно, отзыв НЕ выполнен
+     * @param jti token id from the {@code jti} claim
+     * @throws Exception {@code 500} — store unreachable, the token is NOT
+     *                   revoked; retry
      */
     public void revokeToken(String jti) throws Exception {
         HttpResponse<String> response = request("DELETE", "/tokens/" + jti, null);
         if (response.statusCode() != 204) {
-            throw new IllegalStateException("отзыв не удался: " + response.statusCode());
+            throw new IllegalStateException("revoke failed: " + response.statusCode());
         }
     }
 
     /**
-     * Отзывает все активные токены субъекта.
+     * Revokes every active token of a subject.
      *
-     * <p>Ручка {@code DELETE /subjects/{sub}/tokens}. Нужна при компрометации:
-     * гасить токены по одному нельзя, их {@code jti} вызывающему неизвестны.
+     * <p>Endpoint {@code DELETE /subjects/{sub}/tokens}. The compromise path:
+     * tokens cannot be killed one by one because the caller does not know their
+     * {@code jti}.
      *
-     * @param sub субъект, чьи токены гасятся
-     * @return тело ответа: {@code {"revoked": N}}; истёкшие токены не считаются
-     * @throws Exception {@code 500} — хранилище недоступно, отзыв не выполнен
+     * @param sub subject whose tokens are killed
+     * @return response body: {@code {"revoked": N}}; expired tokens do not count
+     * @throws Exception {@code 500} — store unreachable, nothing was revoked
      */
     public String revokeSubject(String sub) throws Exception {
         HttpResponse<String> response = request("DELETE", "/subjects/" + sub + "/tokens", null);
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("массовый отзыв не удался: " + response.statusCode());
+            throw new IllegalStateException("bulk revoke failed: " + response.statusCode());
         }
 
         return response.body();
     }
 
     /**
-     * Демонстрирует полный жизненный цикл токена.
+     * Full token lifecycle: issue, refresh, bulk revoke.
      *
-     * @param args не используются
-     * @throws Exception при любой ошибке сценария
+     * @param args unused
+     * @throws Exception on any failure
      */
     public static void main(String[] args) throws Exception {
         Java client = Java.fromEnv();
 
         String issued = client.issueToken("svc-a", "svc-b", true, "{\"role\":\"admin\"}");
-        System.out.println("выпущен: " + issued);
+        System.out.println("issued: " + issued);
 
-        // В боевом коде разберите JSON и достаньте refresh_token библиотекой.
+        // Real code should parse the JSON with a library instead.
         String refreshToken = issued.replaceAll(".*\"refresh_token\":\"([^\"]+)\".*", "$1");
 
-        System.out.println("обновлён: " + client.refreshTokens(refreshToken));
-        System.out.println("массовый отзыв: " + client.revokeSubject("svc-a"));
+        System.out.println("refreshed: " + client.refreshTokens(refreshToken));
+        System.out.println("bulk revoke: " + client.revokeSubject("svc-a"));
     }
 }

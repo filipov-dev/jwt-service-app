@@ -2,7 +2,7 @@
 
 =head1 NAME
 
-jwt-service-client — клиент jwt-service-app для эндпоинтов уровня 3 (TOTP)
+jwt-service-client — jwt-service-app level 3 (TOTP) client
 
 =head1 SYNOPSIS
 
@@ -12,30 +12,30 @@ jwt-service-client — клиент jwt-service-app для эндпоинтов 
 
 =head1 DESCRIPTION
 
-Покрывает все четыре ручки уровня 3: выпуск токена, обмен refresh-токена, отзыв
-одного токена и массовый отзыв токенов субъекта.
+Covers all four level 3 endpoints: issue a token, exchange a refresh token,
+revoke one token and revoke every token of a subject.
 
-Зависимости: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>, C<JSON::PP>.
+Dependencies: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>, C<JSON::PP>.
 
-=head2 Окружение
+=head2 Environment
 
 =over 4
 
 =item C<AUTH_TOTP_SECRET>
 
-Общий TOTP-секрет в base32 (обязательно).
+Shared TOTP secret, base32 (required).
 
 =item C<JWT_SERVICE_URL>
 
-Базовый URL сервиса, по умолчанию C<http://localhost:8080>.
+Service base URL, default C<http://localhost:8080>.
 
 =back
 
-=head2 Один код — один запрос
+=head2 One code, one request
 
-Код считается B<заново перед каждым запросом>. При включённой на сервере защите
-от переигрывания (C<AUTH_TOTP_REPLAY_PROTECTION>) повторное предъявление того же
-кода вернёт C<401>, хотя сам код ещё не истёк.
+The code is recomputed B<before every request>. With replay protection on
+(C<AUTH_TOTP_REPLAY_PROTECTION>) the server rejects a code it has already seen
+with C<401>, even while that code is still inside its time window.
 
 =cut
 
@@ -48,7 +48,8 @@ use HTTP::Request;
 use JSON::PP qw(encode_json decode_json);
 use LWP::UserAgent;
 
-# Значение claim iss. Должно совпадать при выпуске и проверке токена.
+# Sent as the Host header and becomes the iss claim. Must be the same on issue
+# and on verify, or the token will not verify.
 my $ISSUER_HOST = 'example.com';
 
 my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
@@ -57,10 +58,10 @@ my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
 
     my $code = totp_code();
 
-Вычисляет TOTP-код на текущий момент. Параметры соответствуют дефолтам сервиса:
-SHA-1, 6 знаков, шаг 30 секунд.
+Computes a fresh TOTP code for right now. Service defaults: SHA-1, 6 digits,
+30-second step.
 
-Возвращает строку из шести десятичных знаков.
+Returns six decimal digits.
 
 =cut
 
@@ -73,12 +74,10 @@ sub totp_code {
 
     my $response = request('POST', '/tokens', { sub => 'svc-a' });
 
-Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+Sends a level 3 request. Takes the HTTP method, the endpoint path and an
+optional body hashref.
 
-Параметры: HTTP-метод, путь ручки (начиная со слеша) и необязательная ссылка на
-хеш с телом запроса.
-
-Возвращает объект L<HTTP::Response>.
+Returns an L<HTTP::Response>.
 
 =cut
 
@@ -87,7 +86,7 @@ sub request {
 
     my $req = HTTP::Request->new($method => "$SERVICE$path");
 
-    # Код считается здесь, а не переиспользуется: один код — один запрос.
+    # Computed here rather than reused: one code, one request.
     $req->header('X-TOTP-Code'  => totp_code());
     $req->header('Host'         => $ISSUER_HOST);
     $req->header('Content-Type' => 'application/json');
@@ -100,21 +99,21 @@ sub request {
 
     my $issued = issue_token($sub, $aud, $with_refresh, { role => 'admin' });
 
-Выпускает access-токен (C<POST /tokens>).
+Issues an access token (C<POST /tokens>).
 
-Параметры: субъект (claim C<sub>), получатель (claim C<aud>), признак того,
-нужен ли refresh-токен для продления сессии, и необязательная ссылка на хеш с
-произвольными claims.
+Takes the subject (C<sub> claim), the audience (C<aud> claim), whether a refresh
+token is wanted for extending the session, and an optional hashref of custom
+claims.
 
-Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
-имена (C<iss>, C<sub>, C<aud>, C<exp>, C<iat>, C<nbf>, C<jti>) переопределять
-нельзя — сервис ответит C<422>. Число ключей и объём ограничены на сервере.
+Custom claims sit next to the registered ones, so the consumer reads C<role>,
+not C<extra.role>. Reserved names (C<iss>, C<sub>, C<aud>, C<exp>, C<iat>,
+C<nbf>, C<jti>) give C<422> — change lifetime through C<ttl>, not C<exp>. Count
+and size are capped server-side.
 
-Возвращает ссылку на хеш с полями C<token> и, если запрашивался,
-C<refresh_token>.
+Returns a hashref with C<token> and, if requested, C<refresh_token>.
 
-Умирает при C<401> (неверный код), C<422> (некорректные параметры) и C<500>
-(недоступны JWKS или Redis).
+Dies on C<401> (bad code), C<422> (bad parameters or forbidden claim) and
+C<500> (JWKS or Redis unavailable).
 
 =cut
 
@@ -130,7 +129,7 @@ sub issue_token {
 
     my $response = request('POST', '/tokens', $body);
 
-    die 'выпуск не удался: ' . $response->code unless $response->code == 200;
+    die 'issue failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content);
 }
 
@@ -138,16 +137,15 @@ sub issue_token {
 
     my $refreshed = refresh_tokens($refresh_token);
 
-Обменивает refresh-токен на новую пару (C<POST /tokens/refresh>).
+Exchanges a refresh token for a new pair (C<POST /tokens/refresh>).
 
-Старый токен после обмена недействителен: сохраните новый и выбросьте
-предыдущий.
+The old token dies on exchange: store the new one and drop the previous.
 
-B<Внимание:> не повторяйте обмен старым токеном при потере ответа. Повторное
-предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-выданные по ним access-токены. Надёжнее выпустить пару заново.
+B<Never retry> an exchange with the old token when the reply is lost. A second
+presentation reads as theft, and the server revokes the whole family — refresh
+tokens and the access tokens issued from them. Issue a new pair instead.
 
-Умирает при C<401>: токен неизвестен, истёк или уже использован.
+Dies on C<401>: the token is unknown, expired or already used.
 
 =cut
 
@@ -158,7 +156,7 @@ sub refresh_tokens {
         refresh_token => $refresh_token,
     });
 
-    die 'обмен не удался: ' . $response->code unless $response->code == 200;
+    die 'refresh failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content);
 }
 
@@ -166,12 +164,12 @@ sub refresh_tokens {
 
     revoke_token($jti);
 
-Отзывает один токен по его C<jti> (C<DELETE /tokens/{jti}>).
+Revokes one token by its C<jti> (C<DELETE /tokens/{jti}>).
 
-Идемпотентно: отзыв несуществующего C<jti> — тоже успех.
+Idempotent: revoking an unknown C<jti> is success too.
 
-Умирает при C<500>: хранилище недоступно и отзыв B<не выполнен> — попытку
-следует повторить.
+Dies on C<500>: the store is unreachable and the token is B<not> revoked —
+retry.
 
 =cut
 
@@ -179,7 +177,7 @@ sub revoke_token {
     my ($jti) = @_;
 
     my $response = request('DELETE', "/tokens/$jti");
-    die 'отзыв не удался: ' . $response->code unless $response->code == 204;
+    die 'revoke failed: ' . $response->code unless $response->code == 204;
     return;
 }
 
@@ -187,12 +185,12 @@ sub revoke_token {
 
     my $count = revoke_subject($sub);
 
-Отзывает все активные токены субъекта (C<DELETE /subjects/{sub}/tokens>).
+Revokes every active token of a subject (C<DELETE /subjects/{sub}/tokens>).
 
-Нужен при компрометации: гасить токены по одному нельзя, их C<jti> вызывающему
-неизвестны.
+The compromise path: tokens cannot be killed one by one because the caller does
+not know their C<jti>.
 
-Возвращает число отозванных токенов; истёкшие не считаются.
+Returns the number of revoked tokens; expired ones do not count.
 
 =cut
 
@@ -200,15 +198,15 @@ sub revoke_subject {
     my ($sub) = @_;
 
     my $response = request('DELETE', "/subjects/$sub/tokens");
-    die 'массовый отзыв не удался: ' . $response->code unless $response->code == 200;
+    die 'bulk revoke failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content)->{revoked};
 }
 
-# Демонстрация полного жизненного цикла токена.
+# Full token lifecycle: issue, refresh, bulk revoke.
 my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
-printf "выпущен: %s...\n", substr($issued->{token}, 0, 32);
+printf "issued: %s...\n", substr($issued->{token}, 0, 32);
 
 my $refreshed = refresh_tokens($issued->{refresh_token});
-printf "обновлён: %s...\n", substr($refreshed->{token}, 0, 32);
+printf "refreshed: %s...\n", substr($refreshed->{token}, 0, 32);
 
-printf "отозвано токенов: %d\n", revoke_subject('svc-a');
+printf "revoked: %d\n", revoke_subject('svc-a');

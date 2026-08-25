@@ -1,56 +1,56 @@
 /**
  * @file objc.m
- * @brief Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * @brief jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
+ * Build: `clang -fobjc-arc objc.m -framework Foundation -o client`
  *
- * Сборка: `clang -fobjc-arc objc.m -framework Foundation -o client`
+ * Env:
+ * - `AUTH_TOTP_SECRET` — shared TOTP secret (see the base32 note below);
+ * - `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
  *
- * Окружение:
- * - `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
- * - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
+ * @note This example treats the secret as raw bytes; add a base32 decoder for
+ *       Google Authenticator compatibility.
  *
- * @note Пример трактует секрет как сырые байты; для совместимости с Google
- *       Authenticator добавьте декодер base32.
- *
- * @warning Код считается **заново перед каждым запросом**. При включённой на
- *          сервере защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`)
- *          повторное предъявление того же кода вернёт `401`, хотя сам код ещё не
- *          истёк.
+ * @warning The code is recomputed **before every request**. With replay
+ *          protection on (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a
+ *          code it has already seen with `401`, even while that code is still
+ *          inside its time window.
  */
 
 #import <CommonCrypto/CommonHMAC.h>
 #import <Foundation/Foundation.h>
 
-/** Значение claim `iss`. Должно совпадать при выпуске и проверке токена. */
+/**
+ * Sent as the Host header and becomes the `iss` claim. Must be the same on
+ * issue and on verify, or the token will not verify.
+ */
 static NSString *const kIssuerHost = @"example.com";
 
 /**
- * @brief Клиент сервиса выдачи токенов.
+ * @brief Client of the token service, covering all four level 3 endpoints.
  */
 @interface JwtServiceClient : NSObject
 
 /**
- * @brief Создаёт клиент из переменных окружения.
+ * @brief Builds a client from the environment.
  *
- * @return Готовый клиент.
+ * @return The client.
  */
 + (instancetype)clientFromEnvironment;
 
 /**
- * @brief Выпускает access-токен (`POST /tokens`).
+ * @brief Issues an access token (`POST /tokens`).
  *
- * @param subject     Субъект, которому выдаётся токен (claim `sub`).
- * @param audience    Получатель (claim `aud`).
- * @param withRefresh Запросить refresh-токен для продления сессии.
- * @param claimsJson Произвольные claims JSON-объектом (например
- *        `@"{\"role\":\"admin\"}"`) либо `nil`. Попадают в payload рядом с
- *        зарегистрированными; служебные имена (`iss`, `sub`, `aud`, `exp`,
- *        `iat`, `nbf`, `jti`) переопределять нельзя — сервис ответит `422`.
+ * @param subject     Subject the token is issued to (`sub` claim).
+ * @param audience    Audience (`aud` claim).
+ * @param withRefresh Also return a refresh token for extending the session.
+ * @param claimsJson  Custom claims as a JSON object (for example
+ *        `@"{\"role\":\"admin\"}"`) or `nil`. They sit next to the registered
+ *        ones; reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+ *        give `422` — change lifetime through `ttl`, not `exp`.
  *
- * @return Тело ответа; `nil` при ошибке. Коды: `401` — неверный код,
- *         `422` — параметры или запрещённый claim, `500` — JWKS или Redis.
+ * @return Response body, or `nil` on failure. `401` bad code, `422` bad
+ *         parameters or forbidden claim, `500` JWKS or Redis unavailable.
  */
 - (nullable NSString *)issueTokenForSubject:(NSString *)subject
                                    audience:(NSString *)audience
@@ -58,43 +58,43 @@ static NSString *const kIssuerHost = @"example.com";
                                  claimsJson:(nullable NSString *)claimsJson;
 
 /**
- * @brief Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+ * @brief Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
  *
- * Старый токен после обмена недействителен: сохраните новый и выбросьте
- * предыдущий.
+ * The old token dies on exchange: store the new one and drop the previous.
  *
- * @warning Не повторяйте обмен старым токеном при потере ответа. Повторное
- *          предъявление трактуется как кража и гасит всю семью — и refresh-токены,
- *          и выданные по ним access-токены. Надёжнее выпустить пару заново.
+ * @warning Never retry an exchange with the old token when the reply is lost. A
+ *          second presentation reads as theft, and the server revokes the whole
+ *          family — refresh tokens and the access tokens issued from them.
+ *          Issue a new pair instead.
  *
- * @param refreshToken Токен из выпуска или прошлого обмена.
+ * @param refreshToken Token from an issue or a previous exchange.
  *
- * @return Тело ответа с новой парой; `nil`, если токен неизвестен, истёк или уже
- *         использован (`401`).
+ * @return Response body with the new pair; `nil` if the token is unknown,
+ *         expired or already used (`401`).
  */
 - (nullable NSString *)refreshTokens:(NSString *)refreshToken;
 
 /**
- * @brief Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+ * @brief Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
  *
- * Идемпотентно: отзыв несуществующего `jti` — тоже успех (`204`).
+ * Idempotent: revoking an unknown `jti` is success too (`204`).
  *
- * @param jti Идентификатор токена из claim `jti`.
+ * @param jti Token id from the `jti` claim.
  *
- * @return `YES` при успехе; `NO` означает `500` — хранилище недоступно и отзыв
- *         **не выполнен**, попытку следует повторить.
+ * @return `YES` on success; `NO` means `500` — the store is unreachable and the
+ *         token is **not** revoked, retry.
  */
 - (BOOL)revokeToken:(NSString *)jti;
 
 /**
- * @brief Отзывает все активные токены субъекта.
+ * @brief Revokes every active token of a subject.
  *
- * Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить токены
- * по одному нельзя, их `jti` вызывающему неизвестны.
+ * Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens cannot
+ * be killed one by one because the caller does not know their `jti`.
  *
- * @param subject Субъект, чьи токены гасятся.
+ * @param subject Subject whose tokens are killed.
  *
- * @return Тело ответа с полем `revoked`; истёкшие токены не считаются.
+ * @return Response body carrying `revoked`; expired tokens do not count.
  */
 - (nullable NSString *)revokeSubject:(NSString *)subject;
 
@@ -116,12 +116,12 @@ static NSString *const kIssuerHost = @"example.com";
 }
 
 /**
- * @brief Вычисляет TOTP-код на текущий момент.
+ * @brief Computes a fresh TOTP code for right now.
  *
- * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
- * Усечение — по RFC 4226 §5.3.
+ * Service defaults: SHA-1, 6 digits, 30-second step. Truncation follows
+ * RFC 4226 section 5.3.
  *
- * @return Код из шести десятичных знаков.
+ * @return Six decimal digits.
  */
 - (NSString *)totpCode {
     uint64_t counter = (uint64_t)(NSDate.date.timeIntervalSince1970 / 30);
@@ -143,14 +143,14 @@ static NSString *const kIssuerHost = @"example.com";
 }
 
 /**
- * @brief Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+ * @brief Sends a level 3 request.
  *
- * @param method HTTP-метод.
- * @param path   Путь ручки, начиная со слеша.
- * @param body   Тело запроса либо `nil`, если тела нет.
- * @param status Сюда пишется HTTP-код ответа.
+ * @param method HTTP method.
+ * @param path   Endpoint path.
+ * @param body   Request body, or `nil` when there is none.
+ * @param status Receives the HTTP status.
  *
- * @return Тело ответа либо `nil` при сбое сети.
+ * @return Response body, or `nil` on a network failure.
  */
 - (nullable NSString *)request:(NSString *)method
                           path:(NSString *)path
@@ -160,7 +160,7 @@ static NSString *const kIssuerHost = @"example.com";
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = method;
 
-    // Код считается здесь, а не переиспользуется: один код — один запрос.
+    // Computed here rather than reused: one code, one request.
     [request setValue:[self totpCode] forHTTPHeaderField:@"X-TOTP-Code"];
     [request setValue:kIssuerHost forHTTPHeaderField:@"Host"];
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -238,22 +238,22 @@ static NSString *const kIssuerHost = @"example.com";
 @end
 
 /**
- * @brief Демонстрирует полный жизненный цикл токена.
+ * @brief Full token lifecycle: issue, refresh, bulk revoke.
  *
- * @return `0` при успехе.
+ * @return `0` on success.
  */
 int main(void) {
     @autoreleasepool {
         JwtServiceClient *client = [JwtServiceClient clientFromEnvironment];
 
-        NSLog(@"выпущен: %@", [client issueTokenForSubject:@"svc-a"
+        NSLog(@"issued: %@", [client issueTokenForSubject:@"svc-a"
                                                  audience:@"svc-b"
                                               withRefresh:YES
                                                claimsJson:@"{\"role\":\"admin\"}"]);
 
-        // В боевом коде разберите JSON через NSJSONSerialization.
-        NSLog(@"обновлён: %@", [client refreshTokens:@"положите-сюда-refresh_token"]);
-        NSLog(@"массовый отзыв: %@", [client revokeSubject:@"svc-a"]);
+        // Real code should parse the JSON with NSJSONSerialization.
+        NSLog(@"refreshed: %@", [client refreshTokens:@"put-refresh-token-here"]);
+        NSLog(@"bulk revoke: %@", [client revokeSubject:@"svc-a"]);
     }
 
     return 0;

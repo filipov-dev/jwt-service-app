@@ -1,24 +1,21 @@
 /**
  * @file cpp.cpp
- * @brief Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * @brief jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
+ * Build: `c++ -std=c++17 cpp.cpp -lcrypto -o client` (cpp-httplib must be on
+ * the include path).
  *
- * Сборка: `c++ -std=c++17 cpp.cpp -lcrypto -o client` (нужен cpp-httplib в
- * include-путях).
+ * Env:
+ * - `AUTH_TOTP_SECRET` — shared TOTP secret (see the base32 note below);
+ * - `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
  *
- * Окружение:
- * - `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
- * - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
+ * @note This example treats the secret as raw bytes; add a base32 decoder for
+ *       Google Authenticator compatibility.
  *
- * @note Пример трактует секрет как сырые байты; для совместимости с Google
- *       Authenticator добавьте декодер base32.
- *
- * @warning Код считается **заново перед каждым запросом**. При включённой на
- *          сервере защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`)
- *          повторное предъявление того же кода вернёт `401`, хотя сам код ещё не
- *          истёк.
+ * @warning The code is recomputed **before every request**. With replay
+ *          protection on (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a
+ *          code it has already seen with `401`, even while that code is still
+ *          inside its time window.
  */
 
 #include <openssl/hmac.h>
@@ -33,27 +30,28 @@
 
 namespace jwt_service {
 
-/// Значение claim `iss`. Должно совпадать при выпуске и проверке токена.
+/// Sent as the Host header and becomes the `iss` claim. Must be the same on
+/// issue and on verify, or the token will not verify.
 constexpr const char* kIssuerHost = "example.com";
 
 /**
- * @brief Клиент сервиса выдачи токенов.
+ * @brief Client of the token service, covering all four level 3 endpoints.
  */
 class Client {
 public:
     /**
-     * @brief Создаёт клиент.
+     * @brief Creates a client.
      *
-     * @param base_url Базовый URL сервиса.
-     * @param secret   Общий TOTP-секрет.
+     * @param base_url Service base URL.
+     * @param secret   Shared TOTP secret.
      */
     Client(std::string base_url, std::string secret)
         : base_url_(std::move(base_url)), secret_(std::move(secret)) {}
 
     /**
-     * @brief Собирает клиент из переменных окружения.
+     * @brief Builds a client from the environment.
      *
-     * @return Готовый клиент.
+     * @return The client.
      */
     static Client FromEnv() {
         const char* service = std::getenv("JWT_SERVICE_URL");
@@ -63,19 +61,19 @@ public:
     }
 
     /**
-     * @brief Выпускает access-токен (`POST /tokens`).
+     * @brief Issues an access token (`POST /tokens`).
      *
-     * @param sub          Субъект, которому выдаётся токен (claim `sub`).
-     * @param aud          Получатель (claim `aud`).
-     * @param with_refresh Запросить refresh-токен для продления сессии.
-     * @param claims_json  Произвольные claims JSON-объектом (например
-     *                     `{"role":"admin"}`) либо пустая строка. Попадают в
-     *                     payload рядом с зарегистрированными; служебные имена
-     *                     (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
-     *                     переопределять нельзя — сервис ответит `422`.
+     * @param sub          Subject the token is issued to (`sub` claim).
+     * @param aud          Audience (`aud` claim).
+     * @param with_refresh Also return a refresh token for extending the session.
+     * @param claims_json  Custom claims as a JSON object (for example
+     *                     `{"role":"admin"}`) or an empty string. They sit next
+     *                     to the registered ones; reserved names (`iss`, `sub`,
+     *                     `aud`, `exp`, `iat`, `nbf`, `jti`) give `422` —
+     *                     change lifetime through `ttl`, not `exp`.
      *
-     * @return HTTP-код и тело ответа. `401` — неверный код, `422` — параметры или
-     *         запрещённый claim, `500` — недоступны JWKS или Redis.
+     * @return HTTP status and response body. `401` bad code, `422` bad
+     *         parameters or forbidden claim, `500` JWKS or Redis unavailable.
      */
     std::pair<int, std::string> IssueToken(const std::string& sub,
                                            const std::string& aud,
@@ -91,20 +89,19 @@ public:
     }
 
     /**
-     * @brief Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+     * @brief Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
      *
-     * Старый токен после обмена недействителен: сохраните новый и выбросьте
-     * предыдущий.
+     * The old token dies on exchange: store the new one and drop the previous.
      *
-     * @warning Не повторяйте обмен старым токеном при потере ответа. Повторное
-     *          предъявление трактуется как кража и гасит всю семью — и
-     *          refresh-токены, и выданные по ним access-токены. Надёжнее
-     *          выпустить пару заново.
+     * @warning Never retry an exchange with the old token when the reply is
+     *          lost. A second presentation reads as theft, and the server
+     *          revokes the whole family — refresh tokens and the access tokens
+     *          issued from them. Issue a new pair instead.
      *
-     * @param refresh_token Токен из выпуска или прошлого обмена.
+     * @param refresh_token Token from an issue or a previous exchange.
      *
-     * @return HTTP-код и тело ответа. `401` — токен неизвестен, истёк или уже
-     *         использован.
+     * @return HTTP status and response body. `401` — token unknown, expired or
+     *         already used.
      */
     std::pair<int, std::string> RefreshTokens(const std::string& refresh_token) {
         const std::string body = "{\"refresh_token\":\"" + refresh_token + "\"}";
@@ -112,28 +109,29 @@ public:
     }
 
     /**
-     * @brief Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+     * @brief Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
      *
-     * Идемпотентно: отзыв несуществующего `jti` — тоже успех (`204`).
+     * Idempotent: revoking an unknown `jti` is success too (`204`).
      *
-     * @param jti Идентификатор токена из claim `jti`.
+     * @param jti Token id from the `jti` claim.
      *
-     * @return HTTP-код и тело ответа. `500` — хранилище недоступно и отзыв **не
-     *         выполнен**: попытку следует повторить.
+     * @return HTTP status and response body. `500` — store unreachable and the
+     *         token is **not** revoked: retry.
      */
     std::pair<int, std::string> RevokeToken(const std::string& jti) {
         return Request("DELETE", "/tokens/" + jti, std::nullopt);
     }
 
     /**
-     * @brief Отзывает все активные токены субъекта.
+     * @brief Revokes every active token of a subject.
      *
-     * Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить
-     * токены по одному нельзя, их `jti` вызывающему неизвестны.
+     * Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+     * cannot be killed one by one because the caller does not know their `jti`.
      *
-     * @param sub Субъект, чьи токены гасятся.
+     * @param sub Subject whose tokens are killed.
      *
-     * @return HTTP-код и тело с полем `revoked`; истёкшие токены не считаются.
+     * @return HTTP status and a body carrying `revoked`; expired tokens do not
+     *         count.
      */
     std::pair<int, std::string> RevokeSubject(const std::string& sub) {
         return Request("DELETE", "/subjects/" + sub + "/tokens", std::nullopt);
@@ -141,12 +139,12 @@ public:
 
 private:
     /**
-     * @brief Вычисляет TOTP-код на текущий момент.
+     * @brief Computes a fresh TOTP code for right now.
      *
-     * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-     * Усечение — по RFC 4226 §5.3.
+     * Service defaults: SHA-1, 6 digits, 30-second step. Truncation follows
+     * RFC 4226 section 5.3.
      *
-     * @return Код из шести десятичных знаков.
+     * @return Six decimal digits.
      */
     std::string TotpCode() const {
         auto counter = static_cast<unsigned long>(std::time(nullptr) / 30);
@@ -174,20 +172,20 @@ private:
     }
 
     /**
-     * @brief Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+     * @brief Sends a level 3 request.
      *
-     * @param method HTTP-метод.
-     * @param path   Путь ручки, начиная со слеша.
-     * @param body   Тело запроса либо `std::nullopt`, если тела нет.
+     * @param method HTTP method.
+     * @param path   Endpoint path.
+     * @param body   Request body, or `std::nullopt` when there is none.
      *
-     * @return HTTP-код и тело ответа; код `0` означает сбой сети.
+     * @return HTTP status and response body; status `0` means a network failure.
      */
     std::pair<int, std::string> Request(const std::string& method,
                                         const std::string& path,
                                         std::optional<std::string> body) {
         httplib::Client http(base_url_.c_str());
 
-        // Код считается здесь, а не переиспользуется: один код — один запрос.
+        // Computed here rather than reused: one code, one request.
         const httplib::Headers headers = {
             {"X-TOTP-Code", TotpCode()},
             {"Host", kIssuerHost},
@@ -208,22 +206,22 @@ private:
 }  // namespace jwt_service
 
 /**
- * @brief Демонстрирует полный жизненный цикл токена.
+ * @brief Full token lifecycle: issue, refresh, bulk revoke.
  *
- * @return `0` при успехе.
+ * @return `0` on success.
  */
 int main() {
     auto client = jwt_service::Client::FromEnv();
 
     auto [issue_status, issued] = client.IssueToken("svc-a", "svc-b", true, R"({"role":"admin"})");
-    std::cout << "выпуск: " << issue_status << " " << issued << "\n";
+    std::cout << "issue: " << issue_status << " " << issued << "\n";
 
-    // В боевом коде разберите JSON ответа и достаньте refresh_token.
-    auto [refresh_status, refreshed] = client.RefreshTokens("положите-сюда-refresh_token");
-    std::cout << "обмен: " << refresh_status << " " << refreshed << "\n";
+    // Real code should parse the reply and take refresh_token from it.
+    auto [refresh_status, refreshed] = client.RefreshTokens("put-refresh-token-here");
+    std::cout << "refresh: " << refresh_status << " " << refreshed << "\n";
 
     auto [revoke_status, revoked] = client.RevokeSubject("svc-a");
-    std::cout << "массовый отзыв: " << revoke_status << " " << revoked << "\n";
+    std::cout << "bulk revoke: " << revoke_status << " " << revoked << "\n";
 
     return 0;
 }

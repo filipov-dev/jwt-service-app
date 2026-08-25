@@ -1,47 +1,45 @@
 (ns jwt-service-client
-  "Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+  "jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 
-  Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-  токена и массовый отзыв токенов субъекта.
+  Dependencies: `[one-time \"0.7.0\"] [clj-http \"3.12.3\"] [cheshire \"5.12.0\"]`.
 
-  Зависимости: `[one-time \"0.7.0\"] [clj-http \"3.12.3\"] [cheshire \"5.12.0\"]`.
+  Environment:
+  - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+  - `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
 
-  Окружение:
-  - `AUTH_TOTP_SECRET` — общий TOTP-секрет в base32 (обязательно);
-  - `JWT_SERVICE_URL` — базовый URL сервиса, по умолчанию `http://localhost:8080`.
-
-  ВАЖНО: код считается заново перед каждым запросом. При включённой на сервере
-  защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное предъявление
-  того же кода вернёт 401, хотя сам код ещё не истёк."
+  The code is recomputed before every request. With replay protection on
+  (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+  with 401, even while that code is still inside its time window."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
             [one-time.core :as ot]))
 
 (def ^:private issuer-host
-  "Значение claim `iss`. Должно совпадать при выпуске и проверке токена."
+  "Sent as the Host header and becomes the `iss` claim. Must be the same on
+  issue and on verify, or the token will not verify."
   "example.com")
 
 (defn- service-url
-  "Возвращает базовый URL сервиса из окружения."
+  "Returns the service base URL from the environment."
   []
   (or (System/getenv "JWT_SERVICE_URL") "http://localhost:8080"))
 
 (defn totp-code
-  "Вычисляет TOTP-код на текущий момент.
+  "Computes a fresh TOTP code for right now.
 
-  Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
+  Service defaults: SHA-1, 6 digits, 30-second step.
 
-  Возвращает строку из шести десятичных знаков."
+  Returns six decimal digits."
   []
   (format "%06d" (ot/get-totp-token (System/getenv "AUTH_TOTP_SECRET"))))
 
 (defn- request
-  "Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+  "Sends a level 3 request.
 
-  `method` — ключевое слово (:post или :delete), `path` — путь ручки,
-  `body` — тело запроса либо nil. Возвращает ответ clj-http."
+  `method` is :post or :delete, `path` the endpoint path, `body` the request
+  body or nil. Returns the clj-http response."
   [method path body]
-  (let [options (cond-> {;; Код считается здесь: один код — один запрос.
+  (let [options (cond-> {;; Computed here rather than reused: one code, one request.
                          :headers {"X-TOTP-Code" (totp-code)
                                    "Host" issuer-host}
                          :content-type :json
@@ -50,74 +48,74 @@
     (http/request (merge options {:method method :url (str (service-url) path)}))))
 
 (defn issue-token
-  "Выпускает access-токен (`POST /tokens`).
+  "Issues an access token (`POST /tokens`).
 
-  `sub` — субъект (claim `sub`), `aud` — вектор получателей (claim `aud`),
-  `with-refresh?` — запросить refresh-токен для продления сессии,
-  `claims` — произвольные claims (роли, scope, tenant), попадают в payload рядом
-  с зарегистрированными.
+  `sub` is the subject (`sub` claim), `aud` the audience vector (`aud` claim),
+  `with-refresh?` also returns a refresh token for extending the session, and
+  `claims` are custom values (role, scope, tenant) placed next to the registered
+  ones, so the consumer reads `role`, not `extra.role`.
 
-  Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
-  переопределять нельзя — сервис ответит 422. Число ключей и объём ограничены на
-  сервере.
+  Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) give 422 —
+  change lifetime through `ttl`, not `exp`. Count and size are capped
+  server-side.
 
-  Возвращает распарсенное тело ответа. Бросает ex-info при 401 (неверный код),
-  422 (некорректные параметры или запрещённый claim) и 500 (JWKS или Redis)."
+  Returns the parsed response body. Throws ex-info on 401 (bad code), 422 (bad
+  parameters or forbidden claim) and 500 (JWKS or Redis unavailable)."
   [sub aud & {:keys [with-refresh? claims] :or {with-refresh? false claims {}}}]
   (let [body (cond-> {:sub sub :aud aud :refresh with-refresh?}
                (seq claims) (assoc :claims claims))
         response (request :post "/tokens" body)]
     (when (not= 200 (:status response))
-      (throw (ex-info "выпуск не удался" {:status (:status response)})))
+      (throw (ex-info "issue failed" {:status (:status response)})))
     (json/parse-string (:body response))))
 
 (defn refresh-tokens
-  "Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+  "Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
 
-  Старый токен после обмена недействителен: сохраните новый и выбросьте
-  предыдущий.
+  The old token dies on exchange: store the new one and drop the previous.
 
-  ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-  предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-  выданные по ним access-токены. Надёжнее выпустить пару заново.
+  Never retry an exchange with the old token when the reply is lost. A second
+  presentation reads as theft, and the server revokes the whole family — refresh
+  tokens and the access tokens issued from them. Issue a new pair instead.
 
-  Бросает ex-info при 401 — токен неизвестен, истёк или уже использован."
+  Throws ex-info on 401 — the token is unknown, expired or already used."
   [refresh-token]
   (let [response (request :post "/tokens/refresh" {:refresh_token refresh-token})]
     (when (not= 200 (:status response))
-      (throw (ex-info "обмен не удался" {:status (:status response)})))
+      (throw (ex-info "refresh failed" {:status (:status response)})))
     (json/parse-string (:body response))))
 
 (defn revoke-token
-  "Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+  "Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
 
-  Идемпотентно: отзыв несуществующего `jti` — тоже успех.
+  Idempotent: revoking an unknown `jti` is success too.
 
-  Бросает ex-info при 500 — хранилище недоступно, отзыв НЕ выполнен."
+  Throws ex-info on 500 — the store is unreachable and the token is NOT revoked,
+  retry."
   [jti]
   (let [response (request :delete (str "/tokens/" jti) nil)]
     (when (not= 204 (:status response))
-      (throw (ex-info "отзыв не удался" {:status (:status response)})))
+      (throw (ex-info "revoke failed" {:status (:status response)})))
     nil))
 
 (defn revoke-subject
-  "Отзывает все активные токены субъекта (`DELETE /subjects/{sub}/tokens`).
+  "Revokes every active token of a subject (`DELETE /subjects/{sub}/tokens`).
 
-  Нужен при компрометации: гасить токены по одному нельзя, их `jti` вызывающему
-  неизвестны.
+  The compromise path: tokens cannot be killed one by one because the caller
+  does not know their `jti`.
 
-  Возвращает число отозванных токенов; истёкшие не считаются."
+  Returns the number of revoked tokens; expired ones do not count."
   [sub]
   (let [response (request :delete (str "/subjects/" sub "/tokens") nil)]
     (when (not= 200 (:status response))
-      (throw (ex-info "массовый отзыв не удался" {:status (:status response)})))
+      (throw (ex-info "bulk revoke failed" {:status (:status response)})))
     (get (json/parse-string (:body response)) "revoked")))
 
 (defn -main
-  "Демонстрирует полный жизненный цикл токена."
+  "Full token lifecycle: issue, refresh, bulk revoke."
   [& _args]
   (let [issued (issue-token "svc-a" ["svc-b"] :with-refresh? true :claims {:role "admin"})
         refreshed (refresh-tokens (get issued "refresh_token"))]
-    (println "выпущен:" (subs (get issued "token") 0 32) "...")
-    (println "обновлён:" (subs (get refreshed "token") 0 32) "...")
-    (println "отозвано токенов:" (revoke-subject "svc-a"))))
+    (println "issued:" (subs (get issued "token") 0 32) "...")
+    (println "refreshed:" (subs (get refreshed "token") 0 32) "...")
+    (println "revoked:" (revoke-subject "svc-a"))))
