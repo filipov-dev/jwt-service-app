@@ -125,10 +125,14 @@ pub fn record_jwks_request(operation: &str, success: bool, latency: Duration) {
 /// - `hit` — ключ отдан из памяти, в сеть не ходили;
 /// - `miss` — в кеше не нашлось, пошли в `jwks-service-app`;
 /// - `throttled` — `kid` неизвестен, но обновляться ещё рано (защита от флуда
-///   несуществующими `kid`), запрос отклонён без похода в сеть.
+///   несуществующими `kid`), запрос отклонён без похода в сеть;
+/// - `stale` — сервис ключей недоступен, ключ отдан из устаревшего снимка
+///   (stale-while-revalidate).
 ///
 /// Доля `hit` — главный показатель эффективности кеша; заметный поток
-/// `throttled` означает, что по сервису бьют мусорными `kid`.
+/// `throttled` означает, что по сервису бьют мусорными `kid`, а любой `stale` —
+/// что `jwks-service-app` лежит и мы работаем на памяти: это повод для алерта,
+/// потому что за пределом `JWKS_CACHE_STALE_MAX_SECONDS` верификация откажет.
 pub fn record_jwks_cache(result: &str) {
     counter!("jwks_cache_total", "result" => result.to_string()).increment(1);
 }
