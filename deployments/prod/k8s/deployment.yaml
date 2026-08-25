@@ -16,6 +16,49 @@ spec:
       labels:
         app.kubernetes.io/name: jwt-service-app
     spec:
+      # Разнос реплик по кластеру. Без него планировщик вправе поставить все
+      # три пода на один узел: тогда replicas: 3 страхуют только от падения
+      # процесса, а drain или отказ узла уносят verify целиком. В такой
+      # раскладке бесполезен и PDB (pdb.yaml) — отпускать поды по одному не
+      # выйдет, они выселяются вместе с узлом.
+      topologySpreadConstraints:
+        # По узлам — жёстко. Перекос больше одного пода не допускается, то есть
+        # при трёх репликах нужно минимум три узла, готовых их принять.
+        #
+        # ВАЖНО: на кластере меньше чем из трёх узлов лишние реплики останутся
+        # в Pending навсегда, а вместе с ними встанет и drain (PDB не наберёт
+        # minAvailable: 2). Меньше трёх узлов — меняйте на ScheduleAnyway.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: jwt-service-app
+          # Перекос считается отдельно по каждой ревизии Deployment'а. Без
+          # этого при обновлении новый под считается вместе со старыми: на трёх
+          # узлах с тремя старыми подами surge-под нарушает maxSkew и висит в
+          # Pending, а maxUnavailable по умолчанию для трёх реплик равен нулю —
+          # старый под не удалят, пока не поднялся новый. Выкатка встаёт
+          # намертво.
+          #
+          # Поле доступно с Kubernetes 1.27. На 1.25/1.26 удалите его и
+          # задайте spec.strategy.rollingUpdate.maxUnavailable: 1.
+          matchLabelKeys:
+            - pod-template-hash
+
+        # По зонам — мягко: однозональный кластер (и любой, где зон меньше
+        # трёх) — норма, и жёсткое требование оставило бы поды в Pending на
+        # ровном месте. ScheduleAnyway превращает правило в предпочтение:
+        # есть зоны — разложит по ним, нет — просто разложит по узлам.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: jwt-service-app
+          matchLabelKeys:
+            - pod-template-hash
+
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

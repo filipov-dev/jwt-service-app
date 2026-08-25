@@ -236,8 +236,8 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
 
 - `docker-compose.yml` — сервис и Redis, секреты из `.env` (образец —
   `.env.example`, сам `.env` в `.gitignore`);
-- `k8s/` — Deployment, Service и образец Secret, применяются через
-  `kubectl apply -k deployments/prod/k8s/`.
+- `k8s/` — Deployment, Service, PodDisruptionBudget, NetworkPolicy и образец
+  Secret, применяются через `kubectl apply -k deployments/prod/k8s/`.
 
 > **`deployments/prod/README.md` — это описание образа на Docker Hub.**
 > `docker.yml` пушит его туда шагом `dockerhub-description`. Поэтому ссылки в
@@ -265,7 +265,22 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   квота появляется, как только задан `cpus`.
 - **Порт наружу не публикуется.** Уровень 2 держится на заголовке, который
   ставит прокси; прямой доступ к контейнеру его обходит. По той же причине
-  Service в k8s — `ClusterIP`.
+  Service в k8s — `ClusterIP`, а `networkpolicy.yaml` закрывает и оставшийся
+  зазор: `ClusterIP` невидим снаружи кластера, но внутри доступен любому поду
+  любого namespace'а, то есть уровень 2 обходится соседом по кластеру.
+  В политике разрешены два источника — поды ingress-контроллера и namespace
+  скрейпера метрик; имена там кластерозависимы и правятся под стенд.
+  **NetworkPolicy исполняет CNI**: плагин без её поддержки примет манифест
+  молча и не сделает ничего, так что после применения стоит убедиться, что
+  посторонний под до порта 8080 не достаёт.
+- **`replicas: 3`, PDB и `topologySpreadConstraints` — одна конструкция, а не
+  три независимые настройки.** Разнос по узлам не даёт планировщику собрать все
+  реплики на одном узле (иначе drain уносит сервис целиком), а
+  `minAvailable: 2` в `pdb.yaml` заставляет drain отпускать поды по одному.
+  Меняете число реплик — пересчитайте `minAvailable`: при `replicas: 2` тот же
+  бюджет заблокирует любое добровольное выселение намертво. Жёсткий разнос по
+  узлам (`DoNotSchedule`) требует минимум трёх узлов; на меньшем кластере
+  реплики зависнут в `Pending` — там нужен `ScheduleAnyway`.
 - В `kustomization.yaml` метки задаются через `labels`, а не `commonLabels`:
   последний дописывает метки и в `spec.selector` Deployment'а, а селектор
   после создания неизменяем — обновление упало бы.
