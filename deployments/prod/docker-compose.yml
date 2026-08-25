@@ -30,6 +30,12 @@ services:
       TOKEN_ALGORITHM: ${TOKEN_ALGORITHM:-RS256}
       TOKEN_EXPIRATION_SECONDS: ${TOKEN_EXPIRATION_SECONDS:-3600}
 
+      # Домены, допустимые в claim `iss` (значение заголовка Host), через
+      # запятую. Пусто — любой Host, как раньше. Задавайте явно: при общем с
+      # соседним инстансом jwks-service-app иначе тут выпускается токен с чужим
+      # `iss`, подписанный общим ключом, и сосед примет его как свой.
+      TOKEN_ISSUER_ALLOWLIST: ${TOKEN_ISSUER_ALLOWLIST:-}
+
       # Воркеры и таймауты соединений. Пусто — сервис считает воркеров сам: по
       # квоте CPU контейнера, а если её нет (здесь `cpus` не задан) — по потолку
       # по умолчанию, а НЕ по числу ядер хоста. Задаёте `cpus` в deploy.resources

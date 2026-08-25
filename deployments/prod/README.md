@@ -124,6 +124,7 @@ healthcheck:
 | `AUTH_PROXY_SECRET` | уровень 2, обязательна |
 | `AUTH_TOTP_SECRET` | уровень 3, base32, обязательна |
 | `AUTH_TOTP_SECRET_NEXT` | второй активный секрет на время ротации |
+| `TOKEN_ISSUER_ALLOWLIST` | список доменов, допустимых в claim `iss`; не задана — `iss` берётся из `Host` без проверки, и при общем `jwks-service-app` можно выпустить токен от имени соседнего инстанса |
 | `RATE_LIMIT_TRUSTED_PROXIES` | без неё за прокси все клиенты делят один per-IP лимит: ключом становится адрес прокси |
 | `AUTH_TOTP_REPLAY_PROTECTION` | запрет переигрывания TOTP-кода; требует Redis |
 | `AUTH_METRICS_TOKEN` | уровень 4; не задана — `/metrics` не публикуется |

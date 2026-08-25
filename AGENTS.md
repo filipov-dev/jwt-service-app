@@ -22,7 +22,8 @@
 
 Поток данных при выпуске токена (`POST /tokens`):
 
-1. `handlers::create_token` читает заголовок `Host` (становится `iss`).
+1. `handlers::create_token` читает заголовок `Host` (становится `iss`) и сверяет
+   его с аллоулистом issuer'ов (`src/issuer.rs`).
 2. `JwtManager::generate_token` запрашивает приватный ключ у `KeyManager`.
 3. `KeyManager` через `JwkService` (`src/jwk.rs`) ходит в `jwks-service-app`:
    получает существующий ключ по id или создаёт новый.
@@ -149,6 +150,7 @@ access + refresh. Refresh-токен — непрозрачная строка, 
 | `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
 | `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
+| `issuer.rs` | Аллоулист issuer'ов (`TOKEN_ISSUER_ALLOWLIST`): какие значения `Host` допустимы в claim `iss`. |
 | `jwt.rs` | `JwtManager` — фасад для генерации и проверки токенов. |
 | `models/jwt.rs` | `TokenClaims`, `TokenHeaders`, `JsonWebToken`, трейт `JtiStore`, ошибки. |
 | `models/mod.rs` | DTO запросов/ответов (`ToSchema`) и структуры JWK/JWKS. |
@@ -338,6 +340,7 @@ Release — формулировки в файле и в релизе совпа
 | `TOKEN_CLAIMS_MAX_COUNT` | `32` | Максимум пользовательских claims в теле `POST /tokens`. |
 | `TOKEN_CLAIMS_MAX_BYTES` | `4096` | Максимальный суммарный объём пользовательских claims. Токен ездит в заголовках — раздутый payload ломает прокси. |
 | `TOKEN_JKU` | — (нет) | Если задан, кладётся в заголовок `jku` и проверяется при верификации. |
+| `TOKEN_ISSUER_ALLOWLIST` | — (нет) | Разрешённые значения `iss` — списком через запятую (`Host` берётся как есть, вместе с портом; регистр не важен). Пусто → любой `Host` (прежнее поведение). |
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` (30 суток) | Время жизни refresh-токена. Длинный срок безопасен за счёт ротации: украденный токен работает лишь до первого обмена настоящим клиентом. |
 | `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
 | `REDIS_RESPONSE_TIMEOUT_MS` | `1000` | Таймаут ожидания ответа на команду. Без него зависший Redis удерживал бы обработчик неограниченно. |
@@ -379,7 +382,13 @@ Release — формулировки в файле и в релизе совпа
 | `AUTH_METRICS_TOKEN` | — (нет) | Уровень 4: статический Bearer-токен для скрейпа `GET /metrics`. Не задан → ручка не публикуется (`404`), сервис стартует. |
 | `CORS_ALLOWED_ORIGINS` | — (нет) | Разрешённые origin'ы CORS для `POST /tokens/verify` (список через запятую). Пусто → `allow_any_origin`. Применяется только к этой ручке. |
 
-`iss` токена берётся **из заголовка `Host` запроса**, а не из конфига.
+`iss` токена берётся **из заголовка `Host` запроса**, а не из конфига, но его
+значение ограничивается `TOKEN_ISSUER_ALLOWLIST`. Список обязателен там, где
+несколько инстансов делят один `jwks-service-app`: без него у инстанса `A`
+выпускается токен с `Host: b.example.com`, подписанный общим ключом, и инстанс
+`B` примет его как свой. Выпуск (`POST /tokens`) и обмен refresh с `Host` вне
+списка дают `403`; проверка (`POST /tokens/verify`) — `401`, как и любой другой
+отказ верификации: причину публичная ручка наружу не раскрывает.
 
 Секреты (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET*`) не логируются и не коммитятся;
 подставляйте их из секрет-менеджера. Дефолтные имена заголовков (`X-Proxy-Secret`,

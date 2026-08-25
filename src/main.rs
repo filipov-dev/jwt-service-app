@@ -23,6 +23,7 @@ use utoipa::{Modify, OpenApi};
 mod auth;
 mod error;
 mod handlers;
+mod issuer;
 mod jwk;
 mod jwt;
 mod key;
@@ -340,6 +341,10 @@ async fn main() -> std::io::Result<()> {
     if let Some(limiter) = &verify_limiter {
         limiter.spawn_cleanup();
     }
+
+    // Аллоулист issuer'ов: пусто/не задано → любой `Host` (текущее поведение),
+    // задано → выпуск и проверка только для перечисленных значений.
+    crate::issuer::log_summary();
 
     // Список origin'ов для CORS. Пусто/не задано → `allow_any_origin` (текущее
     // поведение, чтобы не ломать деплои); задано → только перечисленные origin'ы.
