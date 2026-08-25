@@ -1,13 +1,12 @@
-' Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+' jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 '
-' TOTP считается через HMACSHA1 из .NET, внешних пакетов не требуется.
+' TOTP is computed with .NET HMACSHA1, no external packages needed.
 '
-' Окружение:
-'   AUTH_TOTP_SECRET — общий TOTP-секрет (см. примечание о base32);
-'   JWT_SERVICE_URL  — базовый URL, по умолчанию http://localhost:8080.
+' Env:
+'   AUTH_TOTP_SECRET — shared TOTP secret (raw UTF-8 bytes here, see README.md);
+'   JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
 '
-' Пример трактует секрет как сырые байты (UTF-8); для совместимости с Google
-' Authenticator добавьте декодер base32.
+' See README.md for endpoints, error codes and client rules.
 
 Imports System
 Imports System.Net.Http
@@ -16,51 +15,43 @@ Imports System.Text
 Imports System.Text.Json
 
 ''' <summary>
-''' Клиент сервиса выдачи токенов, покрывающий все четыре ручки уровня 3.
+''' Client of the token service, covering all four level 3 endpoints.
 ''' </summary>
-''' <remarks>
-''' TOTP-код считается <b>заново перед каждым запросом</b>. При включённой на
-''' сервере защите от переигрывания (<c>AUTH_TOTP_REPLAY_PROTECTION</c>) повторное
-''' предъявление того же кода вернёт <c>401</c>, хотя сам код ещё не истёк.
-''' </remarks>
 Public Class JwtServiceClient
 
-    ''' <summary>Значение claim <c>iss</c>. Должно совпадать при выпуске и проверке.</summary>
+    ''' <summary>Sent as the Host header, becomes the <c>iss</c> claim.</summary>
     Private Const IssuerHost As String = "example.com"
 
     Private ReadOnly _baseUrl As String
     Private ReadOnly _secret As Byte()
     Private ReadOnly _http As New HttpClient()
 
-    ''' <summary>Создаёт клиент.</summary>
-    ''' <param name="baseUrl">Базовый URL сервиса.</param>
-    ''' <param name="secret">Общий TOTP-секрет.</param>
+    ''' <summary>Creates a client.</summary>
+    ''' <param name="baseUrl">Service base URL.</param>
+    ''' <param name="secret">Shared TOTP secret.</param>
     Public Sub New(baseUrl As String, secret As String)
         _baseUrl = baseUrl
         _secret = Encoding.UTF8.GetBytes(secret)
     End Sub
 
-    ''' <summary>Собирает клиент из переменных окружения.</summary>
-    ''' <returns>Готовый клиент.</returns>
-    ''' <exception cref="InvalidOperationException">Не задан AUTH_TOTP_SECRET.</exception>
+    ''' <summary>Builds a client from the environment.</summary>
+    ''' <returns>The client.</returns>
+    ''' <exception cref="InvalidOperationException">AUTH_TOTP_SECRET is not set.</exception>
     Public Shared Function FromEnv() As JwtServiceClient
         Dim service = Environment.GetEnvironmentVariable("JWT_SERVICE_URL")
         If String.IsNullOrEmpty(service) Then service = "http://localhost:8080"
 
         Dim secret = Environment.GetEnvironmentVariable("AUTH_TOTP_SECRET")
         If String.IsNullOrEmpty(secret) Then
-            Throw New InvalidOperationException("нужен AUTH_TOTP_SECRET")
+            Throw New InvalidOperationException("AUTH_TOTP_SECRET is required")
         End If
 
         Return New JwtServiceClient(service, secret)
     End Function
 
-    ''' <summary>Вычисляет TOTP-код на текущий момент.</summary>
-    ''' <returns>Код из шести десятичных знаков.</returns>
-    ''' <remarks>
-    ''' Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-    ''' Усечение — по RFC 4226 §5.3.
-    ''' </remarks>
+    ''' <summary>Fresh TOTP code: SHA-1, 6 digits, 30-second step.</summary>
+    ''' <returns>Six decimal digits.</returns>
+    ''' <remarks>Truncation follows RFC 4226 section 5.3.</remarks>
     Private Function TotpCode() As String
         Dim counter As Long = DateTimeOffset.UtcNow.ToUnixTimeSeconds() \ 30
 
@@ -81,16 +72,15 @@ Public Class JwtServiceClient
         End Using
     End Function
 
-    ''' <summary>Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.</summary>
-    ''' <param name="method">HTTP-метод.</param>
-    ''' <param name="path">Путь ручки, начиная со слеша.</param>
-    ''' <param name="body">Тело запроса либо <c>Nothing</c>, если тела нет.</param>
-    ''' <returns>Кортеж из HTTP-кода и тела ответа.</returns>
+    ''' <summary>Sends a level 3 request with a code computed right before the call.</summary>
+    ''' <param name="method">HTTP method.</param>
+    ''' <param name="path">Endpoint path.</param>
+    ''' <param name="body">Request body, or <c>Nothing</c>.</param>
+    ''' <returns>HTTP status and response body.</returns>
     Private Function Request(method As HttpMethod, path As String, body As String) _
         As (Status As Integer, Body As String)
 
         Using message As New HttpRequestMessage(method, _baseUrl & path)
-            ' Код считается здесь, а не переиспользуется: один код — один запрос.
             message.Headers.Add("X-TOTP-Code", TotpCode())
             message.Headers.Host = IssuerHost
 
@@ -103,21 +93,12 @@ Public Class JwtServiceClient
         End Using
     End Function
 
-    ''' <summary>Выпускает access-токен (<c>POST /tokens</c>).</summary>
-    ''' <param name="subject">Субъект, которому выдаётся токен (claim <c>sub</c>).</param>
-    ''' <param name="audience">Получатель (claim <c>aud</c>).</param>
-    ''' <param name="withRefresh">Запросить refresh-токен для продления сессии.</param>
-    ''' <param name="claimsJson">
-    ''' Произвольные claims JSON-объектом (например <c>{"role":"admin"}</c>) либо
-    ''' <c>Nothing</c>. Попадают в payload рядом с зарегистрированными; служебные
-    ''' имена (<c>iss</c>, <c>sub</c>, <c>aud</c>, <c>exp</c>, <c>iat</c>,
-    ''' <c>nbf</c>, <c>jti</c>) переопределять нельзя — сервис ответит <c>422</c>.
-    ''' </param>
-    ''' <returns>Тело ответа с полями <c>token</c> и, если запрашивался, <c>refresh_token</c>.</returns>
-    ''' <exception cref="InvalidOperationException">
-    ''' <c>401</c> — неверный код, <c>422</c> — параметры или запрещённый claim,
-    ''' <c>500</c> — JWKS или Redis.
-    ''' </exception>
+    ''' <summary><c>POST /tokens</c></summary>
+    ''' <param name="subject">Subject.</param>
+    ''' <param name="audience">Audience.</param>
+    ''' <param name="withRefresh">Also ask for a refresh token.</param>
+    ''' <param name="claimsJson">Custom claims as a JSON object, or <c>Nothing</c>.</param>
+    ''' <returns>Response body with <c>token</c> and, if requested, <c>refresh_token</c>.</returns>
     Public Function IssueToken(subject As String, audience As String,
                                Optional withRefresh As Boolean = False,
                                Optional claimsJson As String = Nothing) As String
@@ -127,65 +108,46 @@ Public Class JwtServiceClient
         Dim result = Request(HttpMethod.Post, "/tokens", body)
 
         If result.Status <> 200 Then
-            Throw New InvalidOperationException($"выпуск не удался: {result.Status}")
+            Throw New InvalidOperationException($"issue failed: {result.Status}")
         End If
 
         Return result.Body
     End Function
 
-    ''' <summary>Обменивает refresh-токен на новую пару (<c>POST /tokens/refresh</c>).</summary>
-    ''' <param name="refreshToken">Токен из выпуска или прошлого обмена.</param>
-    ''' <returns>Тело ответа с новой парой.</returns>
-    ''' <remarks>
-    ''' Старый токен после обмена недействителен: сохраните новый и выбросьте
-    ''' предыдущий.
-    ''' <para>
-    ''' <b>Внимание:</b> не повторяйте обмен старым токеном при потере ответа.
-    ''' Повторное предъявление трактуется как кража и гасит всю семью — и
-    ''' refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-    ''' заново.
-    ''' </para>
-    ''' </remarks>
-    ''' <exception cref="InvalidOperationException">
-    ''' <c>401</c> — токен неизвестен, истёк или уже использован.
-    ''' </exception>
+    ''' <summary><c>POST /tokens/refresh</c></summary>
+    ''' <param name="refreshToken">Token from an issue or a previous refresh.</param>
+    ''' <returns>Response body with the new pair.</returns>
+    ''' <remarks>The old refresh token is dead once the call succeeds.</remarks>
     Public Function RefreshTokens(refreshToken As String) As String
         Dim body = $"{{""refresh_token"":""{refreshToken}""}}"
         Dim result = Request(HttpMethod.Post, "/tokens/refresh", body)
 
         If result.Status <> 200 Then
-            Throw New InvalidOperationException($"обмен не удался: {result.Status}")
+            Throw New InvalidOperationException($"refresh failed: {result.Status}")
         End If
 
         Return result.Body
     End Function
 
-    ''' <summary>Отзывает один токен по его <c>jti</c> (<c>DELETE /tokens/{jti}</c>).</summary>
-    ''' <param name="jti">Идентификатор токена из claim <c>jti</c>.</param>
-    ''' <remarks>Идемпотентно: отзыв несуществующего <c>jti</c> — тоже успех.</remarks>
-    ''' <exception cref="InvalidOperationException">
-    ''' <c>500</c> — хранилище недоступно, отзыв НЕ выполнен: повторите попытку.
-    ''' </exception>
+    ''' <summary><c>DELETE /tokens/{jti}</c></summary>
+    ''' <param name="jti">Token id from the <c>jti</c> claim.</param>
+    ''' <remarks>Idempotent.</remarks>
     Public Sub RevokeToken(jti As String)
         Dim result = Request(HttpMethod.Delete, $"/tokens/{jti}", Nothing)
 
         If result.Status <> 204 Then
-            Throw New InvalidOperationException($"отзыв не удался: {result.Status}")
+            Throw New InvalidOperationException($"revoke failed: {result.Status}")
         End If
     End Sub
 
-    ''' <summary>Отзывает все активные токены субъекта.</summary>
-    ''' <param name="subject">Субъект, чьи токены гасятся.</param>
-    ''' <returns>Число отозванных токенов; истёкшие не считаются.</returns>
-    ''' <remarks>
-    ''' Ручка <c>DELETE /subjects/{sub}/tokens</c>. Нужна при компрометации: гасить
-    ''' токены по одному нельзя, их <c>jti</c> вызывающему неизвестны.
-    ''' </remarks>
+    ''' <summary><c>DELETE /subjects/{sub}/tokens</c></summary>
+    ''' <param name="subject">Subject whose tokens are revoked.</param>
+    ''' <returns>Number of revoked tokens.</returns>
     Public Function RevokeSubject(subject As String) As Integer
         Dim result = Request(HttpMethod.Delete, $"/subjects/{subject}/tokens", Nothing)
 
         If result.Status <> 200 Then
-            Throw New InvalidOperationException($"массовый отзыв не удался: {result.Status}")
+            Throw New InvalidOperationException($"bulk revoke failed: {result.Status}")
         End If
 
         Using document = JsonDocument.Parse(result.Body)
@@ -195,21 +157,21 @@ Public Class JwtServiceClient
 
 End Class
 
-''' <summary>Демонстрирует полный жизненный цикл токена.</summary>
+''' <summary>Issue -> refresh -> revoke.</summary>
 Module Program
-    ''' <summary>Точка входа.</summary>
+    ''' <summary>Entry point.</summary>
     Sub Main()
         Dim client = JwtServiceClient.FromEnv()
 
         Dim issued = client.IssueToken("svc-a", "svc-b", withRefresh:=True,
                                        claimsJson:="{""role"":""admin""}")
-        Console.WriteLine($"выпущен: {issued}")
+        Console.WriteLine($"issued: {issued}")
 
         Using document = JsonDocument.Parse(issued)
             Dim refreshToken = document.RootElement.GetProperty("refresh_token").GetString()
-            Console.WriteLine($"обновлён: {client.RefreshTokens(refreshToken)}")
+            Console.WriteLine($"refreshed: {client.RefreshTokens(refreshToken)}")
         End Using
 
-        Console.WriteLine($"отозвано токенов: {client.RevokeSubject("svc-a")}")
+        Console.WriteLine($"revoked: {client.RevokeSubject("svc-a")}")
     End Sub
 End Module

@@ -1,52 +1,30 @@
 #!/usr/bin/env bash
 #
-# Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+# jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 #
-# Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-# токена и массовый отзыв токенов субъекта.
-#
-# Зависимости: oathtool (пакет oath-toolkit), curl, jq.
-#
-# Окружение:
-#   AUTH_TOTP_SECRET — общий TOTP-секрет в base32 (обязательно);
-#   JWT_SERVICE_URL  — базовый URL сервиса, по умолчанию http://localhost:8080.
-#
-# ВАЖНО: код считается заново перед каждым запросом (см. функцию totp_code).
-# При включённой на сервере защите от переигрывания (AUTH_TOTP_REPLAY_PROTECTION)
-# повторное предъявление того же кода вернёт 401, хотя сам код ещё не истёк.
+# Install: oathtool (oath-toolkit), curl, jq.
+# Env: AUTH_TOTP_SECRET (base32), JWT_SERVICE_URL (default http://localhost:8080).
+# See README.md for endpoints, error codes and client rules.
 
 set -euo pipefail
 
-: "${AUTH_TOTP_SECRET:?нужен AUTH_TOTP_SECRET}"
+: "${AUTH_TOTP_SECRET:?AUTH_TOTP_SECRET is required}"
 SERVICE="${JWT_SERVICE_URL:-http://localhost:8080}"
 
-# Значение claim iss. Должно совпадать при выпуске и проверке токена.
+# Sent as the Host header, becomes the iss claim.
 ISSUER_HOST="example.com"
 
-# Вычисляет TOTP-код на текущий момент.
-#
-# Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-#
-# Вывод: код из шести десятичных знаков.
+# Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 totp_code() {
   oathtool --totp --base32 "$AUTH_TOTP_SECRET"
 }
 
-# Выпускает access-токен (POST /tokens).
+# POST /tokens
 #
-# Аргументы:
-#   $1 — субъект (claim sub);
-#   $2 — получатель (claim aud);
-#   $3 — "true", чтобы запросить refresh-токен (по умолчанию false);
-#   $4 — JSON-объект с произвольными claims (по умолчанию пусто).
+# $1 sub, $2 aud, $3 "true" to also get a refresh token, $4 custom claims as a
+# JSON object.
 #
-# Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
-# имена (iss, sub, aud, exp, iat, nbf, jti) переопределять нельзя — будет 422.
-# Число ключей и объём ограничены на сервере.
-#
-# Вывод: JSON вида {"token":"...","refresh_token":"..."}.
-# Код возврата: ненулевой при 401 (неверный код), 422 (параметры или запрещённый
-# claim), 500 (JWKS/Redis).
+# Prints {"token":"...","refresh_token":"..."}.
 issue_token() {
   local sub="$1" aud="$2" with_refresh="${3:-false}" claims="${4:-}"
 
@@ -62,19 +40,9 @@ issue_token() {
     -d "$body"
 }
 
-# Обменивает refresh-токен на новую пару (POST /tokens/refresh).
+# POST /tokens/refresh — prints a new pair; the old refresh token is dead.
 #
-# Старый токен после обмена недействителен: сохраните новый и выбросьте
-# предыдущий.
-#
-# ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-# предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-# выданные по ним access-токены. Надёжнее выпустить пару заново.
-#
-# Аргументы:
-#   $1 — refresh-токен из выпуска или прошлого обмена.
-# Вывод: JSON с новой парой.
-# Код возврата: ненулевой при 401 (токен неизвестен, истёк или уже использован).
+# $1 refresh token from an issue or a previous refresh.
 refresh_tokens() {
   local refresh_token="$1"
 
@@ -86,13 +54,9 @@ refresh_tokens() {
     -d "{\"refresh_token\":\"$refresh_token\"}"
 }
 
-# Отзывает один токен по его jti (DELETE /tokens/{jti}).
+# DELETE /tokens/{jti} — idempotent.
 #
-# Идемпотентно: отзыв несуществующего jti — тоже успех (204).
-#
-# Аргументы:
-#   $1 — идентификатор токена из claim jti.
-# Код возврата: ненулевой при 500 — хранилище недоступно, отзыв НЕ выполнен.
+# $1 token id from the jti claim.
 revoke_token() {
   local jti="$1"
 
@@ -102,14 +66,9 @@ revoke_token() {
     -H "Host: $ISSUER_HOST"
 }
 
-# Отзывает все активные токены субъекта (DELETE /subjects/{sub}/tokens).
+# DELETE /subjects/{sub}/tokens — prints {"revoked":N}.
 #
-# Нужен при компрометации: гасить токены по одному нельзя, их jti вызывающему
-# неизвестны.
-#
-# Аргументы:
-#   $1 — субъект, чьи токены гасятся.
-# Вывод: JSON вида {"revoked":N}; истёкшие токены не считаются.
+# $1 subject whose tokens are revoked.
 revoke_subject() {
   local sub="$1"
 
@@ -119,18 +78,18 @@ revoke_subject() {
     -H "Host: $ISSUER_HOST"
 }
 
-# Демонстрация полного жизненного цикла токена.
+# Issue -> refresh -> revoke.
 main() {
   local issued refresh_token refreshed
 
   issued="$(issue_token svc-a svc-b true '{"role":"admin"}')"
-  echo "выпущен: $(jq -r '.token[:32]' <<<"$issued")..."
+  echo "issued: $(jq -r '.token[:32]' <<<"$issued")..."
 
   refresh_token="$(jq -r '.refresh_token' <<<"$issued")"
   refreshed="$(refresh_tokens "$refresh_token")"
-  echo "обновлён: $(jq -r '.token[:32]' <<<"$refreshed")..."
+  echo "refreshed: $(jq -r '.token[:32]' <<<"$refreshed")..."
 
-  echo "отозвано токенов: $(revoke_subject svc-a | jq -r '.revoked')"
+  echo "revoked: $(revoke_subject svc-a | jq -r '.revoked')"
 }
 
 main "$@"

@@ -1,20 +1,11 @@
-/// Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+/// jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 ///
-/// Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-/// токена и массовый отзыв токенов субъекта.
+/// TOTP is computed with .NET HMACSHA1, no external packages needed.
 ///
-/// TOTP считается через HMACSHA1 из .NET, внешних пакетов не требуется.
+/// Env: `AUTH_TOTP_SECRET` (raw UTF-8 bytes here, see README.md),
+/// `JWT_SERVICE_URL` (default `http://localhost:8080`).
 ///
-/// Окружение:
-/// - `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
-/// - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
-///
-/// Пример трактует секрет как сырые байты (UTF-8); для совместимости с Google
-/// Authenticator добавьте декодер base32.
-///
-/// **Код считается заново перед каждым запросом.** При включённой на сервере
-/// защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное
-/// предъявление того же кода вернёт `401`, хотя сам код ещё не истёк.
+/// See README.md for endpoints, error codes and client rules.
 module JwtServiceClient
 
 open System
@@ -23,10 +14,10 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 
-/// Значение claim `iss`. Должно совпадать при выпуске и проверке токена.
+/// Sent as the Host header, becomes the `iss` claim.
 let issuerHost = "example.com"
 
-/// Базовый URL сервиса из окружения.
+/// Service base URL from the environment.
 let serviceUrl =
     match Environment.GetEnvironmentVariable "JWT_SERVICE_URL" with
     | null | "" -> "http://localhost:8080"
@@ -34,12 +25,9 @@ let serviceUrl =
 
 let private http = new HttpClient()
 
-/// Вычисляет TOTP-код на текущий момент.
+/// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 ///
-/// Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-/// Усечение — по RFC 4226 §5.3.
-///
-/// Возвращает код из шести десятичных знаков.
+/// Truncation follows RFC 4226 section 5.3.
 let totpCode () : string =
     let secret = Encoding.UTF8.GetBytes(Environment.GetEnvironmentVariable "AUTH_TOTP_SECRET")
     let counter = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 30L
@@ -59,15 +47,12 @@ let totpCode () : string =
 
     sprintf "%06d" (code % 1000000)
 
-/// Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+/// Sends a level 3 request with a code computed right before the call.
 ///
-/// `method` — HTTP-метод, `path` — путь ручки, `body` — тело запроса либо `None`.
-///
-/// Возвращает пару из HTTP-кода и тела ответа.
+/// Returns the HTTP status and the response body.
 let request (method: HttpMethod) (path: string) (body: string option) : int * string =
     use message = new HttpRequestMessage(method, serviceUrl + path)
 
-    // Код считается здесь, а не переиспользуется: один код — один запрос.
     message.Headers.Add("X-TOTP-Code", totpCode ())
     message.Headers.Host <- issuerHost
 
@@ -80,19 +65,9 @@ let request (method: HttpMethod) (path: string) (body: string option) : int * st
 
     int response.StatusCode, text
 
-/// Выпускает access-токен (`POST /tokens`).
+/// `POST /tokens`
 ///
-/// `sub` — субъект (claim `sub`), `aud` — получатель (claim `aud`),
-/// `withRefresh` — запросить refresh-токен для продления сессии,
-/// `claimsJson` — произвольные claims JSON-объектом (например `{"role":"admin"}`)
-/// либо `None`.
-///
-/// Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
-/// имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
-/// сервис ответит `422`.
-///
-/// Ошибки: `401` — неверный код, `422` — некорректные параметры или запрещённый
-/// claim, `500` — недоступны JWKS или Redis.
+/// `claimsJson` carries custom claims as a JSON object, or `None`.
 let issueToken (sub: string) (aud: string) (withRefresh: bool) (claimsJson: string option) : string =
     let claimsPart =
         claimsJson |> Option.map (sprintf ",\"claims\":%s") |> Option.defaultValue ""
@@ -102,54 +77,38 @@ let issueToken (sub: string) (aud: string) (withRefresh: bool) (claimsJson: stri
 
     match request HttpMethod.Post "/tokens" (Some body) with
     | 200, text -> text
-    | status, _ -> failwithf "выпуск не удался: %d" status
+    | status, _ -> failwithf "issue failed: %d" status
 
-/// Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
-///
-/// Старый токен после обмена недействителен: сохраните новый и выбросьте
-/// предыдущий.
-///
-/// **Внимание:** не повторяйте обмен старым токеном при потере ответа. Повторное
-/// предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-/// выданные по ним access-токены. Надёжнее выпустить пару заново.
-///
-/// Ошибка `401` означает, что токен неизвестен, истёк или уже использован.
+/// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
+/// once the call succeeds.
 let refreshTokens (refreshToken: string) : string =
     let body = sprintf """{"refresh_token":"%s"}""" refreshToken
 
     match request HttpMethod.Post "/tokens/refresh" (Some body) with
     | 200, text -> text
-    | status, _ -> failwithf "обмен не удался: %d" status
+    | status, _ -> failwithf "refresh failed: %d" status
 
-/// Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
-///
-/// Идемпотентно: отзыв несуществующего `jti` — тоже успех. Ошибка `500` означает,
-/// что хранилище недоступно и отзыв **не выполнен**: попытку следует повторить.
+/// `DELETE /tokens/{jti}` — idempotent.
 let revokeToken (jti: string) : unit =
     match request HttpMethod.Delete (sprintf "/tokens/%s" jti) None with
     | 204, _ -> ()
-    | status, _ -> failwithf "отзыв не удался: %d" status
+    | status, _ -> failwithf "revoke failed: %d" status
 
-/// Отзывает все активные токены субъекта.
-///
-/// Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить токены
-/// по одному нельзя, их `jti` вызывающему неизвестны.
-///
-/// Возвращает число отозванных токенов; истёкшие не считаются.
+/// `DELETE /subjects/{sub}/tokens` — returns the number of revoked tokens.
 let revokeSubject (sub: string) : int =
     match request HttpMethod.Delete (sprintf "/subjects/%s/tokens" sub) None with
     | 200, text ->
         use document = JsonDocument.Parse text
         document.RootElement.GetProperty("revoked").GetInt32()
-    | status, _ -> failwithf "массовый отзыв не удался: %d" status
+    | status, _ -> failwithf "bulk revoke failed: %d" status
 
-// Демонстрация полного жизненного цикла токена.
+// Issue -> refresh -> revoke.
 let issued = issueToken "svc-a" "svc-b" true (Some """{"role":"admin"}""")
-printfn "выпущен: %s" issued
+printfn "issued: %s" issued
 
-// В боевом коде разберите JSON и достаньте refresh_token.
+// Real code should parse the JSON and take refresh_token from it.
 use issuedDocument = JsonDocument.Parse issued
 let refreshToken = issuedDocument.RootElement.GetProperty("refresh_token").GetString()
 
-printfn "обновлён: %s" (refreshTokens refreshToken)
-printfn "отозвано токенов: %d" (revokeSubject "svc-a")
+printfn "refreshed: %s" (refreshTokens refreshToken)
+printfn "revoked: %d" (revokeSubject "svc-a")

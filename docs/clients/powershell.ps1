@@ -1,44 +1,35 @@
 <#
 .SYNOPSIS
-    Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+    jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 
 .DESCRIPTION
-    Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-    токена и массовый отзыв токенов субъекта.
+    TOTP is computed with .NET HMACSHA1, no extra modules needed.
 
-    TOTP считается через HMACSHA1 из .NET, дополнительных модулей не требуется.
-
-    Переменные окружения:
-    - AUTH_TOTP_SECRET — общий TOTP-секрет (см. примечание о base32);
-    - JWT_SERVICE_URL  — базовый URL, по умолчанию http://localhost:8080.
-
-    Пример трактует секрет как сырые байты (UTF-8); для совместимости с Google
-    Authenticator добавьте декодер base32.
+    Env:
+    - AUTH_TOTP_SECRET — shared TOTP secret (raw UTF-8 bytes here, see README.md);
+    - JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
 
 .NOTES
-    Код считается ЗАНОВО перед каждым запросом. При включённой на сервере защите
-    от переигрывания (AUTH_TOTP_REPLAY_PROTECTION) повторное предъявление того же
-    кода вернёт 401, хотя сам код ещё не истёк.
+    See README.md for endpoints, error codes and client rules.
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Значение claim iss. Должно совпадать при выпуске и проверке токена.
+# Sent as the Host header, becomes the iss claim.
 $script:IssuerHost = 'example.com'
 $script:Service = if ($env:JWT_SERVICE_URL) { $env:JWT_SERVICE_URL } else { 'http://localhost:8080' }
 
 function Get-TotpCode {
     <#
     .SYNOPSIS
-        Вычисляет TOTP-код на текущий момент.
+        Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 
     .DESCRIPTION
-        Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-        Усечение — по RFC 4226 §5.3.
+        Truncation follows RFC 4226 section 5.3.
 
     .OUTPUTS
-        System.String. Код из шести десятичных знаков.
+        System.String. Six decimal digits.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -65,19 +56,19 @@ function Get-TotpCode {
 function Invoke-LevelThreeRequest {
     <#
     .SYNOPSIS
-        Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+        Sends a level 3 request with a code computed right before the call.
 
     .PARAMETER Method
-        HTTP-метод.
+        HTTP method.
 
     .PARAMETER Path
-        Путь ручки, начиная со слеша.
+        Endpoint path.
 
     .PARAMETER Body
-        Хеш-таблица с телом запроса либо $null, если тела нет.
+        Request body hashtable, or $null.
 
     .OUTPUTS
-        Разобранный ответ сервиса.
+        The parsed service reply.
     #>
     [CmdletBinding()]
     param(
@@ -87,7 +78,6 @@ function Invoke-LevelThreeRequest {
     )
 
     $headers = @{
-        # Код считается здесь, а не переиспользуется: один код — один запрос.
         'X-TOTP-Code' = Get-TotpCode
         'Host'        = $script:IssuerHost
     }
@@ -109,29 +99,22 @@ function Invoke-LevelThreeRequest {
 function New-ServiceToken {
     <#
     .SYNOPSIS
-        Выпускает access-токен (POST /tokens).
+        POST /tokens
 
     .PARAMETER Subject
-        Субъект, которому выдаётся токен (claim sub).
+        Subject.
 
     .PARAMETER Audience
-        Список получателей (claim aud); не должен быть пустым.
+        Audience.
 
     .PARAMETER WithRefresh
-        Запросить refresh-токен для продления сессии.
+        Also ask for a refresh token.
 
     .PARAMETER Claims
-        Хеш-таблица произвольных claims (роли, scope, tenant): попадают в payload
-        рядом с зарегистрированными. Служебные имена (iss, sub, aud, exp, iat,
-        nbf, jti) переопределять нельзя — сервис ответит 422. Число ключей и
-        объём ограничены на сервере.
+        Hashtable of custom claims.
 
     .OUTPUTS
-        Объект с полями token и, если запрашивался, refresh_token.
-
-    .NOTES
-        Ошибки: 401 — неверный TOTP-код, 422 — некорректные параметры или
-        запрещённый claim, 500 — недоступны JWKS или Redis.
+        Object with token and, if requested, refresh_token.
     #>
     [CmdletBinding()]
     param(
@@ -155,24 +138,16 @@ function New-ServiceToken {
 function Update-ServiceToken {
     <#
     .SYNOPSIS
-        Обменивает refresh-токен на новую пару (POST /tokens/refresh).
+        POST /tokens/refresh
 
     .DESCRIPTION
-        Старый токен после обмена недействителен: сохраните новый и выбросьте
-        предыдущий.
+        Returns a new pair; the old refresh token is dead once the call succeeds.
 
     .PARAMETER RefreshToken
-        Токен, полученный при выпуске или прошлом обмене.
+        Token from an issue or a previous refresh.
 
     .OUTPUTS
-        Объект с новой парой token и refresh_token.
-
-    .NOTES
-        ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-        предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-        выданные по ним access-токены. Надёжнее выпустить пару заново.
-
-        Ошибка 401 означает, что токен неизвестен, истёк или уже использован.
+        Object with the new token and refresh_token.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RefreshToken)
@@ -185,17 +160,13 @@ function Update-ServiceToken {
 function Remove-ServiceToken {
     <#
     .SYNOPSIS
-        Отзывает один токен по его jti (DELETE /tokens/{jti}).
+        DELETE /tokens/{jti}
 
     .DESCRIPTION
-        Идемпотентно: отзыв несуществующего jti — тоже успех.
+        Idempotent.
 
     .PARAMETER Jti
-        Идентификатор токена из claim jti.
-
-    .NOTES
-        Ошибка 500 означает, что хранилище недоступно и отзыв НЕ выполнен:
-        попытку следует повторить.
+        Token id from the jti claim.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Jti)
@@ -206,17 +177,13 @@ function Remove-ServiceToken {
 function Remove-SubjectTokens {
     <#
     .SYNOPSIS
-        Отзывает все активные токены субъекта.
-
-    .DESCRIPTION
-        Ручка DELETE /subjects/{sub}/tokens. Нужна при компрометации: гасить
-        токены по одному нельзя, их jti вызывающему неизвестны.
+        DELETE /subjects/{sub}/tokens
 
     .PARAMETER Subject
-        Субъект, чьи токены гасятся.
+        Subject whose tokens are revoked.
 
     .OUTPUTS
-        System.Int32. Число отозванных токенов; истёкшие не считаются.
+        System.Int32. Number of revoked tokens.
     #>
     [CmdletBinding()]
     [OutputType([int])]
@@ -226,11 +193,11 @@ function Remove-SubjectTokens {
     return $response.revoked
 }
 
-# Демонстрация полного жизненного цикла токена.
+# Issue -> refresh -> revoke.
 $issued = New-ServiceToken -Subject 'svc-a' -Audience 'svc-b' -WithRefresh -Claims @{ role = 'admin' }
-Write-Host "выпущен: $($issued.token.Substring(0, 32))..."
+Write-Host "issued: $($issued.token.Substring(0, 32))..."
 
 $refreshed = Update-ServiceToken -RefreshToken $issued.refresh_token
-Write-Host "обновлён: $($refreshed.token.Substring(0, 32))..."
+Write-Host "refreshed: $($refreshed.token.Substring(0, 32))..."
 
-Write-Host "отозвано токенов: $(Remove-SubjectTokens -Subject 'svc-a')"
+Write-Host "revoked: $(Remove-SubjectTokens -Subject 'svc-a')"

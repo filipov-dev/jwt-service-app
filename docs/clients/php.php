@@ -1,19 +1,10 @@
 <?php
 /**
- * Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
- *
- * Зависимости: composer require spomky-labs/otphp
- *
- * Окружение:
- * - AUTH_TOTP_SECRET — общий TOTP-секрет в base32 (обязательно);
- * - JWT_SERVICE_URL — базовый URL сервиса, по умолчанию http://localhost:8080.
- *
- * ВАЖНО: код считается заново перед каждым запросом. При включённой на сервере
- * защите от переигрывания (AUTH_TOTP_REPLAY_PROTECTION) повторное предъявление
- * того же кода вернёт 401, хотя сам код ещё не истёк.
+ * Install: composer require spomky-labs/otphp
+ * Env: AUTH_TOTP_SECRET (base32), JWT_SERVICE_URL (default http://localhost:8080).
+ * See README.md for endpoints, error codes and client rules.
  *
  * @package JwtServiceClient
  */
@@ -25,18 +16,18 @@ require __DIR__ . '/vendor/autoload.php';
 use OTPHP\TOTP;
 
 /**
- * Клиент сервиса выдачи токенов.
+ * Client of the token service.
  */
 final class JwtServiceClient
 {
     /**
-     * Значение claim `iss`. Должно совпадать при выпуске и проверке токена.
+     * Sent as the Host header, becomes the `iss` claim.
      */
     private const ISSUER_HOST = 'example.com';
 
     /**
-     * @param string $baseUrl Базовый URL сервиса.
-     * @param string $secret  Общий TOTP-секрет в base32.
+     * @param string $baseUrl Service base URL.
+     * @param string $secret  Shared TOTP secret, base32.
      */
     public function __construct(
         private readonly string $baseUrl,
@@ -45,7 +36,7 @@ final class JwtServiceClient
     }
 
     /**
-     * Собирает клиент из переменных окружения.
+     * Builds a client from the environment.
      *
      * @return self
      */
@@ -53,16 +44,14 @@ final class JwtServiceClient
     {
         return new self(
             getenv('JWT_SERVICE_URL') ?: 'http://localhost:8080',
-            getenv('AUTH_TOTP_SECRET') ?: throw new RuntimeException('нужен AUTH_TOTP_SECRET'),
+            getenv('AUTH_TOTP_SECRET') ?: throw new RuntimeException('AUTH_TOTP_SECRET is required'),
         );
     }
 
     /**
-     * Вычисляет TOTP-код на текущий момент.
+     * Fresh TOTP code: SHA-1, 6 digits, 30-second step.
      *
-     * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-     *
-     * @return string Код из шести десятичных знаков.
+     * @return string
      */
     private function totpCode(): string
     {
@@ -70,13 +59,13 @@ final class JwtServiceClient
     }
 
     /**
-     * Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+     * Sends a level 3 request with a code computed right before the call.
      *
-     * @param string            $method HTTP-метод.
-     * @param string            $path   Путь ручки, начиная со слеша.
-     * @param array<mixed>|null $body   Тело запроса либо null, если тела нет.
+     * @param string            $method HTTP method.
+     * @param string            $path   Endpoint path.
+     * @param array<mixed>|null $body   Request body, if any.
      *
-     * @return array{status:int, body:string} Код ответа и его тело.
+     * @return array{status:int, body:string}
      */
     private function request(string $method, string $path, ?array $body = null): array
     {
@@ -102,21 +91,14 @@ final class JwtServiceClient
     }
 
     /**
-     * Выпускает access-токен (POST /tokens).
+     * POST /tokens
      *
-     * @param string             $sub         Субъект, которому выдаётся токен.
-     * @param list<string>       $aud         Список получателей; не пустой.
-     * @param bool               $withRefresh Запросить refresh для продления сессии.
-     * @param array<string,mixed> $claims     Произвольные claims (роли, scope,
-     *                                        tenant): попадают в payload рядом с
-     *                                        зарегистрированными. Служебные имена
-     *                                        (iss, sub, aud, exp, iat, nbf, jti)
-     *                                        переопределять нельзя — будет 422.
+     * @param string              $sub
+     * @param list<string>        $aud
+     * @param bool                $withRefresh
+     * @param array<string,mixed> $claims
      *
-     * @return array{token:string, refresh_token?:string} Выпущенный токен.
-     *
-     * @throws RuntimeException 401 — неверный код, 422 — параметры или
-     *                          запрещённый claim, 500 — JWKS/Redis.
+     * @return array{token:string, refresh_token?:string}
      */
     public function issueToken(
         string $sub,
@@ -132,27 +114,18 @@ final class JwtServiceClient
         $response = $this->request('POST', '/tokens', $body);
 
         if ($response['status'] !== 200) {
-            throw new RuntimeException("выпуск не удался: {$response['status']}");
+            throw new RuntimeException("issue failed: {$response['status']}");
         }
 
         return json_decode($response['body'], true, 512, JSON_THROW_ON_ERROR);
     }
 
     /**
-     * Обменивает refresh-токен на новую пару (POST /tokens/refresh).
+     * POST /tokens/refresh — returns a new pair; the old refresh token is dead.
      *
-     * Старый токен после обмена недействителен: сохраните новый и выбросьте
-     * предыдущий.
+     * @param string $refreshToken
      *
-     * ВНИМАНИЕ: не повторяйте обмен старым токеном при потере ответа. Повторное
-     * предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-     * выданные по ним access-токены. Надёжнее выпустить пару заново.
-     *
-     * @param string $refreshToken Токен из выпуска или прошлого обмена.
-     *
-     * @return array{token:string, refresh_token:string} Новая пара.
-     *
-     * @throws RuntimeException 401 — токен неизвестен, истёк или уже использован.
+     * @return array{token:string, refresh_token:string}
      */
     public function refreshTokens(string $refreshToken): array
     {
@@ -161,48 +134,39 @@ final class JwtServiceClient
         ]);
 
         if ($response['status'] !== 200) {
-            throw new RuntimeException("обмен не удался: {$response['status']}");
+            throw new RuntimeException("refresh failed: {$response['status']}");
         }
 
         return json_decode($response['body'], true, 512, JSON_THROW_ON_ERROR);
     }
 
     /**
-     * Отзывает один токен по его jti (DELETE /tokens/{jti}).
+     * DELETE /tokens/{jti} — idempotent.
      *
-     * Идемпотентно: отзыв несуществующего jti — тоже успех.
-     *
-     * @param string $jti Идентификатор токена из claim jti.
-     *
-     * @throws RuntimeException 500 — хранилище недоступно, отзыв НЕ выполнен.
+     * @param string $jti
      */
     public function revokeToken(string $jti): void
     {
         $response = $this->request('DELETE', "/tokens/{$jti}");
 
         if ($response['status'] !== 204) {
-            throw new RuntimeException("отзыв не удался: {$response['status']}");
+            throw new RuntimeException("revoke failed: {$response['status']}");
         }
     }
 
     /**
-     * Отзывает все активные токены субъекта.
+     * DELETE /subjects/{sub}/tokens
      *
-     * Ручка DELETE /subjects/{sub}/tokens. Нужна при компрометации: гасить токены
-     * по одному нельзя, их jti вызывающему неизвестны.
+     * @param string $sub
      *
-     * @param string $sub Субъект, чьи токены гасятся.
-     *
-     * @return int Число отозванных токенов; истёкшие не считаются.
-     *
-     * @throws RuntimeException 500 — хранилище недоступно, отзыв не выполнен.
+     * @return int Number of revoked tokens.
      */
     public function revokeSubject(string $sub): int
     {
         $response = $this->request('DELETE', "/subjects/{$sub}/tokens");
 
         if ($response['status'] !== 200) {
-            throw new RuntimeException("массовый отзыв не удался: {$response['status']}");
+            throw new RuntimeException("bulk revoke failed: {$response['status']}");
         }
 
         return json_decode($response['body'], true, 512, JSON_THROW_ON_ERROR)['revoked'];
@@ -212,9 +176,9 @@ final class JwtServiceClient
 $client = JwtServiceClient::fromEnv();
 
 $issued = $client->issueToken('svc-a', ['svc-b'], true, ['role' => 'admin']);
-echo 'выпущен: ', substr($issued['token'], 0, 32), "...\n";
+echo 'issued: ', substr($issued['token'], 0, 32), "...\n";
 
 $refreshed = $client->refreshTokens($issued['refresh_token']);
-echo 'обновлён: ', substr($refreshed['token'], 0, 32), "...\n";
+echo 'refreshed: ', substr($refreshed['token'], 0, 32), "...\n";
 
-echo 'отозвано токенов: ', $client->revokeSubject('svc-a'), "\n";
+echo 'revoked: ', $client->revokeSubject('svc-a'), "\n";

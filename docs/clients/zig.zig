@@ -1,40 +1,29 @@
-//! Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+//! jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 //!
-//! Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-//! токена и массовый отзыв токенов субъекта.
+//! Dependencies: standard library only (`std.crypto`, `std.http`).
 //!
-//! Зависимости: только стандартная библиотека (`std.crypto`, `std.http`).
+//! Env: `AUTH_TOTP_SECRET` (raw bytes here, see README.md), `JWT_SERVICE_URL`
+//! (default `http://localhost:8080`).
 //!
-//! Окружение:
-//! - `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
-//! - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
-//!
-//! Пример трактует секрет как сырые байты; для совместимости с Google
-//! Authenticator добавьте декодер base32.
-//!
-//! **Код считается заново перед каждым запросом.** При включённой на сервере
-//! защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное
-//! предъявление того же кода вернёт `401`, хотя сам код ещё не истёк.
+//! See README.md for endpoints, error codes and client rules.
 
 const std = @import("std");
 
-/// Значение claim `iss`. Должно совпадать при выпуске и проверке токена.
+/// Sent as the Host header, becomes the `iss` claim.
 const issuer_host = "example.com";
 
-/// Ошибки клиента.
+/// Client errors.
 const ClientError = error{
-    /// Сервис ответил неожиданным кодом.
+    /// The service replied with an unexpected status.
     UnexpectedStatus,
-    /// Не задана обязательная переменная окружения.
+    /// A required environment variable is missing.
     MissingEnv,
 };
 
-/// Вычисляет TOTP-код на текущий момент.
+/// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 ///
-/// Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-/// Усечение — по RFC 4226 §5.3.
-///
-/// Результат пишется в `out` (ровно 6 байт) и возвращается срезом.
+/// Truncation follows RFC 4226 section 5.3. The code is written into `out`
+/// (exactly 6 bytes) and returned as a slice.
 fn totpCode(secret: []const u8, out: *[6]u8) []const u8 {
     const counter: u64 = @intCast(@divFloor(std.time.timestamp(), 30));
 
@@ -54,10 +43,10 @@ fn totpCode(secret: []const u8, out: *[6]u8) []const u8 {
     return out;
 }
 
-/// Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+/// Sends a level 3 request with a code computed right before the call.
 ///
-/// `body` — тело запроса либо `null` для запросов без него (отзыв).
-/// Возвращает HTTP-код ответа; тело пишется в `response_buffer`.
+/// `body` is `null` for requests without one. Returns the HTTP status; the
+/// response body is written into `response_buffer`.
 fn request(
     allocator: std.mem.Allocator,
     method: std.http.Method,
@@ -71,7 +60,6 @@ fn request(
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ service, path });
     defer allocator.free(url);
 
-    // Код считается здесь, а не переиспользуется: один код — один запрос.
     var code_buffer: [6]u8 = undefined;
     const code = totpCode(secret, &code_buffer);
 
@@ -93,19 +81,9 @@ fn request(
     return @intFromEnum(result.status);
 }
 
-/// Выпускает access-токен (`POST /tokens`).
+/// `POST /tokens`
 ///
-/// `sub` — субъект (claim `sub`), `aud` — получатель (claim `aud`),
-/// `with_refresh` — запросить refresh-токен для продления сессии,
-/// `claims_json` — произвольные claims JSON-объектом (например
-/// `{"role":"admin"}`) либо `null`.
-///
-/// Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
-/// имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
-/// сервис ответит `422`.
-///
-/// Ошибки: `401` — неверный код, `422` — некорректные параметры или запрещённый
-/// claim, `500` — недоступны JWKS или Redis.
+/// `claims_json` carries custom claims as a JSON object, or `null`.
 pub fn issueToken(
     allocator: std.mem.Allocator,
     sub: []const u8,
@@ -131,16 +109,8 @@ pub fn issueToken(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
-///
-/// Старый токен после обмена недействителен: сохраните новый и выбросьте
-/// предыдущий.
-///
-/// **Внимание:** не повторяйте обмен старым токеном при потере ответа. Повторное
-/// предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-/// выданные по ним access-токены. Надёжнее выпустить пару заново.
-///
-/// Ошибка при `401`: токен неизвестен, истёк или уже использован.
+/// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
+/// once the call succeeds.
 pub fn refreshTokens(
     allocator: std.mem.Allocator,
     refresh_token: []const u8,
@@ -157,10 +127,7 @@ pub fn refreshTokens(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
-///
-/// Идемпотентно: отзыв несуществующего `jti` — тоже успех. Ошибка при `500`
-/// означает, что хранилище недоступно и отзыв **не выполнен**.
+/// `DELETE /tokens/{jti}` — idempotent.
 pub fn revokeToken(
     allocator: std.mem.Allocator,
     jti: []const u8,
@@ -173,11 +140,7 @@ pub fn revokeToken(
     if (status != 204) return ClientError.UnexpectedStatus;
 }
 
-/// Отзывает все активные токены субъекта.
-///
-/// Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить токены
-/// по одному нельзя, их `jti` вызывающему неизвестны. В теле ответа — поле
-/// `revoked`; истёкшие токены не считаются.
+/// `DELETE /subjects/{sub}/tokens` — the reply carries a `revoked` field.
 pub fn revokeSubject(
     allocator: std.mem.Allocator,
     sub: []const u8,
@@ -190,7 +153,7 @@ pub fn revokeSubject(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// Демонстрирует полный жизненный цикл токена.
+/// Issue -> refresh -> revoke.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -200,10 +163,10 @@ pub fn main() !void {
     defer response.deinit();
 
     try issueToken(allocator, "svc-a", "svc-b", true, "{\"role\":\"admin\"}", &response);
-    std.debug.print("выпущен: {s}\n", .{response.items});
+    std.debug.print("issued: {s}\n", .{response.items});
 
-    // В боевом коде разберите JSON через std.json и достаньте refresh_token.
+    // Real code should parse the JSON with std.json and take refresh_token.
     response.clearRetainingCapacity();
     try revokeSubject(allocator, "svc-a", &response);
-    std.debug.print("массовый отзыв: {s}\n", .{response.items});
+    std.debug.print("bulk revoke: {s}\n", .{response.items});
 }

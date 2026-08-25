@@ -2,7 +2,7 @@
 
 =head1 NAME
 
-jwt-service-client — клиент jwt-service-app для эндпоинтов уровня 3 (TOTP)
+jwt-service-client — jwt-service-app level 3 (TOTP) client
 
 =head1 SYNOPSIS
 
@@ -12,30 +12,15 @@ jwt-service-client — клиент jwt-service-app для эндпоинтов 
 
 =head1 DESCRIPTION
 
-Покрывает все четыре ручки уровня 3: выпуск токена, обмен refresh-токена, отзыв
-одного токена и массовый отзыв токенов субъекта.
+Issue, refresh and revoke tokens over the four level 3 endpoints.
 
-Зависимости: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>, C<JSON::PP>.
+Dependencies: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>,
+C<JSON::PP>.
 
-=head2 Окружение
+Env: C<AUTH_TOTP_SECRET> (base32), C<JWT_SERVICE_URL> (default
+C<http://localhost:8080>).
 
-=over 4
-
-=item C<AUTH_TOTP_SECRET>
-
-Общий TOTP-секрет в base32 (обязательно).
-
-=item C<JWT_SERVICE_URL>
-
-Базовый URL сервиса, по умолчанию C<http://localhost:8080>.
-
-=back
-
-=head2 Один код — один запрос
-
-Код считается B<заново перед каждым запросом>. При включённой на сервере защите
-от переигрывания (C<AUTH_TOTP_REPLAY_PROTECTION>) повторное предъявление того же
-кода вернёт C<401>, хотя сам код ещё не истёк.
+See README.md for endpoints, error codes and client rules.
 
 =cut
 
@@ -48,7 +33,7 @@ use HTTP::Request;
 use JSON::PP qw(encode_json decode_json);
 use LWP::UserAgent;
 
-# Значение claim iss. Должно совпадать при выпуске и проверке токена.
+# Sent as the Host header, becomes the iss claim.
 my $ISSUER_HOST = 'example.com';
 
 my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
@@ -57,10 +42,7 @@ my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
 
     my $code = totp_code();
 
-Вычисляет TOTP-код на текущий момент. Параметры соответствуют дефолтам сервиса:
-SHA-1, 6 знаков, шаг 30 секунд.
-
-Возвращает строку из шести десятичных знаков.
+Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 
 =cut
 
@@ -73,12 +55,9 @@ sub totp_code {
 
     my $response = request('POST', '/tokens', { sub => 'svc-a' });
 
-Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
-
-Параметры: HTTP-метод, путь ручки (начиная со слеша) и необязательная ссылка на
-хеш с телом запроса.
-
-Возвращает объект L<HTTP::Response>.
+Sends a level 3 request with a code computed right before the call. Takes the
+HTTP method, the endpoint path and an optional body hashref; returns an
+L<HTTP::Response>.
 
 =cut
 
@@ -87,7 +66,6 @@ sub request {
 
     my $req = HTTP::Request->new($method => "$SERVICE$path");
 
-    # Код считается здесь, а не переиспользуется: один код — один запрос.
     $req->header('X-TOTP-Code'  => totp_code());
     $req->header('Host'         => $ISSUER_HOST);
     $req->header('Content-Type' => 'application/json');
@@ -100,21 +78,8 @@ sub request {
 
     my $issued = issue_token($sub, $aud, $with_refresh, { role => 'admin' });
 
-Выпускает access-токен (C<POST /tokens>).
-
-Параметры: субъект (claim C<sub>), получатель (claim C<aud>), признак того,
-нужен ли refresh-токен для продления сессии, и необязательная ссылка на хеш с
-произвольными claims.
-
-Произвольные claims попадают в payload рядом с зарегистрированными. Служебные
-имена (C<iss>, C<sub>, C<aud>, C<exp>, C<iat>, C<nbf>, C<jti>) переопределять
-нельзя — сервис ответит C<422>. Число ключей и объём ограничены на сервере.
-
-Возвращает ссылку на хеш с полями C<token> и, если запрашивался,
+C<POST /tokens>. Returns a hashref with C<token> and, if requested,
 C<refresh_token>.
-
-Умирает при C<401> (неверный код), C<422> (некорректные параметры) и C<500>
-(недоступны JWKS или Redis).
 
 =cut
 
@@ -130,7 +95,7 @@ sub issue_token {
 
     my $response = request('POST', '/tokens', $body);
 
-    die 'выпуск не удался: ' . $response->code unless $response->code == 200;
+    die 'issue failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content);
 }
 
@@ -138,16 +103,8 @@ sub issue_token {
 
     my $refreshed = refresh_tokens($refresh_token);
 
-Обменивает refresh-токен на новую пару (C<POST /tokens/refresh>).
-
-Старый токен после обмена недействителен: сохраните новый и выбросьте
-предыдущий.
-
-B<Внимание:> не повторяйте обмен старым токеном при потере ответа. Повторное
-предъявление трактуется как кража и гасит всю семью — и refresh-токены, и
-выданные по ним access-токены. Надёжнее выпустить пару заново.
-
-Умирает при C<401>: токен неизвестен, истёк или уже использован.
+C<POST /tokens/refresh> — returns a new pair; the old refresh token is dead once
+the call succeeds.
 
 =cut
 
@@ -158,7 +115,7 @@ sub refresh_tokens {
         refresh_token => $refresh_token,
     });
 
-    die 'обмен не удался: ' . $response->code unless $response->code == 200;
+    die 'refresh failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content);
 }
 
@@ -166,12 +123,7 @@ sub refresh_tokens {
 
     revoke_token($jti);
 
-Отзывает один токен по его C<jti> (C<DELETE /tokens/{jti}>).
-
-Идемпотентно: отзыв несуществующего C<jti> — тоже успех.
-
-Умирает при C<500>: хранилище недоступно и отзыв B<не выполнен> — попытку
-следует повторить.
+C<DELETE /tokens/{jti}> — idempotent.
 
 =cut
 
@@ -179,7 +131,7 @@ sub revoke_token {
     my ($jti) = @_;
 
     my $response = request('DELETE', "/tokens/$jti");
-    die 'отзыв не удался: ' . $response->code unless $response->code == 204;
+    die 'revoke failed: ' . $response->code unless $response->code == 204;
     return;
 }
 
@@ -187,12 +139,7 @@ sub revoke_token {
 
     my $count = revoke_subject($sub);
 
-Отзывает все активные токены субъекта (C<DELETE /subjects/{sub}/tokens>).
-
-Нужен при компрометации: гасить токены по одному нельзя, их C<jti> вызывающему
-неизвестны.
-
-Возвращает число отозванных токенов; истёкшие не считаются.
+C<DELETE /subjects/{sub}/tokens> — returns the number of revoked tokens.
 
 =cut
 
@@ -200,15 +147,15 @@ sub revoke_subject {
     my ($sub) = @_;
 
     my $response = request('DELETE', "/subjects/$sub/tokens");
-    die 'массовый отзыв не удался: ' . $response->code unless $response->code == 200;
+    die 'bulk revoke failed: ' . $response->code unless $response->code == 200;
     return decode_json($response->content)->{revoked};
 }
 
-# Демонстрация полного жизненного цикла токена.
+# Issue -> refresh -> revoke.
 my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
-printf "выпущен: %s...\n", substr($issued->{token}, 0, 32);
+printf "issued: %s...\n", substr($issued->{token}, 0, 32);
 
 my $refreshed = refresh_tokens($issued->{refresh_token});
-printf "обновлён: %s...\n", substr($refreshed->{token}, 0, 32);
+printf "refreshed: %s...\n", substr($refreshed->{token}, 0, 32);
 
-printf "отозвано токенов: %d\n", revoke_subject('svc-a');
+printf "revoked: %d\n", revoke_subject('svc-a');

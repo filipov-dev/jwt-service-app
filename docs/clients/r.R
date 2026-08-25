@@ -1,20 +1,11 @@
-#' Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP)
+#' jwt-service-app level 3 (TOTP) client: issue, refresh, revoke
 #'
-#' Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-#' токена и массовый отзыв токенов субъекта.
+#' Install: \code{install.packages(c("otp", "httr", "jsonlite"))}.
 #'
-#' Зависимости: \code{install.packages(c("otp", "httr", "jsonlite"))}.
+#' Env: \code{AUTH_TOTP_SECRET} (base32), \code{JWT_SERVICE_URL} (default
+#' \code{http://localhost:8080}).
 #'
-#' Окружение:
-#' \itemize{
-#'   \item \code{AUTH_TOTP_SECRET} — общий TOTP-секрет в base32 (обязательно);
-#'   \item \code{JWT_SERVICE_URL} — базовый URL, по умолчанию \code{http://localhost:8080}.
-#' }
-#'
-#' @section Один код — один запрос:
-#' Код считается \strong{заново перед каждым запросом}. При включённой на сервере
-#' защите от переигрывания (\code{AUTH_TOTP_REPLAY_PROTECTION}) повторное
-#' предъявление того же кода вернёт 401, хотя сам код ещё не истёк.
+#' See README.md for endpoints, error codes and client rules.
 #'
 #' @name jwt-service-client
 NULL
@@ -23,35 +14,35 @@ library(httr)
 library(jsonlite)
 library(otp)
 
-#' Значение claim iss
+#' Host header value
 #'
-#' Должно совпадать при выпуске и проверке токена.
+#' Sent as the Host header, becomes the iss claim.
 ISSUER_HOST <- "example.com"
 
-#' Базовый URL сервиса
+#' Service base URL
 #'
-#' @return Строка с URL из окружения либо значение по умолчанию.
+#' @return URL from the environment, or the default.
 service_url <- function() {
   Sys.getenv("JWT_SERVICE_URL", "http://localhost:8080")
 }
 
-#' Вычислить TOTP-код на текущий момент
+#' Fresh TOTP code
 #'
-#' Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
+#' SHA-1, 6 digits, 30-second step.
 #'
-#' @return Строка из шести десятичных знаков.
+#' @return Six decimal digits.
 totp_code <- function() {
   TOTP$new(Sys.getenv("AUTH_TOTP_SECRET"))$now()
 }
 
-#' Выполнить запрос к ручке уровня 3
+#' Send a level 3 request
 #'
-#' Подставляет свежий TOTP-код: один код — один запрос.
+#' The code is computed right before the call.
 #'
-#' @param method Функция httr: \code{POST} или \code{DELETE}.
-#' @param path Путь ручки, начиная со слеша.
-#' @param body Список с телом запроса либо \code{NULL}, если тела нет.
-#' @return Объект ответа httr.
+#' @param method httr function: \code{POST} or \code{DELETE}.
+#' @param path Endpoint path.
+#' @param body Request body list, or \code{NULL}.
+#' @return httr response object.
 do_request <- function(method, path, body = NULL) {
   headers <- add_headers("X-TOTP-Code" = totp_code(), "Host" = ISSUER_HOST)
 
@@ -62,18 +53,13 @@ do_request <- function(method, path, body = NULL) {
   }
 }
 
-#' Выпустить access-токен
+#' POST /tokens
 #'
-#' Ручка \code{POST /tokens}.
-#'
-#' @param sub Субъект, которому выдаётся токен (claim \code{sub}).
-#' @param aud Вектор получателей (claim \code{aud}); не должен быть пустым.
-#' @param with_refresh Запросить refresh-токен для продления сессии.
-#' @param claims Именованный список произвольных claims (роли, scope, tenant):
-#'   попадают в payload рядом с зарегистрированными. Служебные имена
-#'   (\code{iss}, \code{sub}, \code{aud}, \code{exp}, \code{iat},
-#'   \code{nbf}, \code{jti}) переопределять нельзя — сервис ответит 422.
-#' @return Список с полями \code{token} и, если запрашивался, \code{refresh_token}.
+#' @param sub Subject.
+#' @param aud Audience vector.
+#' @param with_refresh Also ask for a refresh token.
+#' @param claims Named list of custom claims.
+#' @return List with \code{token} and, if requested, \code{refresh_token}.
 #' @examples
 #' \dontrun{
 #' issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE,
@@ -86,73 +72,63 @@ issue_token <- function(sub, aud, with_refresh = FALSE, claims = NULL) {
   response <- do_request(POST, "/tokens", body)
 
   if (status_code(response) != 200) {
-    stop(sprintf("выпуск не удался: %d", status_code(response)))
+    stop(sprintf("issue failed: %d", status_code(response)))
   }
 
   fromJSON(content(response, "text", encoding = "UTF-8"))
 }
 
-#' Обменять refresh-токен на новую пару
+#' POST /tokens/refresh
 #'
-#' Ручка \code{POST /tokens/refresh}. Старый токен после обмена недействителен:
-#' сохраните новый и выбросьте предыдущий.
+#' Returns a new pair; the old refresh token is dead once the call succeeds.
 #'
-#' @section Внимание:
-#' Не повторяйте обмен старым токеном при потере ответа. Повторное предъявление
-#' трактуется как кража и гасит всю семью — и refresh-токены, и выданные по ним
-#' access-токены. Надёжнее выпустить пару заново.
-#'
-#' @param refresh_token Токен из выпуска или прошлого обмена.
-#' @return Список с новой парой \code{token} и \code{refresh_token}.
+#' @param refresh_token Token from an issue or a previous refresh.
+#' @return List with the new \code{token} and \code{refresh_token}.
 refresh_tokens <- function(refresh_token) {
   response <- do_request(POST, "/tokens/refresh", list(refresh_token = refresh_token))
 
   if (status_code(response) != 200) {
-    stop(sprintf("обмен не удался: %d", status_code(response)))
+    stop(sprintf("refresh failed: %d", status_code(response)))
   }
 
   fromJSON(content(response, "text", encoding = "UTF-8"))
 }
 
-#' Отозвать один токен
+#' DELETE /tokens/{jti}
 #'
-#' Ручка \code{DELETE /tokens/{jti}}. Идемпотентно: отзыв несуществующего
-#' \code{jti} — тоже успех.
+#' Idempotent.
 #'
-#' @param jti Идентификатор токена из claim \code{jti}.
+#' @param jti Token id from the \code{jti} claim.
 #' @return \code{invisible(NULL)}.
 revoke_token <- function(jti) {
   response <- do_request(DELETE, paste0("/tokens/", jti))
 
   if (status_code(response) != 204) {
-    stop(sprintf("отзыв не удался: %d — хранилище недоступно, повторите", status_code(response)))
+    stop(sprintf("revoke failed: %d", status_code(response)))
   }
 
   invisible(NULL)
 }
 
-#' Отозвать все токены субъекта
+#' DELETE /subjects/{sub}/tokens
 #'
-#' Ручка \code{DELETE /subjects/{sub}/tokens}. Нужна при компрометации: гасить
-#' токены по одному нельзя, их \code{jti} вызывающему неизвестны.
-#'
-#' @param sub Субъект, чьи токены гасятся.
-#' @return Число отозванных токенов; истёкшие не считаются.
+#' @param sub Subject whose tokens are revoked.
+#' @return Number of revoked tokens.
 revoke_subject <- function(sub) {
   response <- do_request(DELETE, paste0("/subjects/", sub, "/tokens"))
 
   if (status_code(response) != 200) {
-    stop(sprintf("массовый отзыв не удался: %d", status_code(response)))
+    stop(sprintf("bulk revoke failed: %d", status_code(response)))
   }
 
   fromJSON(content(response, "text", encoding = "UTF-8"))$revoked
 }
 
-# Демонстрация полного жизненного цикла токена.
+# Issue -> refresh -> revoke.
 issued <- issue_token("svc-a", c("svc-b"), with_refresh = TRUE, claims = list(role = "admin"))
-cat("выпущен:", substr(issued$token, 1, 32), "...\n")
+cat("issued:", substr(issued$token, 1, 32), "...\n")
 
 refreshed <- refresh_tokens(issued$refresh_token)
-cat("обновлён:", substr(refreshed$token, 1, 32), "...\n")
+cat("refreshed:", substr(refreshed$token, 1, 32), "...\n")
 
-cat("отозвано токенов:", revoke_subject("svc-a"), "\n")
+cat("revoked:", revoke_subject("svc-a"), "\n")

@@ -1,20 +1,12 @@
 /**
- * Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
+ * Dependencies are pulled in with {@code @Grab}.
  *
- * Зависимости подтягиваются через {@code @Grab}.
+ * Env: {@code AUTH_TOTP_SECRET} (base32), {@code JWT_SERVICE_URL} (default
+ * {@code http://localhost:8080}).
  *
- * Окружение:
- * <ul>
- *   <li>{@code AUTH_TOTP_SECRET} — общий TOTP-секрет в base32 (обязательно);</li>
- *   <li>{@code JWT_SERVICE_URL} — базовый URL, по умолчанию {@code http://localhost:8080}.</li>
- * </ul>
- *
- * <b>Код считается заново перед каждым запросом.</b> При включённой на сервере
- * защите от переигрывания ({@code AUTH_TOTP_REPLAY_PROTECTION}) повторное
- * предъявление того же кода вернёт {@code 401}, хотя сам код ещё не истёк.
+ * See README.md for endpoints, error codes and client rules.
  */
 @Grab('com.eatthepath:java-otp:0.4.0')
 @Grab('commons-codec:commons-codec:1.16.0')
@@ -30,11 +22,11 @@ import java.net.http.HttpResponse
 import java.time.Instant
 
 /**
- * Клиент сервиса выдачи токенов.
+ * Client of the token service.
  */
 class JwtServiceClient {
 
-    /** Значение claim {@code iss}. Должно совпадать при выпуске и проверке. */
+    /** Sent as the Host header, becomes the {@code iss} claim. */
     static final String ISSUER_HOST = 'example.com'
 
     private final String baseUrl
@@ -43,10 +35,10 @@ class JwtServiceClient {
     private final HttpClient http = HttpClient.newHttpClient()
 
     /**
-     * Создаёт клиент.
+     * Creates a client.
      *
-     * @param baseUrl базовый URL сервиса
-     * @param secret общий TOTP-секрет в base32
+     * @param baseUrl service base URL
+     * @param secret shared TOTP secret, base32
      */
     JwtServiceClient(String baseUrl, String secret) {
         this.baseUrl = baseUrl
@@ -54,35 +46,33 @@ class JwtServiceClient {
     }
 
     /**
-     * Собирает клиент из переменных окружения.
+     * Builds a client from the environment.
      *
-     * @return готовый клиент
+     * @return the client
      */
     static JwtServiceClient fromEnv() {
         def secret = System.getenv('AUTH_TOTP_SECRET')
-        assert secret != null, 'нужен AUTH_TOTP_SECRET'
+        assert secret != null, 'AUTH_TOTP_SECRET is required'
 
         new JwtServiceClient(System.getenv('JWT_SERVICE_URL') ?: 'http://localhost:8080', secret)
     }
 
     /**
-     * Вычисляет TOTP-код на текущий момент.
+     * Fresh TOTP code: SHA-1, 6 digits, 30-second step.
      *
-     * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-     *
-     * @return код из шести десятичных знаков
+     * @return six decimal digits
      */
     private String totpCode() {
         totp.generateOneTimePasswordString(key, Instant.now())
     }
 
     /**
-     * Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+     * Sends a level 3 request with a code computed right before the call.
      *
-     * @param method HTTP-метод
-     * @param path путь ручки, начиная со слеша
-     * @param body тело запроса либо {@code null}, если тела нет
-     * @return ответ сервиса
+     * @param method HTTP method
+     * @param path endpoint path
+     * @param body request body, or {@code null}
+     * @return service reply
      */
     private HttpResponse<String> request(String method, String path, String body) {
         def publisher = body == null
@@ -90,7 +80,6 @@ class JwtServiceClient {
                 : HttpRequest.BodyPublishers.ofString(body)
 
         def request = HttpRequest.newBuilder(URI.create("$baseUrl$path"))
-                // Код считается здесь, а не переиспользуется: один код — один запрос.
                 .header('X-TOTP-Code', totpCode())
                 .header('Host', ISSUER_HOST)
                 .header('Content-Type', 'application/json')
@@ -101,19 +90,14 @@ class JwtServiceClient {
     }
 
     /**
-     * Выпускает access-токен ({@code POST /tokens}).
+     * {@code POST /tokens}
      *
-     * @param sub субъект, которому выдаётся токен (claim {@code sub})
-     * @param aud список получателей (claim {@code aud}); не должен быть пустым
-     * @param withRefresh запросить refresh-токен для продления сессии
-     * @param claims произвольные claims (роли, scope, tenant) — попадают в payload
-     *        рядом с зарегистрированными. Служебные имена ({@code iss},
-     *        {@code sub}, {@code aud}, {@code exp}, {@code iat}, {@code nbf},
-     *        {@code jti}) переопределять нельзя, сервис ответит {@code 422}
-     * @return разобранное тело ответа с полями {@code token} и,
-     *         если запрашивался, {@code refresh_token}
-     * @throws IllegalStateException {@code 401} — неверный код,
-     *         {@code 422} — параметры или запрещённый claim, {@code 500} — JWKS/Redis
+     * @param sub subject
+     * @param aud audience
+     * @param withRefresh also ask for a refresh token
+     * @param claims custom claims
+     * @return parsed reply with {@code token} and, if requested,
+     *         {@code refresh_token}
      */
     Map issueToken(String sub, List<String> aud, boolean withRefresh = false, Map claims = [:]) {
         def payload = [sub: sub, aud: aud, refresh: withRefresh]
@@ -123,84 +107,67 @@ class JwtServiceClient {
         def response = request('POST', '/tokens', body)
 
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("выпуск не удался: ${response.statusCode()}")
+            throw new IllegalStateException("issue failed: ${response.statusCode()}")
         }
 
         new JsonSlurper().parseText(response.body()) as Map
     }
 
     /**
-     * Обменивает refresh-токен на новую пару ({@code POST /tokens/refresh}).
+     * {@code POST /tokens/refresh} — returns a new pair; the old refresh token
+     * is dead once the call succeeds.
      *
-     * Старый токен после обмена недействителен: сохраните новый и выбросьте
-     * предыдущий.
-     *
-     * <b>Внимание:</b> не повторяйте обмен старым токеном при потере ответа.
-     * Повторное предъявление трактуется как кража и гасит всю семью — и
-     * refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-     * заново.
-     *
-     * @param refreshToken токен из выпуска или прошлого обмена
-     * @return новая пара access + refresh
-     * @throws IllegalStateException {@code 401} — токен неизвестен, истёк или
-     *         уже использован
+     * @param refreshToken token from an issue or a previous refresh
+     * @return the new access + refresh pair
      */
     Map refreshTokens(String refreshToken) {
         def body = JsonOutput.toJson([refresh_token: refreshToken])
         def response = request('POST', '/tokens/refresh', body)
 
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("обмен не удался: ${response.statusCode()}")
+            throw new IllegalStateException("refresh failed: ${response.statusCode()}")
         }
 
         new JsonSlurper().parseText(response.body()) as Map
     }
 
     /**
-     * Отзывает один токен по его {@code jti} ({@code DELETE /tokens/{jti}}).
+     * {@code DELETE /tokens/{jti}} — idempotent.
      *
-     * Идемпотентно: отзыв несуществующего {@code jti} — тоже успех.
-     *
-     * @param jti идентификатор токена из claim {@code jti}
-     * @throws IllegalStateException {@code 500} — хранилище недоступно, отзыв
-     *         НЕ выполнен: повторите попытку
+     * @param jti token id from the {@code jti} claim
      */
     void revokeToken(String jti) {
         def response = request('DELETE', "/tokens/$jti", null)
 
         if (response.statusCode() != 204) {
-            throw new IllegalStateException("отзыв не удался: ${response.statusCode()}")
+            throw new IllegalStateException("revoke failed: ${response.statusCode()}")
         }
     }
 
     /**
-     * Отзывает все активные токены субъекта.
+     * {@code DELETE /subjects/{sub}/tokens}
      *
-     * Ручка {@code DELETE /subjects/{sub}/tokens}. Нужна при компрометации:
-     * гасить токены по одному нельзя, их {@code jti} вызывающему неизвестны.
-     *
-     * @param sub субъект, чьи токены гасятся
-     * @return число отозванных токенов; истёкшие не считаются
-     * @throws IllegalStateException {@code 500} — хранилище недоступно
+     * @param sub subject whose tokens are revoked
+     * @return number of revoked tokens
      */
     int revokeSubject(String sub) {
         def response = request('DELETE', "/subjects/$sub/tokens", null)
 
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("массовый отзыв не удался: ${response.statusCode()}")
+            throw new IllegalStateException("bulk revoke failed: ${response.statusCode()}")
         }
 
         (new JsonSlurper().parseText(response.body()) as Map).revoked as int
     }
 }
 
-// Демонстрация полного жизненного цикла токена.
+// Issue -> refresh -> revoke.
 def client = JwtServiceClient.fromEnv()
 
 def issued = client.issueToken('svc-a', ['svc-b'], true, [role: 'admin'])
-println "выпущен: ${issued.token.take(32)}..."
+println "issued: ${issued.token.take(32)}..."
 
 def refreshed = client.refreshTokens(issued.refresh_token as String)
-println "обновлён: ${refreshed.token.take(32)}..."
+println "refreshed: ${refreshed.token.take(32)}..."
 
-println "отозвано токенов: ${client.revokeSubject('svc-a')}"
+println "revoked: ${client.revokeSubject('svc-a')}"

@@ -1,17 +1,9 @@
-/// Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+/// jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 ///
-/// Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-/// токена и массовый отзыв токенов субъекта.
-///
-/// Зависимости: `dart pub add otp http`.
-///
-/// Окружение:
-/// * `AUTH_TOTP_SECRET` — общий TOTP-секрет в base32 (обязательно);
-/// * `JWT_SERVICE_URL` — базовый URL сервиса, по умолчанию `http://localhost:8080`.
-///
-/// Код считается **заново перед каждым запросом**. При включённой на сервере
-/// защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`) повторное
-/// предъявление того же кода вернёт `401`, хотя сам код ещё не истёк.
+/// Install: `dart pub add otp http`.
+/// Env: `AUTH_TOTP_SECRET` (base32), `JWT_SERVICE_URL` (default
+/// `http://localhost:8080`).
+/// See README.md for endpoints, error codes and client rules.
 library;
 
 import 'dart:convert';
@@ -20,26 +12,24 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:otp/otp.dart';
 
-/// Клиент сервиса выдачи токенов.
+/// Client of the token service.
 class JwtServiceClient {
-  /// Значение claim `iss`. Должно совпадать при выпуске и проверке токена.
+  /// Sent as the Host header, becomes the `iss` claim.
   static const issuerHost = 'example.com';
 
-  /// Базовый URL сервиса.
+  /// Service base URL.
   final String baseUrl;
 
-  /// Общий TOTP-секрет в base32.
+  /// Shared TOTP secret, base32.
   final String secret;
 
-  /// Создаёт клиент.
+  /// Creates a client.
   JwtServiceClient(this.baseUrl, this.secret);
 
-  /// Собирает клиент из переменных окружения.
-  ///
-  /// Бросает [StateError], если не задан `AUTH_TOTP_SECRET`.
+  /// Builds a client from the environment.
   factory JwtServiceClient.fromEnv() {
     final secret = Platform.environment['AUTH_TOTP_SECRET'];
-    if (secret == null) throw StateError('нужен AUTH_TOTP_SECRET');
+    if (secret == null) throw StateError('AUTH_TOTP_SECRET is required');
 
     return JwtServiceClient(
       Platform.environment['JWT_SERVICE_URL'] ?? 'http://localhost:8080',
@@ -47,11 +37,7 @@ class JwtServiceClient {
     );
   }
 
-  /// Вычисляет TOTP-код на текущий момент.
-  ///
-  /// Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-  ///
-  /// Возвращает код из шести десятичных знаков.
+  /// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
   String _totpCode() => OTP.generateTOTPCodeString(
         secret,
         DateTime.now().millisecondsSinceEpoch,
@@ -61,30 +47,19 @@ class JwtServiceClient {
         isGoogle: true,
       );
 
-  /// Заголовки для запроса к ручке уровня 3 со свежим TOTP-кодом.
+  /// Headers with a code computed right before the call.
   Map<String, String> _headers() => {
-        // Код считается здесь, а не переиспользуется: один код — один запрос.
         'X-TOTP-Code': _totpCode(),
         'Host': issuerHost,
         'Content-Type': 'application/json',
       };
 
-  /// Выпускает access-токен (`POST /tokens`).
+  /// `POST /tokens`
   ///
-  /// [sub] — субъект (claim `sub`), [aud] — список получателей (claim `aud`,
-  /// не пустой), [withRefresh] — запросить refresh-токен для продления сессии,
-  /// [claims] — произвольные claims (роли, scope, tenant), попадают в payload
-  /// рядом с зарегистрированными.
+  /// [sub] subject, [aud] audience, [withRefresh] also ask for a refresh token,
+  /// [claims] custom claims.
   ///
-  /// Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
-  /// переопределять нельзя — сервис ответит `422`. Число ключей и объём
-  /// ограничены на сервере.
-  ///
-  /// Возвращает `{"token": ..., "refresh_token": ...}`; `refresh_token`
-  /// присутствует, только если запрашивался.
-  ///
-  /// Бросает [HttpException]: `401` — неверный код, `422` — параметры,
-  /// `500` — недоступны JWKS или Redis.
+  /// Returns `{"token": ..., "refresh_token": ...}`.
   Future<Map<String, dynamic>> issueToken(
     String sub,
     List<String> aud, {
@@ -101,25 +76,16 @@ class JwtServiceClient {
     );
 
     if (response.statusCode != 200) {
-      throw HttpException('выпуск не удался: ${response.statusCode}');
+      throw HttpException('issue failed: ${response.statusCode}');
     }
 
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
-  /// Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+  /// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
+  /// once the call succeeds.
   ///
-  /// Старый токен после обмена недействителен: сохраните новый и выбросьте
-  /// предыдущий.
-  ///
-  /// **Внимание:** не повторяйте обмен старым токеном при потере ответа.
-  /// Повторное предъявление трактуется как кража и гасит всю семью — и
-  /// refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-  /// заново.
-  ///
-  /// [refreshToken] — токен из выпуска или прошлого обмена.
-  ///
-  /// Бросает [HttpException]: `401` — токен неизвестен, истёк или использован.
+  /// [refreshToken] token from an issue or a previous refresh.
   Future<Map<String, dynamic>> refreshTokens(String refreshToken) async {
     final response = await http.post(
       Uri.parse('$baseUrl/tokens/refresh'),
@@ -128,18 +94,13 @@ class JwtServiceClient {
     );
 
     if (response.statusCode != 200) {
-      throw HttpException('обмен не удался: ${response.statusCode}');
+      throw HttpException('refresh failed: ${response.statusCode}');
     }
 
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
-  /// Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
-  ///
-  /// Идемпотентно: отзыв несуществующего [jti] — тоже успех.
-  ///
-  /// Бросает [HttpException]: `500` — хранилище недоступно, отзыв **не
-  /// выполнен**, попытку следует повторить.
+  /// `DELETE /tokens/{jti}` — idempotent.
   Future<void> revokeToken(String jti) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/tokens/$jti'),
@@ -147,16 +108,11 @@ class JwtServiceClient {
     );
 
     if (response.statusCode != 204) {
-      throw HttpException('отзыв не удался: ${response.statusCode}');
+      throw HttpException('revoke failed: ${response.statusCode}');
     }
   }
 
-  /// Отзывает все активные токены субъекта.
-  ///
-  /// Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить
-  /// токены по одному нельзя, их `jti` вызывающему неизвестны.
-  ///
-  /// Возвращает число отозванных токенов; истёкшие не считаются.
+  /// `DELETE /subjects/{sub}/tokens` — returns the number of revoked tokens.
   Future<int> revokeSubject(String sub) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/subjects/$sub/tokens'),
@@ -164,23 +120,23 @@ class JwtServiceClient {
     );
 
     if (response.statusCode != 200) {
-      throw HttpException('массовый отзыв не удался: ${response.statusCode}');
+      throw HttpException('bulk revoke failed: ${response.statusCode}');
     }
 
     return (jsonDecode(response.body) as Map<String, dynamic>)['revoked'] as int;
   }
 }
 
-/// Демонстрирует полный жизненный цикл токена.
+/// Issue -> refresh -> revoke.
 Future<void> main() async {
   final client = JwtServiceClient.fromEnv();
 
   final issued = await client.issueToken('svc-a', ['svc-b'],
       withRefresh: true, claims: {'role': 'admin'});
-  print('выпущен: ${issued['token'].toString().substring(0, 32)}...');
+  print('issued: ${issued['token'].toString().substring(0, 32)}...');
 
   final refreshed = await client.refreshTokens(issued['refresh_token'] as String);
-  print('обновлён: ${refreshed['token'].toString().substring(0, 32)}...');
+  print('refreshed: ${refreshed['token'].toString().substring(0, 32)}...');
 
-  print('отозвано токенов: ${await client.revokeSubject('svc-a')}');
+  print('revoked: ${await client.revokeSubject('svc-a')}');
 }

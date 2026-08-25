@@ -1,23 +1,13 @@
 /**
  * @file c.c
- * @brief Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+ * @brief jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
- * Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
- * токена и массовый отзыв токенов субъекта.
+ * Build: `cc c.c -lcrypto -lcurl -o client`
  *
- * Сборка: `cc c.c -lcrypto -lcurl -o client`
+ * Env: `AUTH_TOTP_SECRET` (raw bytes here, see README.md), `JWT_SERVICE_URL`
+ * (default `http://localhost:8080`).
  *
- * Окружение:
- * - `AUTH_TOTP_SECRET` — общий TOTP-секрет (см. примечание о base32);
- * - `JWT_SERVICE_URL` — базовый URL, по умолчанию `http://localhost:8080`.
- *
- * @note Пример трактует секрет как сырые байты; для совместимости с Google
- *       Authenticator добавьте декодер base32.
- *
- * @warning Код считается **заново перед каждым запросом**. При включённой на
- *          сервере защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION`)
- *          повторное предъявление того же кода вернёт `401`, хотя сам код ещё не
- *          истёк.
+ * See README.md for endpoints, error codes and client rules.
  */
 
 #include <curl/curl.h>
@@ -27,16 +17,15 @@
 #include <string.h>
 #include <time.h>
 
-/** Значение claim `iss`. Должно совпадать при выпуске и проверке токена. */
+/** Sent as the Host header, becomes the `iss` claim. */
 #define ISSUER_HOST "example.com"
 
 /**
- * @brief Вычисляет TOTP-код на текущий момент.
+ * @brief Fresh TOTP code: SHA-1, 6 digits, 30-second step.
  *
- * Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
- * Усечение — по RFC 4226 §5.3.
+ * Truncation follows RFC 4226 section 5.3.
  *
- * @param[out] out Буфер не менее 7 байт, куда пишется код с завершающим нулём.
+ * @param[out] out Buffer of at least 7 bytes for the NUL-terminated code.
  */
 static void totp_code(char *out) {
     const char *secret = getenv("AUTH_TOTP_SECRET");
@@ -62,9 +51,9 @@ static void totp_code(char *out) {
 }
 
 /**
- * @brief Возвращает базовый URL сервиса из окружения.
+ * @brief Service base URL from the environment.
  *
- * @return URL сервиса либо значение по умолчанию.
+ * @return The URL, or the default.
  */
 static const char *service_url(void) {
     const char *service = getenv("JWT_SERVICE_URL");
@@ -72,13 +61,13 @@ static const char *service_url(void) {
 }
 
 /**
- * @brief Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+ * @brief Sends a level 3 request with a code computed right before the call.
  *
- * @param method HTTP-метод (`POST`, `DELETE`).
- * @param path   Путь ручки, начиная со слеша.
- * @param body   Тело запроса либо `NULL`, если тела нет.
+ * @param method HTTP method.
+ * @param path   Endpoint path.
+ * @param body   Request body, or `NULL`.
  *
- * @return HTTP-код ответа либо `0` при сбое сети.
+ * @return HTTP status, or `0` on a network failure.
  */
 static long request(const char *method, const char *path, const char *body) {
     CURL *curl = curl_easy_init();
@@ -87,7 +76,6 @@ static long request(const char *method, const char *path, const char *body) {
     char url[512];
     snprintf(url, sizeof(url), "%s%s", service_url(), path);
 
-    /* Код считается здесь, а не переиспользуется: один код — один запрос. */
     char code[7];
     totp_code(code);
 
@@ -115,19 +103,14 @@ static long request(const char *method, const char *path, const char *body) {
 }
 
 /**
- * @brief Выпускает access-токен (`POST /tokens`).
+ * @brief `POST /tokens`
  *
- * @param sub          Субъект, которому выдаётся токен (claim `sub`).
- * @param aud          Получатель (claim `aud`).
- * @param with_refresh Запросить refresh-токен для продления сессии.
- * @param claims_json  Произвольные claims JSON-объектом (например
- *                     `{"role":"admin"}`) либо `NULL`. Попадают в payload рядом
- *                     с зарегистрированными; служебные имена (`iss`, `sub`,
- *                     `aud`, `exp`, `iat`, `nbf`, `jti`) переопределять нельзя —
- *                     сервис ответит `422`.
+ * @param sub          Subject.
+ * @param aud          Audience.
+ * @param with_refresh Also ask for a refresh token.
+ * @param claims_json  Custom claims as a JSON object, or `NULL`.
  *
- * @return HTTP-код: `200` — успех, `401` — неверный код, `422` — параметры или
- *         запрещённый claim, `500` — недоступны JWKS или Redis.
+ * @return HTTP status.
  */
 long issue_token(const char *sub, const char *aud, int with_refresh, const char *claims_json) {
     char body[1024];
@@ -145,19 +128,12 @@ long issue_token(const char *sub, const char *aud, int with_refresh, const char 
 }
 
 /**
- * @brief Обменивает refresh-токен на новую пару (`POST /tokens/refresh`).
+ * @brief `POST /tokens/refresh` — returns a new pair; the old refresh token is
+ *        dead once the call succeeds.
  *
- * Старый токен после обмена недействителен: сохраните новый и выбросьте
- * предыдущий.
+ * @param refresh_token Token from an issue or a previous refresh.
  *
- * @warning Не повторяйте обмен старым токеном при потере ответа. Повторное
- *          предъявление трактуется как кража и гасит всю семью — и refresh-токены,
- *          и выданные по ним access-токены. Надёжнее выпустить пару заново.
- *
- * @param refresh_token Токен из выпуска или прошлого обмена.
- *
- * @return HTTP-код: `200` — успех, `401` — токен неизвестен, истёк или уже
- *         использован.
+ * @return HTTP status.
  */
 long refresh_tokens(const char *refresh_token) {
     char body[512];
@@ -167,14 +143,11 @@ long refresh_tokens(const char *refresh_token) {
 }
 
 /**
- * @brief Отзывает один токен по его `jti` (`DELETE /tokens/{jti}`).
+ * @brief `DELETE /tokens/{jti}` — idempotent.
  *
- * Идемпотентно: отзыв несуществующего `jti` — тоже успех (`204`).
+ * @param jti Token id from the `jti` claim.
  *
- * @param jti Идентификатор токена из claim `jti`.
- *
- * @return HTTP-код: `204` — успех, `500` — хранилище недоступно и отзыв **не
- *         выполнен**, попытку следует повторить.
+ * @return HTTP status.
  */
 long revoke_token(const char *jti) {
     char path[256];
@@ -184,15 +157,11 @@ long revoke_token(const char *jti) {
 }
 
 /**
- * @brief Отзывает все активные токены субъекта.
+ * @brief `DELETE /subjects/{sub}/tokens`
  *
- * Ручка `DELETE /subjects/{sub}/tokens`. Нужна при компрометации: гасить токены
- * по одному нельзя, их `jti` вызывающему неизвестны.
+ * @param sub Subject whose tokens are revoked.
  *
- * @param sub Субъект, чьи токены гасятся.
- *
- * @return HTTP-код: `200` — успех; в теле ответа поле `revoked` с числом
- *         отозванных токенов (истёкшие не считаются).
+ * @return HTTP status; the body carries `revoked` with the count.
  */
 long revoke_subject(const char *sub) {
     char path[256];
@@ -202,16 +171,16 @@ long revoke_subject(const char *sub) {
 }
 
 /**
- * @brief Демонстрирует полный жизненный цикл токена.
+ * @brief Issue -> refresh -> revoke.
  *
- * @return `0` при успехе.
+ * @return `0` on success.
  */
 int main(void) {
-    printf("выпуск: %ld\n", issue_token("svc-a", "svc-b", 1, "{\"role\":\"admin\"}"));
+    printf("issue: %ld\n", issue_token("svc-a", "svc-b", 1, "{\"role\":\"admin\"}"));
 
-    /* В боевом коде разберите JSON ответа и достаньте refresh_token. */
-    printf("обмен: %ld\n", refresh_tokens("положите-сюда-refresh_token"));
-    printf("массовый отзыв: %ld\n", revoke_subject("svc-a"));
+    /* Real code should parse the response and take refresh_token from it. */
+    printf("refresh: %ld\n", refresh_tokens("put-refresh-token-here"));
+    printf("bulk revoke: %ld\n", revoke_subject("svc-a"));
 
     return 0;
 }

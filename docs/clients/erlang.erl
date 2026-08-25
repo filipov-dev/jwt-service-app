@@ -1,60 +1,42 @@
-%%% @doc Клиент jwt-service-app для эндпоинтов уровня 3 (TOTP).
+%%% @doc jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 %%%
-%%% Покрывает все четыре ручки: выпуск токена, обмен refresh-токена, отзыв одного
-%%% токена и массовый отзыв токенов субъекта.
+%%% Dependencies: standard `crypto', `httpc'; `jsx' for JSON.
 %%%
-%%% Зависимости: стандартные `crypto', `httpc'; для разбора JSON — `jsx'.
+%%% Env: `AUTH_TOTP_SECRET' (raw bytes here, see README.md),
+%%% `JWT_SERVICE_URL' (default `http://localhost:8080').
 %%%
-%%% Окружение:
-%%% <ul>
-%%%   <li>`AUTH_TOTP_SECRET' — общий TOTP-секрет (см. примечание о base32);</li>
-%%%   <li>`JWT_SERVICE_URL' — базовый URL, по умолчанию `http://localhost:8080'.</li>
-%%% </ul>
-%%%
-%%% Пример трактует секрет как сырые байты. Для совместимости с Google
-%%% Authenticator добавьте декодер base32.
-%%%
-%%% <b>Код считается заново перед каждым запросом.</b> При включённой на сервере
-%%% защите от переигрывания (`AUTH_TOTP_REPLAY_PROTECTION') повторное
-%%% предъявление того же кода вернёт `401', хотя сам код ещё не истёк.
+%%% See README.md for endpoints, error codes and client rules.
 %%% @end
 -module(jwt_service_client).
 
 -export([issue_token/4, refresh_tokens/1, revoke_token/1, revoke_subject/1, main/0]).
 
-%% Значение claim `iss'. Должно совпадать при выпуске и проверке токена.
+%% Sent as the Host header, becomes the `iss' claim.
 -define(ISSUER_HOST, "example.com").
 
-%% @doc Вычисляет TOTP-код на текущий момент.
+%% @doc Fresh TOTP code: SHA-1, 6 digits, 30-second step.
 %%
-%% Параметры соответствуют дефолтам сервиса: SHA-1, 6 знаков, шаг 30 секунд.
-%%
-%% @returns Код из шести десятичных знаков.
+%% @returns Six decimal digits.
 -spec totp_code() -> string().
 totp_code() ->
     Secret = list_to_binary(os:getenv("AUTH_TOTP_SECRET")),
     Counter = erlang:system_time(second) div 30,
     Hmac = crypto:mac(hmac, sha, Secret, <<Counter:64/big>>),
 
-    %% Динамическое усечение по RFC 4226 §5.3.
+    %% Dynamic truncation, RFC 4226 section 5.3.
     Offset = binary:last(Hmac) band 16#0f,
     <<_:Offset/binary, B0, B1, B2, B3, _/binary>> = Hmac,
     Code = ((B0 band 16#7f) bsl 24) bor (B1 bsl 16) bor (B2 bsl 8) bor B3,
 
     lists:flatten(io_lib:format("~6..0B", [Code rem 1000000])).
 
-%% @doc Выпускает access-токен (`POST /tokens').
+%% @doc `POST /tokens'.
 %%
-%% @param Sub Субъект, которому выдаётся токен (claim `sub').
-%% @param Aud Получатель (claim `aud').
-%% @param WithRefresh Запросить refresh-токен для продления сессии.
-%% @param ClaimsJson Произвольные claims JSON-строкой (например
-%%        `<<"{\"role\":\"admin\"}">>') либо `undefined'. Попадают в payload рядом
-%%        с зарегистрированными; служебные имена (`iss', `sub', `aud', `exp',
-%%        `iat', `nbf', `jti') переопределять нельзя — сервис ответит `422'.
-%% @returns `{ok, Body}' либо `{error, Status}': `401' — неверный код,
-%%          `422' — некорректные параметры или запрещённый claim,
-%%          `500' — JWKS или Redis недоступны.
+%% @param Sub Subject.
+%% @param Aud Audience.
+%% @param WithRefresh Also ask for a refresh token.
+%% @param ClaimsJson Custom claims as a JSON binary, or `undefined'.
+%% @returns `{ok, Body}' or `{error, Status}'.
 -spec issue_token(string(), string(), boolean(), binary() | undefined) ->
     {ok, binary()} | {error, term()}.
 issue_token(Sub, Aud, WithRefresh, ClaimsJson) ->
@@ -69,47 +51,33 @@ issue_token(Sub, Aud, WithRefresh, ClaimsJson) ->
     ]),
     request(post, "/tokens", Body, 200).
 
-%% @doc Обменивает refresh-токен на новую пару (`POST /tokens/refresh').
+%% @doc `POST /tokens/refresh' — returns a new pair; the old refresh token is
+%% dead once the call succeeds.
 %%
-%% Старый токен после обмена недействителен: сохраните новый и выбросьте
-%% предыдущий.
-%%
-%% <b>Внимание:</b> не повторяйте обмен старым токеном при потере ответа.
-%% Повторное предъявление трактуется как кража и гасит всю семью — и
-%% refresh-токены, и выданные по ним access-токены. Надёжнее выпустить пару
-%% заново.
-%%
-%% @param RefreshToken Токен из выпуска или прошлого обмена.
-%% @returns `{ok, Body}' либо `{error, 401}', если токен неизвестен, истёк или
-%%          уже использован.
+%% @param RefreshToken Token from an issue or a previous refresh.
+%% @returns `{ok, Body}' or `{error, Status}'.
 -spec refresh_tokens(string()) -> {ok, binary()} | {error, term()}.
 refresh_tokens(RefreshToken) ->
     Body = iolist_to_binary(io_lib:format("{\"refresh_token\":\"~s\"}", [RefreshToken])),
     request(post, "/tokens/refresh", Body, 200).
 
-%% @doc Отзывает один токен по его `jti' (`DELETE /tokens/{jti}').
+%% @doc `DELETE /tokens/{jti}' — idempotent.
 %%
-%% Идемпотентно: отзыв несуществующего `jti' — тоже успех.
-%%
-%% @param Jti Идентификатор токена из claim `jti'.
-%% @returns `{ok, _}' либо `{error, 500}' — хранилище недоступно, отзыв НЕ
-%%          выполнен, попытку следует повторить.
+%% @param Jti Token id from the `jti' claim.
+%% @returns `{ok, Body}' or `{error, Status}'.
 -spec revoke_token(string()) -> {ok, binary()} | {error, term()}.
 revoke_token(Jti) ->
     request(delete, "/tokens/" ++ Jti, <<>>, 204).
 
-%% @doc Отзывает все активные токены субъекта.
+%% @doc `DELETE /subjects/{sub}/tokens'.
 %%
-%% Ручка `DELETE /subjects/{sub}/tokens'. Нужна при компрометации: гасить токены
-%% по одному нельзя, их `jti' вызывающему неизвестны.
-%%
-%% @param Sub Субъект, чьи токены гасятся.
-%% @returns `{ok, Body}' с полем `revoked'; истёкшие токены не считаются.
+%% @param Sub Subject whose tokens are revoked.
+%% @returns `{ok, Body}' with a `revoked' field.
 -spec revoke_subject(string()) -> {ok, binary()} | {error, term()}.
 revoke_subject(Sub) ->
     request(delete, "/subjects/" ++ Sub ++ "/tokens", <<>>, 200).
 
-%% @private Выполняет запрос к ручке уровня 3, подставляя свежий TOTP-код.
+%% @private Sends a level 3 request with a code computed right before the call.
 -spec request(atom(), string(), binary(), integer()) -> {ok, binary()} | {error, term()}.
 request(Method, Path, Body, Expected) ->
     application:ensure_all_started(inets),
@@ -118,7 +86,6 @@ request(Method, Path, Body, Expected) ->
         Value -> Value
     end,
 
-    %% Код считается здесь, а не переиспользуется: один код — один запрос.
     Headers = [{"X-TOTP-Code", totp_code()}, {"Host", ?ISSUER_HOST}],
     Request = {Service ++ Path, Headers, "application/json", Body},
 
@@ -131,16 +98,16 @@ request(Method, Path, Body, Expected) ->
             {error, Reason}
     end.
 
-%% @doc Демонстрирует полный жизненный цикл токена.
+%% @doc Issue -> refresh -> revoke.
 -spec main() -> ok.
 main() ->
     {ok, Issued} = issue_token("svc-a", "svc-b", true, <<"{\"role\":\"admin\"}">>),
-    io:format("выпущен: ~s~n", [Issued]),
+    io:format("issued: ~s~n", [Issued]),
 
-    %% В боевом коде разберите JSON библиотекой (например, jsx) и достаньте
-    %% refresh_token из ответа.
-    {ok, Refreshed} = refresh_tokens("положите-сюда-refresh_token"),
-    io:format("обновлён: ~s~n", [Refreshed]),
+    %% Real code should parse the JSON with a library (jsx, for example) and
+    %% take refresh_token from the reply.
+    {ok, Refreshed} = refresh_tokens("put-refresh-token-here"),
+    io:format("refreshed: ~s~n", [Refreshed]),
 
     {ok, Revoked} = revoke_subject("svc-a"),
-    io:format("массовый отзыв: ~s~n", [Revoked]).
+    io:format("bulk revoke: ~s~n", [Revoked]).
