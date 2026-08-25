@@ -105,6 +105,7 @@ ASCII `[A-Za-z0-9_-]`, ≤128 символов), иначе генерирует
 | `jwt_auth_denied_total` | counter | `level` |
 | `jwt_rate_limit_exceeded_total` | counter | — |
 | `jwks_request_duration_seconds` | histogram | `operation`, `success` |
+| `jwks_cache_total` | counter | `result` (`hit`/`miss`/`throttled`/`stale`) |
 | `redis_command_duration_seconds` | histogram | `command`, `success` |
 
 > **Кардинальность.** В лейбл `endpoint` идёт **шаблон роута** (`/tokens/{jti}`), а

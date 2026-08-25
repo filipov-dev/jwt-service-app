@@ -56,6 +56,19 @@ const POOL_IDLE_TIMEOUT_SECONDS: u64 = 60;
 /// одному — ровно то, от чего мы уходим.
 const DEFAULT_MISS_REFRESH_SECONDS: u64 = 10;
 
+/// Сколько снимок разрешено отдавать **сверх** TTL, если сервис ключей
+/// недоступен (`JWKS_CACHE_STALE_GRACE_SECONDS`).
+///
+/// Отсчёт идёт от TTL, а не от момента снимка: предельный возраст пригодного
+/// снимка — `JWKS_CACHE_TTL_SECONDS + JWKS_CACHE_STALE_GRACE_SECONDS`.
+///
+/// Десять секунд — сознательно скупая отсрочка: её хватает на моргание сети и
+/// рестарт `jwks-service-app`, то есть на всё, что чинится само. Длинная
+/// отсрочка ровно настолько же продлевает жизнь отозванному ключу, а отзыв
+/// конкретных токенов через `jti` в Redis в это время продолжает работать.
+/// `0` выключает отдачу устаревших снимков совсем — поведение до JWT-50.
+const DEFAULT_STALE_GRACE_SECONDS: u64 = 10;
+
 /// Собирает HTTP-клиент к сервису ключей с таймаутами.
 ///
 /// Без них `reqwest` ждёт ответа неограниченно, и зависший — не упавший, а
@@ -117,6 +130,10 @@ struct CacheState {
     /// Момент последнего похода в JWKS (успешного или нет) — для троттлинга
     /// обновлений по промаху.
     last_attempt: Option<Instant>,
+    /// Момент последнего **неудачного** похода; сбрасывается успешным. Отличает
+    /// «обновляться ещё рано» от «сервис ключей лежит»: отдавать устаревший
+    /// снимок можно только во втором случае.
+    last_failure: Option<Instant>,
 }
 
 /// Ошибки взаимодействия с сервисом ключей.
@@ -152,6 +169,9 @@ pub struct JwkService {
     cache_ttl: Duration,
     /// Минимальный интервал между обновлениями по промаху.
     miss_refresh_interval: Duration,
+    /// Отсрочка сверх TTL, в пределах которой снимок ещё отдаётся при
+    /// недоступном сервисе ключей.
+    stale_grace: Duration,
 }
 
 impl JwkService {
@@ -160,22 +180,30 @@ impl JwkService {
     pub fn new() -> Self {
         let url = env::var("JWKS_SERVICE_URL").unwrap_or("http://jwks-service-app:8080".into());
 
+        let cache_ttl = Duration::from_secs(env_seconds(
+            "JWKS_CACHE_TTL_SECONDS",
+            DEFAULT_CACHE_TTL_SECONDS,
+        ));
+        let stale_grace = Duration::from_secs(env_seconds(
+            "JWKS_CACHE_STALE_GRACE_SECONDS",
+            DEFAULT_STALE_GRACE_SECONDS,
+        ));
+
         Self {
             client: build_client(),
             url,
             cache: Arc::new(RwLock::new(CacheState {
                 entry: None,
                 last_attempt: None,
+                last_failure: None,
             })),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
-            cache_ttl: Duration::from_secs(env_seconds(
-                "JWKS_CACHE_TTL_SECONDS",
-                DEFAULT_CACHE_TTL_SECONDS,
-            )),
+            cache_ttl,
             miss_refresh_interval: Duration::from_secs(env_seconds(
                 "JWKS_CACHE_MISS_REFRESH_SECONDS",
                 DEFAULT_MISS_REFRESH_SECONDS,
             )),
+            stale_grace,
         }
     }
 
@@ -228,15 +256,20 @@ impl JwkService {
     /// 1. **Попадание** — свежий кеш содержит `kid`, в сеть не идём.
     /// 2. **Промах** — берём замок обновления и проверяем кеш ещё раз: пока мы
     ///    ждали, его мог наполнить другой запрос.
-    /// 3. Если кеш свежий, но `kid` в нём нет, это либо новый ключ, либо мусор.
-    ///    Обновляемся, но не чаще `JWKS_CACHE_MISS_REFRESH_SECONDS` — иначе поток
-    ///    случайных `kid` снова транслировался бы в JWKS один к одному.
+    /// 3. Если обновляться ещё рано (`JWKS_CACHE_MISS_REFRESH_SECONDS`), пробуем
+    ///    отдать устаревший снимок; при свежем кеше без нужного `kid` — отказываем,
+    ///    не трогая сеть, иначе поток случайных `kid` снова транслировался бы в
+    ///    JWKS один к одному.
     /// 4. Иначе идём в JWKS, обновляем кеш и ищем в нём.
+    /// 5. Если поход не удался — отдаём последний известный снимок
+    ///    (stale-while-revalidate), пока его возраст не превысил
+    ///    `JWKS_CACHE_STALE_MAX_SECONDS`.
     ///
     /// # Errors
     /// - [`JwkError::NotFound`] — ключа нет ни в кеше, ни в свежем ответе JWKS,
     ///   либо обновление сейчас троттлится;
-    /// - [`JwkError::BadConnection`] / [`JwkError::BadResponse`] — от запроса к JWKS.
+    /// - [`JwkError::BadConnection`] / [`JwkError::BadResponse`] — от запроса к JWKS,
+    ///   когда пригодного устаревшего снимка нет.
     pub async fn public_key(&self, kid: &str) -> Result<Jwk, JwkError> {
         if let Some(jwk) = self.lookup_fresh(kid) {
             record_jwks_cache("hit");
@@ -252,22 +285,136 @@ impl JwkService {
             return Ok(jwk);
         }
 
-        if self.cache_is_fresh() && !self.allow_refresh_on_miss() {
-            // Кеш свежий, ключа в нём нет, обновляться ещё рано — отказываем, не
-            // трогая сеть. Для клиента это неотличимо от «ключ не найден».
-            record_jwks_cache("throttled");
-            debug!("JWKS: kid {} неизвестен, обновление кеша троттлится", kid);
-            return Err(JwkError::NotFound);
+        if !self.allow_refresh_on_miss() {
+            // Обновляться ещё рано. Если прошлый поход провалился, повторный
+            // сейчас ничего не даст — отдаём устаревший снимок, не трогая сеть.
+            // Это не только лучше отказа: иначе запросы выстроились бы в
+            // очередь, каждый со своим таймаутом к лежащему JWKS, и верификация
+            // всё равно лежала бы — уже по латентности.
+            if self.refresh_recently_failed() {
+                if let Some(jwk) = self.serve_stale(kid) {
+                    return Ok(jwk);
+                }
+            }
+
+            if self.cache_is_fresh() {
+                // Кеш свежий, ключа в нём нет — отказываем, не трогая сеть. Для
+                // клиента это неотличимо от «ключ не найден».
+                record_jwks_cache("throttled");
+                debug!("JWKS: kid {} неизвестен, обновление кеша троттлится", kid);
+                return Err(JwkError::NotFound);
+            }
+
+            // Пригодного снимка нет вовсе — беречь тут нечего, идём в сеть.
         }
 
+        let jwks = match self.fetch_and_store().await {
+            Ok(jwks) => jwks,
+            Err(e) => {
+                // Сервис ключей не ответил, но рабочий снимок лежит в памяти —
+                // отдаём его, вместо того чтобы класть верификацию целиком.
+                return match self.serve_stale(kid) {
+                    Some(jwk) => Ok(jwk),
+                    None => {
+                        record_jwks_cache("miss");
+                        Err(e)
+                    }
+                };
+            }
+        };
+
         record_jwks_cache("miss");
-        let jwks = self.fetch_and_store().await?;
 
         jwks.keys
             .iter()
             .find(|jwk| jwk.kid == kid)
             .cloned()
             .ok_or(JwkError::NotFound)
+    }
+
+    /// Отдаёт `kid` из устаревшего снимка, если тот ещё пригоден.
+    ///
+    /// Осознанный размен: недоступный `jwks-service-app` не должен класть
+    /// верификацию на всё время аварии, пока рабочий снимок ключей лежит в
+    /// памяти. Расплата — отозванный ключ какое-то время продолжает считаться
+    /// валидным, поэтому отсрочка ограничена `JWKS_CACHE_STALE_GRACE_SECONDS`,
+    /// а сама деградация видна в логе (WARN) и в метрике
+    /// `jwks_cache_total{result="stale"}`.
+    fn serve_stale(&self, kid: &str) -> Option<Jwk> {
+        let (jwk, age) = self.lookup_stale(kid)?;
+
+        record_jwks_cache("stale");
+        // WARN, а не INFO: это деградация, и она должна быть заметна в логах.
+        tracing::warn!(
+            "JWKS недоступен: ключ {} отдан из устаревшего снимка (возраст {} с, предел {} с)",
+            kid,
+            age.as_secs(),
+            self.servable_max_age().as_secs()
+        );
+
+        Some(jwk)
+    }
+
+    /// Провалился ли последний поход в JWKS настолько недавно, что повторять его
+    /// сейчас бессмысленно.
+    ///
+    /// Отметка снимается успешным обновлением, поэтому «свежий провал» — это
+    /// именно недоступный сервис ключей, а не троттлинг мусорных `kid`.
+    fn refresh_recently_failed(&self) -> bool {
+        self.cache
+            .read()
+            .last_failure
+            .is_some_and(|at| at.elapsed() < self.miss_refresh_interval)
+    }
+
+    /// Предельный возраст снимка, которым ещё можно обслуживать верификацию:
+    /// TTL плюс отсрочка.
+    ///
+    /// При нулевом TTL кеш выключен целиком — пригодных снимков нет вовсе, и
+    /// нулевая отсрочка отдачу устаревших снимков выключает: за пределом TTL
+    /// снимок сразу перестаёт быть пригодным.
+    fn servable_max_age(&self) -> Duration {
+        if self.cache_ttl.is_zero() {
+            return Duration::ZERO;
+        }
+
+        self.cache_ttl.saturating_add(self.stale_grace)
+    }
+
+    /// Есть ли в памяти снимок, которым сервис ещё может обслуживать
+    /// верификацию (свежий или в пределах отсрочки).
+    ///
+    /// Нужен readiness-пробе: пока такой снимок есть, недоступность
+    /// `jwks-service-app` ещё не означает, что под нужно выводить из
+    /// балансировки. Пустой снимок не в счёт — ключей в нём всё равно нет.
+    pub fn has_servable_snapshot(&self) -> bool {
+        let servable_max_age = self.servable_max_age();
+
+        self.cache
+            .read()
+            .entry
+            .as_ref()
+            .is_some_and(|(jwks, fetched_at)| {
+                !jwks.keys.is_empty() && fetched_at.elapsed() < servable_max_age
+            })
+    }
+
+    /// Ищет `kid` в последнем снимке, даже протухшем, — лишь бы тот оставался
+    /// пригодным. Возвращает ключ вместе с возрастом снимка.
+    fn lookup_stale(&self, kid: &str) -> Option<(Jwk, Duration)> {
+        let state = self.cache.read();
+        let (jwks, fetched_at) = state.entry.as_ref()?;
+        let age = fetched_at.elapsed();
+
+        if age >= self.servable_max_age() {
+            return None;
+        }
+
+        jwks.keys
+            .iter()
+            .find(|jwk| jwk.kid == kid)
+            .cloned()
+            .map(|jwk| (jwk, age))
     }
 
     /// Ищет `kid` в кеше, если тот ещё свеж. `None` — промах или протухший кеш.
@@ -291,7 +438,11 @@ impl JwkService {
             .is_some_and(|(_, fetched_at)| fetched_at.elapsed() < self.cache_ttl)
     }
 
-    /// Разрешено ли сейчас внеплановое обновление по промаху; отмечает попытку.
+    /// Разрешено ли сейчас обновление по промаху; отмечает попытку.
+    ///
+    /// Троттлит не только флуд неизвестными `kid`, но и повторные походы в
+    /// недоступный JWKS: успешный поход делает кеш свежим, поэтому «попытка была
+    /// только что, а кеш не свеж» означает, что она провалилась.
     fn allow_refresh_on_miss(&self) -> bool {
         let mut state = self.cache.write();
 
@@ -313,10 +464,19 @@ impl JwkService {
             state.last_attempt = Some(Instant::now());
         }
 
-        let jwks = self.public_keys().await?;
+        let jwks = match self.public_keys().await {
+            Ok(jwks) => jwks,
+            Err(e) => {
+                // Помечаем провал: пока он свеж, повторные походы троттлятся, а
+                // запросы обслуживаются устаревшим снимком.
+                self.cache.write().last_failure = Some(Instant::now());
+                return Err(e);
+            }
+        };
 
         let mut state = self.cache.write();
         state.entry = Some((jwks.clone(), Instant::now()));
+        state.last_failure = None;
 
         Ok(jwks)
     }
@@ -468,11 +628,38 @@ mod tests {
                 cache: Arc::new(RwLock::new(CacheState {
                     entry: None,
                     last_attempt: None,
+                    last_failure: None,
                 })),
                 refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
                 cache_ttl,
                 miss_refresh_interval,
+                stale_grace: Duration::from_secs(DEFAULT_STALE_GRACE_SECONDS),
             }
+        }
+
+        /// Задаёт отсрочку сверх TTL (по умолчанию в тестах — боевая).
+        fn with_stale_grace(mut self, stale_grace: Duration) -> Self {
+            self.stale_grace = stale_grace;
+            self
+        }
+
+        /// Состаривает содержимое кеша на `age`.
+        ///
+        /// Иначе тесту протухания пришлось бы ждать TTL вживую. Вместе со
+        /// снимком сдвигается и отметка последней попытки обновления: без этого
+        /// троттлинг не пустил бы обновление в сеть и тест проверял бы не то,
+        /// что собирался.
+        fn backdate_cache(&self, age: Duration) {
+            let mut state = self.cache.write();
+
+            if let Some((_, fetched_at)) = state.entry.as_mut() {
+                *fetched_at = fetched_at
+                    .checked_sub(age)
+                    .expect("тестовый сдвиг времени должен быть в пределах монотонных часов");
+            }
+
+            state.last_attempt = state.last_attempt.and_then(|at| at.checked_sub(age));
+            state.last_failure = state.last_failure.and_then(|at| at.checked_sub(age));
         }
     }
 
@@ -637,6 +824,178 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "запрос должен был прерваться по таймауту, а занял {elapsed:?}"
         );
+    }
+
+    /// Мок JWKS, который отвечает ровно один раз, а дальше падает с `500`:
+    /// так выглядит сервис ключей, легший уже после того, как кеш прогрелся.
+    async fn start_dying_jwks_mock() -> MockServer {
+        let server = MockServer::start().await;
+
+        let jwks = json!({ "keys": [ {
+            "kty": "OKP", "alg": "EdDSA", "kid": "kid-1", "crv": "Ed25519",
+            "x": "AAAA", "y": null, "n": null, "e": null,
+        } ] });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        server
+    }
+
+    #[actix_web::test]
+    async fn stale_snapshot_is_served_when_jwks_is_down() {
+        let server = start_dying_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        assert!(service.public_key("kid-1").await.is_ok());
+
+        // Снимок протух (TTL 300 с), но в пределах отсрочки (ещё 10 с), а
+        // сервис ключей к этому моменту лёг.
+        service.backdate_cache(Duration::from_secs(305));
+
+        // Главное требование задачи: лежащий JWKS не кладёт верификацию, пока
+        // рабочий снимок ключей лежит в памяти.
+        assert!(service.public_key("kid-1").await.is_ok());
+        // Попытка обновиться всё же была — отдача устаревшего снимка её не
+        // заменяет, а страхует.
+        assert_eq!(requests_to(&server).await, 2);
+    }
+
+    #[actix_web::test]
+    async fn too_old_snapshot_is_refused() {
+        let server = start_dying_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        )
+        .with_stale_grace(Duration::from_secs(10));
+
+        assert!(service.public_key("kid-1").await.is_ok());
+
+        // 320 с — это TTL (300) плюс отсрочка (10) и ещё десять сверху.
+        // Дальше отказываем: иначе отозванный ключ считался бы валидным сколь
+        // угодно долго.
+        service.backdate_cache(Duration::from_secs(320));
+
+        assert!(matches!(
+            service.public_key("kid-1").await,
+            Err(JwkError::BadResponse)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn stale_serving_can_be_disabled() {
+        let server = start_dying_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        )
+        .with_stale_grace(Duration::ZERO);
+
+        assert!(service.public_key("kid-1").await.is_ok());
+        service.backdate_cache(Duration::from_secs(305));
+
+        // Нулевая отсрочка — прежнее поведение: недоступный JWKS означает отказ.
+        assert!(matches!(
+            service.public_key("kid-1").await,
+            Err(JwkError::BadResponse)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn down_jwks_is_not_hammered_while_stale_snapshot_serves() {
+        let server = start_dying_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        );
+
+        assert!(service.public_key("kid-1").await.is_ok());
+        service.backdate_cache(Duration::from_secs(305));
+
+        for _ in 0..5 {
+            assert!(service.public_key("kid-1").await.is_ok());
+        }
+
+        // Один неудачный поход на весь интервал троттлинга: без этого каждый
+        // запрос ждал бы таймаута лежащего JWKS, и verify всё равно лежал бы —
+        // теперь уже по латентности.
+        assert_eq!(requests_to(&server).await, 2);
+    }
+
+    #[actix_web::test]
+    async fn live_jwks_is_refreshed_even_when_refresh_is_throttled() {
+        let server = start_jwks_mock().await;
+        // TTL короче интервала троттлинга: протухший снимок есть, обновление
+        // формально «ещё рано».
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        );
+
+        assert!(service.public_key("kid-1").await.is_ok());
+        service.backdate_cache(Duration::from_secs(2));
+
+        assert!(service.public_key("kid-1").await.is_ok());
+
+        // Устаревший снимок — страховка на время аварии, а не замена живому
+        // сервису: пока JWKS отвечает, кеш обновляется.
+        assert_eq!(requests_to(&server).await, 2);
+    }
+
+    #[actix_web::test]
+    async fn snapshot_stays_servable_until_grace_runs_out() {
+        let server = start_jwks_mock().await;
+        let service = JwkService::for_test(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+        )
+        .with_stale_grace(Duration::from_secs(10));
+
+        // Пустого кеша readiness-пробе недостаточно.
+        assert!(!service.has_servable_snapshot());
+
+        assert!(service.public_key("kid-1").await.is_ok());
+        assert!(service.has_servable_snapshot());
+
+        // Протухший, но в пределах отсрочки — верификацию обслужить ещё можем.
+        service.backdate_cache(Duration::from_secs(305));
+        assert!(service.has_servable_snapshot());
+
+        // За пределом отсрочки — уже нет, и readiness обязан это показать.
+        service.backdate_cache(Duration::from_secs(10));
+        assert!(!service.has_servable_snapshot());
+    }
+
+    #[actix_web::test]
+    async fn disabled_cache_has_no_servable_snapshot() {
+        let server = start_jwks_mock().await;
+        // Нулевой TTL — кеш выключен, обслуживать из памяти нечего даже сразу
+        // после успешного запроса.
+        let service = JwkService::for_test(server.uri(), Duration::ZERO, Duration::from_secs(10));
+
+        assert!(service.public_key("kid-1").await.is_ok());
+
+        assert!(!service.has_servable_snapshot());
     }
 
     /// Мок сервиса ключей для сценариев выпуска: `GET /jwks/{id}` отвечает

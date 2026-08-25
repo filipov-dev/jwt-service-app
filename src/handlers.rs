@@ -474,33 +474,52 @@ pub async fn livez() -> HttpResponse {
     get,
     path = "/readyz",
     responses(
-        (status = 200, body = ReadinessResponse, description = "Все зависимости доступны"),
-        (status = 503, body = ReadinessResponse, description = "Одна из зависимостей недоступна")
+        (status = 200, body = ReadinessResponse, description = "Сервис готов обслуживать запросы (`ok` либо `degraded`)"),
+        (status = 503, body = ReadinessResponse, description = "Обслуживать запросы нельзя: недоступен Redis либо у сервиса ключей нет ни ответа, ни пригодного снимка")
     )
 )]
-/// Readiness-проба: проверяет доступность зависимостей.
+/// Readiness-проба: может ли под обслуживать запросы.
 ///
 /// Пингует Redis и запрашивает JWKS у `jwks-service-app`
-/// (`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обе зависимости
-/// доступны, иначе `503 Service Unavailable`. В обоих случаях тело —
+/// (`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обслуживать можем,
+/// иначе `503 Service Unavailable`. В обоих случаях тело —
 /// [`ReadinessResponse`] с детализацией по каждой зависимости.
+///
+/// **Проба спрашивает не «жива ли зависимость», а «сможем ли мы ответить».**
+/// Разница только в сервисе ключей: пока в памяти лежит пригодный снимок JWKS,
+/// верификация работает и без него (см. [`crate::jwk`]), поэтому выводить под из
+/// балансировки не за что — иначе stale-кеш не спасал бы ровно в той аварии,
+/// ради которой сделан: readiness погасил бы поды за десяток секунд, и трафик до
+/// снимка в памяти просто не дошёл бы. Состояние при этом честно показывается
+/// как `degraded`, а когда снимок перестанет быть пригодным — под уйдёт из
+/// балансировки сам.
+///
+/// Redis такой поблажки не имеет: без него не проверить `jti`, то есть отозванный
+/// токен стал бы валидным — это не деградация, а дыра.
 #[get("/readyz")]
 pub async fn readyz(redis: web::Data<RedisClient>, keys: web::Data<KeyManager>) -> HttpResponse {
     let redis_ok = redis.ping().await.is_ok();
-    let jwks_ok = keys.check_jwks().await.is_ok();
+
+    let jwks_live = keys.check_jwks().await.is_ok();
+    // Сервис ключей не ответил, но снимок в памяти ещё обслуживает верификацию.
+    let jwks_stale = !jwks_live && keys.has_servable_jwks_snapshot();
+    let jwks_ok = jwks_live || jwks_stale;
+
+    let ready = redis_ok && jwks_ok;
 
     let body = ReadinessResponse {
-        status: if redis_ok && jwks_ok {
-            "ok"
-        } else {
-            "unavailable"
+        status: match (ready, jwks_stale) {
+            (false, _) => "unavailable",
+            (true, true) => "degraded",
+            (true, false) => "ok",
         }
         .into(),
         redis: redis_ok,
         jwks: jwks_ok,
+        jwks_stale,
     };
 
-    if redis_ok && jwks_ok {
+    if ready {
         HttpResponse::Ok().json(body)
     } else {
         HttpResponse::ServiceUnavailable().json(body)
@@ -941,6 +960,65 @@ mod tests {
         assert_eq!(body.status, "unavailable");
         assert!(!body.redis);
         assert!(!body.jwks);
+    }
+
+    #[actix_web::test]
+    async fn readyz_counts_jwks_as_ready_while_snapshot_serves() {
+        let _guard = env_guard();
+
+        let key = make_key("kid-ready");
+        let server = MockServer::start().await;
+
+        // Сервис ключей отвечает ровно один раз — им прогревается кеш, — и
+        // дальше лежит.
+        let jwks = json!({ "keys": [ {
+            "kty": "OKP", "alg": "EdDSA", "kid": key.kid, "crv": "Ed25519",
+            "x": key.x_b64, "y": null, "n": null, "e": null,
+        } ] });
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        env::set_var("REDIS_URL", "redis://127.0.0.1:1");
+        set_jwks_env(&server);
+        env::remove_var("JWKS_CACHE_TTL_SECONDS");
+        env::remove_var("JWKS_CACHE_STALE_GRACE_SECONDS");
+
+        let redis = RedisClient::new().unwrap();
+        let keys = KeyManager::new("EdDSA".to_string());
+
+        // Снимок попадает в память при верификации, а не пробой: `check_jwks`
+        // намеренно ходит в сеть мимо кеша.
+        assert!(keys.get_public_key(&key.kid).await.is_ok());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(redis))
+                .app_data(web::Data::new(keys))
+                .service(readyz),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+
+        // Redis в этом тесте недоступен, поэтому под всё равно не готов — но по
+        // сервису ключей готовность держится на снимке, и видно, что она
+        // держится именно на нём.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body: ReadinessResponse = test::read_body_json(resp).await;
+        assert!(body.jwks);
+        assert!(body.jwks_stale);
+        assert!(!body.redis);
     }
 
     // --- Эндпоинты токенов ---
