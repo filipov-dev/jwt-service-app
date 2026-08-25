@@ -97,6 +97,14 @@ spec:
             - name: SERVER_WORKERS
               value: "2"
 
+            # Домены, допустимые в claim `iss` (значение заголовка Host).
+            # Пусто/не задано — любой Host, как раньше. Уточняется под кластер:
+            # это те же имена, что в ingress. Обязательно, если этот и соседние
+            # сервисы ходят в один jwks-service-app: общий ключ делает токен с
+            # чужим `iss` валидным у соседа.
+            - name: TOKEN_ISSUER_ALLOWLIST
+              value: "jwt.example.com"
+
             - name: LOG_FORMAT
               value: "json"
             - name: RUST_LOG

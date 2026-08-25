@@ -1,10 +1,24 @@
 [package]
 name = "jwt-service-app"
-version = "1.14.1"
+version = "1.15.2"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.9"
+# `http2` из дефолтных фич намеренно выключен: он тянет `h2` 0.3, которая не
+# получила патча к RUSTSEC-2026-0258 (ветка 0.3 не выходит с июля 2025), а сам
+# HTTP/2 в сервисе не используется — TLS терминирует обратный прокси и ходит к
+# апстриму по HTTP/1.x. Планируемый gRPC (JWT-102) это не задевает: `tonic`
+# поднимает собственный сервер на `hyper` с `h2` 0.4. Остальные дефолтные фичи
+# перечислены как есть — без `macros` не соберутся атрибуты `#[post]`.
+actix-web = { version = "4.9", default-features = false, features = [
+    "macros",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+    "cookies",
+    "unicode",
+    "compat",
+] }
 actix-cors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

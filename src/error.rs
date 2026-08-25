@@ -31,6 +31,8 @@ pub enum Error {
     Internal(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
     // Ни один обработчик пока не отдаёт 404, но вариант достраивает маппинг
     // ошибок в статусы (400/401/404/422) и покрыт тестом `error_response`.
     #[allow(dead_code)]
@@ -43,7 +45,7 @@ impl ResponseError for Error {
     /// [`ErrorResponse`].
     ///
     /// `Validation` → 400, `Unprocessable` → 422, `Unauthorized` → 401,
-    /// `NotFound` → 404. Остальные варианты (`Jwt`, `Redis`, `Reqwest`,
+    /// `Forbidden` → 403, `NotFound` → 404. Остальные варианты (`Jwt`, `Redis`, `Reqwest`,
     /// `Internal`) считаются внутренними и возвращают 500 с обобщённым
     /// сообщением — детали наружу не раскрываются.
     fn error_response(&self) -> HttpResponse {
@@ -53,6 +55,7 @@ impl ResponseError for Error {
                 HttpResponse::UnprocessableEntity().json(ErrorResponse::new(msg))
             }
             Error::Unauthorized(msg) => HttpResponse::Unauthorized().json(ErrorResponse::new(msg)),
+            Error::Forbidden(msg) => HttpResponse::Forbidden().json(ErrorResponse::new(msg)),
             Error::NotFound(msg) => HttpResponse::NotFound().json(ErrorResponse::new(msg)),
             _ => HttpResponse::InternalServerError()
                 .json(ErrorResponse::new("Internal server error")),
@@ -103,6 +106,13 @@ mod tests {
         let (status, body) = render(Error::Unauthorized("Invalid or expired token".into())).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body.error, "Invalid or expired token");
+    }
+
+    #[actix_web::test]
+    async fn forbidden_maps_to_403_with_message() {
+        let (status, body) = render(Error::Forbidden("Issuer not allowed".into())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.error, "Issuer not allowed");
     }
 
     #[actix_web::test]

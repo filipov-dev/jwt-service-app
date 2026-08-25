@@ -12,11 +12,13 @@
 //!
 //! Обработчики намеренно тонкие: вся доменная логика вынесена в
 //! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
-//! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации.
+//! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации; список
+//! допустимых значений при этом ограничивается аллоулистом (см.
+//! [`crate::issuer`]).
 
 use actix_web::{delete, get, post, web, HttpResponse};
 use metrics_exporter_prometheus::PrometheusHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::*;
 use crate::jwt::JwtManager;
@@ -28,6 +30,37 @@ use crate::models::{
 };
 use crate::redis::RedisClient;
 
+/// Достаёт заголовок `Host` — значение будущего claim `iss`.
+///
+/// Общая часть всех ручек, работающих с issuer: выпуск, обмен refresh и
+/// проверка. Отсутствующий или не-ASCII заголовок — ошибка клиента (`400`).
+fn host_header(req: &actix_web::HttpRequest) -> Result<&str, Error> {
+    req.headers()
+        .get("Host")
+        .ok_or(Error::Validation("Missing Host header".into()))?
+        .to_str()
+        .map_err(|_| Error::Validation("Invalid Host header".into()))
+}
+
+/// Достаёт `Host` для ручек **выпуска** токена и сверяет его с аллоулистом
+/// issuer'ов (`TOKEN_ISSUER_ALLOWLIST`, см. [`crate::issuer`]).
+///
+/// Отказ явный (`403`): выпуск дёргает доверенный internal-клиент, от которого
+/// конфигурацию инстанса скрывать незачем, а неотличимый отказ отлаживали бы
+/// вслепую. Пустой аллоулист ничего не запрещает — поведение прежнее.
+fn issuer_for_issuance(req: &actix_web::HttpRequest) -> Result<&str, Error> {
+    let host = host_header(req)?;
+    if !crate::issuer::is_allowed(host) {
+        warn!(
+            "Отказ в выпуске: issuer '{}' отсутствует в {}",
+            host,
+            crate::issuer::ALLOWLIST_VAR
+        );
+        return Err(Error::Forbidden("Issuer not allowed".into()));
+    }
+    Ok(host)
+}
+
 #[utoipa::path(
     post,
     path = "/tokens",
@@ -37,6 +70,7 @@ use crate::redis::RedisClient;
         (status = 200, body = TokenResponse),
         (status = 400, body = ErrorResponse),
         (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
+        (status = 403, body = ErrorResponse, description = "`Host` вне `TOKEN_ISSUER_ALLOWLIST` (если задан)"),
         (status = 422, body = ErrorResponse),
         (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
         (status = 500, body = ErrorResponse)
@@ -55,6 +89,7 @@ use crate::redis::RedisClient;
 ///   `aud`, невалидный `TOKEN_EXPIRATION_SECONDS` или `ttl` вне допустимых
 ///   границ);
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`;
+/// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
 /// - `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).
 #[post("/tokens")]
 pub async fn create_token(
@@ -77,12 +112,7 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
     keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let host_header = host
-        .headers()
-        .get("Host")
-        .ok_or(Error::Validation("Missing Host header".into()))?
-        .to_str()
-        .map_err(|_| Error::Validation("Invalid Host header".into()))?;
+    let host_header = issuer_for_issuance(&host)?;
 
     let issued = if req.refresh {
         JwtManager::generate_token_pair(
@@ -155,12 +185,14 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
 ///
 /// Тело запроса — [`TokenVerifyRequest`] с самим `token` и ожидаемым
 /// `audience`. Проверяются подпись (по публичному ключу из JWKS, найденному по
-/// `kid`), совпадение `iss` с заголовком `Host`, вхождение `audience` в `aud`,
+/// `kid`), совпадение `iss` с заголовком `Host` (и его допустимость по
+/// аллоулисту issuer'ов), вхождение `audience` в `aud`,
 /// временные границы (`nbf`/`iat`/`exp`) и наличие `jti` в Redis (не отозван).
 ///
 /// # Ответы
 /// - `200 OK` — токен валиден, в теле возвращаются его claims;
-/// - `401 Unauthorized` — любая ошибка проверки (намеренно без деталей);
+/// - `401 Unauthorized` — любая ошибка проверки (намеренно без деталей), в том
+///   числе `Host` вне `TOKEN_ISSUER_ALLOWLIST`;
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
 #[post("/tokens/verify")]
 pub async fn verify_token(
@@ -181,12 +213,19 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
     keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let host_header = host
-        .headers()
-        .get("Host")
-        .ok_or(Error::Validation("Missing Host header".into()))?
-        .to_str()
-        .map_err(|_| Error::Validation("Invalid Host header".into()))?;
+    let host_header = host_header(&host)?;
+
+    // Проверка — публичная ручка: причину отказа наружу не раскрываем, ответ
+    // тот же, что и на протухший токен. Issuer вне аллоулиста означает, что
+    // токен выпущен не этим контуром, даже если подпись сделана общим ключом.
+    if !crate::issuer::is_allowed(host_header) {
+        debug!(
+            "Проверка токена отклонена: issuer '{}' отсутствует в {}",
+            host_header,
+            crate::issuer::ALLOWLIST_VAR
+        );
+        return Err(Error::Unauthorized("Invalid or expired token".into()));
+    }
 
     match JwtManager::verify_token(&request.token, host_header, &request.audience, &keys, store)
         .await
@@ -347,6 +386,7 @@ pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
 /// - `200 OK` — [`TokenResponse`] с новыми `token` и `refresh_token`;
 /// - `401 Unauthorized` — токен неизвестен, истёк или уже использован (детали
 ///   наружу не раскрываются, как и при проверке токена);
+/// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
 #[post("/tokens/refresh")]
 pub async fn refresh_token(
@@ -365,12 +405,7 @@ pub async fn refresh_token_impl<S: JtiStore + 'static>(
     keys: web::Data<KeyManager>,
     host: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let host_header = host
-        .headers()
-        .get("Host")
-        .ok_or(Error::Validation("Missing Host header".into()))?
-        .to_str()
-        .map_err(|_| Error::Validation("Invalid Host header".into()))?;
+    let host_header = issuer_for_issuance(&host)?;
 
     match JwtManager::refresh_token_pair(&request.refresh_token, host_header, &keys, store).await {
         Ok((token, refresh)) => {
@@ -758,6 +793,7 @@ mod tests {
         env::remove_var("TOKEN_EXPIRATION_SECONDS");
         env::remove_var("TOKEN_TTL_MIN_SECONDS");
         env::remove_var("TOKEN_TTL_MAX_SECONDS");
+        env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
     /// Собирает тестовое приложение с эндпоинтами токенов поверх [`MockStore`].
@@ -1045,6 +1081,89 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Аллоулист issuer'ов: `Host` вне списка не выпускает токен (403), а
+    /// перечисленный — выпускает.
+    ///
+    /// Это и есть закрываемая дыра: инстанс `a.example.com`, разделяющий ключи
+    /// с `b.example.com`, не должен подписывать токены с чужим `iss`.
+    #[actix_web::test]
+    async fn create_token_rejects_issuer_outside_allowlist() {
+        let _guard = env_guard();
+        let key = make_key("kid-allowlist");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+        env::set_var(crate::issuer::ALLOWLIST_VAR, "a.example.com");
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "b.example.com"))
+            .set_json(json!({ "sub": "u", "aud": ["api1"] }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "a.example.com"))
+            .set_json(json!({ "sub": "u", "aud": ["api1"] }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        env::remove_var(crate::issuer::ALLOWLIST_VAR);
+    }
+
+    /// Пустой аллоулист — прежнее поведение: любой `Host` выпускает токен.
+    #[actix_web::test]
+    async fn create_token_allows_any_issuer_without_allowlist() {
+        let _guard = env_guard();
+        let key = make_key("kid-no-allowlist");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", "whatever.example.net"))
+            .set_json(json!({ "sub": "u", "aud": ["api1"] }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Проверка токена с `Host` вне аллоулиста → 401, как и любой другой отказ
+    /// верификации: причину публичная ручка наружу не раскрывает.
+    #[actix_web::test]
+    async fn verify_rejects_issuer_outside_allowlist() {
+        let _guard = env_guard();
+        let key = make_key("kid-allowlist-verify");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        // Токен выпущен, пока ограничений не было...
+        let token = issue_token!(&app, "user1");
+
+        // ...а после включения аллоулиста его issuer стал чужим.
+        env::set_var(crate::issuer::ALLOWLIST_VAR, "other.example.com");
+        let req = test::TestRequest::post()
+            .uri("/tokens/verify")
+            .insert_header(("Host", "example.com"))
+            .set_json(json!({ "token": token, "audience": "api1" }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
     /// Проверка истёкшего токена → 401. `jti` в хранилище присутствует, чтобы
@@ -1349,6 +1468,28 @@ mod tests {
 
         let resp = exchange!(&app, "no-such-token");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Обмен refresh-токена — тот же выпуск, поэтому `Host` вне аллоулиста
+    /// отвергается так же явно (403), как и `POST /tokens`.
+    #[actix_web::test]
+    async fn refresh_rejects_issuer_outside_allowlist() {
+        let _guard = env_guard();
+        let key = make_key("kid-allowlist-refresh");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let store = web::Data::new(MockStore::new());
+        let app = test::init_service(token_app!(store)).await;
+
+        let (_access, refresh) = issue_pair!(&app, "user1");
+
+        // Макрос обмена ходит с `Host: example.com` — теперь он вне списка.
+        env::set_var(crate::issuer::ALLOWLIST_VAR, "other.example.com");
+        let resp = exchange!(&app, &refresh);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
     #[actix_web::test]
