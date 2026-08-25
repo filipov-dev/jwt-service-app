@@ -1,0 +1,40 @@
+# Конфигурация gitleaks для прогона по всей истории репозитория.
+#
+# Запуск — scripts/scan-secrets.sh (он же крутится в
+# .github/workflows/secrets.yml). Отчёт последнего аудита и разбор находок —
+# в docs/security/secret-audit.md.
+#
+# Правила берутся стандартные и целиком: цель конфига — не ослабить детект, а
+# погасить ровно те строки, про которые уже доказано, что они не секреты.
+# Каждая запись allowlist'а — отдельная, с причиной: список должен читаться как
+# список решений, а не как «чтобы CI позеленел».
+
+title = "jwt-service-app secret scan"
+
+[extend]
+useDefault = true
+
+# Гасим по ЗНАЧЕНИЮ (regexTarget = "secret"), а не по пути к файлу.
+# Разница принципиальная: allowlist на `deployments/dev/**` заодно ослепил бы
+# сканер на настоящий секрет, случайно закоммиченный в тот же файл, — а такой
+# промах ровно в dev-стенде и вероятнее всего. Привязка к значению глушит
+# конкретные известные строки и оставляет файлы под наблюдением.
+[[allowlists]]
+description = """
+Демо-секреты локального dev-стенда и нагрузочного прогона.
+
+AUTH_TOTP_SECRET из deployments/dev/docker-compose.yml, deployments/load/run.sh,
+deployments/load/README.md и юнит-тестов в src/main.rs. Валидный base32
+(иначе сервис не стартует), поэтому у него высокая энтропия и generic-api-key
+ловит его как ключ. Декодируется в бессмыслицу — сгенерированная строка, ни к
+какому окружению не привязана.
+
+Прод-значения этих переменных в репозитории не лежат вовсе: deployments/prod/.env
+и k8s/secret.yaml в .gitignore, в репозитории только .env.example.
+"""
+regexTarget = "secret"
+regexes = [
+    '''MRSWGYLSMUQGO33WNFXGO4ZAOBWGKYLSFVRW63LOMNXW2ZI''',
+    '''dev-proxy-secret''',
+    '''dev-metrics-token''',
+]
