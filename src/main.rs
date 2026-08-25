@@ -280,8 +280,9 @@ pub async fn openapi_spec() -> impl Responder {
 ///    недоступен на старте).
 /// 5. Поднимает `HttpServer`: на публичную ручку `/tokens/verify` навешивает
 ///    разрешающий CORS, на остальные — запрещающий (`deny_cors`), и регистрирует
-///    маршруты, включая выдачу OpenAPI. Число воркеров и таймауты соединений
-///    берутся из [`ServerConfig`], а не из дефолтов actix (см. `server.rs`).
+///    маршруты, включая выдачу OpenAPI. Число воркеров, таймауты соединений и
+///    время дренажа при остановке берутся из [`ServerConfig`], а не из дефолтов
+///    actix (см. `server.rs`).
 ///
 /// # Panics
 ///
@@ -384,6 +385,11 @@ async fn main() -> std::io::Result<()> {
     .workers(server_config.workers)
     .client_request_timeout(server_config.client_request_timeout)
     .keep_alive(server_config.keep_alive)
+    // Дренаж соединений при остановке. Дефолт actix (30 с) совпадает с
+    // terminationGracePeriodSeconds в k8s-манифесте, то есть SIGKILL приходит
+    // ровно в момент истечения таймаута — здесь он заведомо короче, чтобы
+    // осталось время на досылку телеметрии ниже (см. `server.rs`).
+    .shutdown_timeout(server_config.shutdown_timeout.as_secs())
     .bind((host, port))?
     .run()
     .await?;

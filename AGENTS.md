@@ -142,7 +142,7 @@ access + refresh. Refresh-токен — непрозрачная строка, 
 | Файл | Назначение |
 |------|-----------|
 | `main.rs` | Точка входа, конфиг HTTP-сервера, логирование, CORS, роуты (с уровнями доступа), OpenAPI (`ApiDoc`). |
-| `server.rs` | Параметры `HttpServer`: число воркеров (по квоте CPU cgroup, а не по числу ядер хоста) и таймауты соединений (`client_request_timeout`, keep-alive). |
+| `server.rs` | Параметры `HttpServer`: число воркеров (по квоте CPU cgroup, а не по числу ядер хоста), таймауты соединений (`client_request_timeout`, keep-alive) и время дренажа при остановке (`shutdown_timeout`). |
 | `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret, TOTP (RFC 6238) и Bearer-токена метрик. |
 | `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP); отсюда же пишется метрика запроса. |
 | `tracing_otel.rs` | Распределённый трейсинг OpenTelemetry: OTLP-экспорт (вкл. по env), W3C-propagation (`traceparent`) на входе и в исходящих запросах к JWKS. |
@@ -275,6 +275,13 @@ Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `a
   **NetworkPolicy исполняет CNI**: плагин без её поддержки примет манифест
   молча и не сделает ничего, так что после применения стоит убедиться, что
   посторонний под до порта 8080 не достаёт.
+- **Дренаж при остановке и grace period — одна настройка на два файла.**
+  `SERVER_SHUTDOWN_TIMEOUT_SECONDS` (25 с) обязан быть строго меньше
+  `terminationGracePeriodSeconds` в k8s (30 с) и `stop_grace_period` в compose
+  (30 с): иначе SIGKILL приходит ровно тогда, когда дренаж только истекает, и
+  времени не остаётся ни на последний запрос, ни на досылку телеметрии (её
+  отправляют уже после возврата из `run()`). Меняете одно — пересчитайте другое.
+  Дефолт actix (30 с) совпал бы с grace period, поэтому таймаут задан явно.
 - **`replicas: 3`, PDB и `topologySpreadConstraints` — одна конструкция, а не
   три независимые настройки.** Разнос по узлам не даёт планировщику собрать все
   реплики на одном узле (иначе drain уносит сервис целиком), а
@@ -333,6 +340,7 @@ Release — формулировки в файле и в релизе совпа
 | `SERVER_WORKERS` | `auto` | Число воркер-потоков. `auto`/`0`/пусто — по квоте CPU cgroup (округление вверх), а при её отсутствии — потолок 4, но **не** число ядер хоста. |
 | `SERVER_CLIENT_REQUEST_TIMEOUT_MS` | `5000` | Время на приём заголовков запроса. `0` — без ограничения. |
 | `SERVER_KEEP_ALIVE_SECONDS` | `5` | Простой keep-alive-соединения. `0` — keep-alive выключен. |
+| `SERVER_SHUTDOWN_TIMEOUT_SECONDS` | `25` | Сколько времени сервер дослуживает запросы в полёте после сигнала остановки. `0` — рвать соединения сразу. Должно быть **строго меньше** `terminationGracePeriodSeconds` (k8s) / `stop_grace_period` (compose), иначе pod убивают посреди дренажа. |
 | `TOKEN_ALGORITHM` | `RS256` | Алгоритм подписи (см. `SUPPORTED_ALGORITHMS` в `key.rs`). |
 | `TOKEN_EXPIRATION_SECONDS` | `3600` | TTL токена и записи `jti` в Redis по умолчанию (когда `ttl` не передан в запросе). |
 | `TOKEN_TTL_MIN_SECONDS` | `1` | Нижняя граница кастомного `ttl` в теле `POST /tokens`. |

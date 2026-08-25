@@ -14,3 +14,7 @@ AGENTS_INTERNAL.md
 # только образцы — .env.example и k8s/secret.example.yaml.
 /deployments/prod/.env
 /deployments/prod/k8s/secret.yaml
+
+# Мусор macOS Finder: заводится в любой открытой папке, к репозиторию отношения
+# не имеет. Без слеша в начале — на любой глубине, а не только в корне.
+.DS_Store

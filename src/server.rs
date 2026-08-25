@@ -28,6 +28,21 @@
 //! публично и разворачивается в том числе напрямую, поэтому ограничение времени
 //! на приём заголовков запроса (`client_request_timeout`) и времени простоя
 //! keep-alive-соединения — не деталь тюнинга, а защита воркеров от удержания.
+//!
+//! ## Почему shutdown_timeout меньше grace period
+//!
+//! При остановке actix перестаёт принимать соединения и даёт воркерам
+//! `shutdown_timeout` на дослуживание запросов в полёте. Дефолт — 30 секунд, и
+//! ровно столько же стоит `terminationGracePeriodSeconds` в
+//! `deployments/prod/k8s/deployment.yaml`: SIGKILL прилетает в ту же секунду,
+//! когда дренаж только истекает. Запаса нет ни на добивание последнего
+//! запроса, ни на досылку телеметрии — а она отправляется уже **после**
+//! возврата из `run()` (OTel-провайдер и guard GlitchTip в `main.rs`).
+//!
+//! Поэтому дефолт здесь — [`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`], заведомо
+//! меньше grace period. Значения связаны: меняете одно — пересчитайте другое,
+//! иначе таймаут бесполезен (pod убьют раньше) либо дренаж заканчивается
+//! мгновенным SIGKILL.
 
 use std::env;
 use std::fs;
@@ -46,6 +61,12 @@ const DEFAULT_CLIENT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
 /// Таймаут простоя keep-alive-соединения по умолчанию (дефолт actix).
 const DEFAULT_KEEP_ALIVE_SECONDS: u64 = 5;
+
+/// Время на дренаж запросов при остановке, по умолчанию.
+///
+/// Меньше `terminationGracePeriodSeconds: 30` из k8s-манифеста намеренно:
+/// оставшиеся секунды уходят на досылку телеметрии после остановки сервера.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
 /// Путь к квоте CPU в cgroup v2 (`<квота|max> <период>` в микросекундах).
 const CGROUP_V2_CPU_MAX: &str = "/sys/fs/cgroup/cpu.max";
@@ -74,6 +95,8 @@ pub struct ServerConfig {
     pub client_request_timeout: Duration,
     /// Время простоя keep-alive-соединения; `Duration::ZERO` — keep-alive выключен.
     pub keep_alive: Duration,
+    /// Время на дослуживание запросов при остановке; `Duration::ZERO` — сразу.
+    pub shutdown_timeout: Duration,
     /// Откуда взялось `workers` (для лога).
     source: WorkersSource,
 }
@@ -100,6 +123,10 @@ impl ServerConfig {
                 "SERVER_KEEP_ALIVE_SECONDS",
                 DEFAULT_KEEP_ALIVE_SECONDS,
             )),
+            shutdown_timeout: Duration::from_secs(env_u64(
+                "SERVER_SHUTDOWN_TIMEOUT_SECONDS",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+            )),
             source,
         }
     }
@@ -113,26 +140,40 @@ impl ServerConfig {
             WorkersSource::Fallback => "квота CPU не обнаружена, потолок по умолчанию",
         };
         info!(
-            "HTTP-сервер: воркеров {} ({}), client_request_timeout {} мс, keep-alive {} с",
+            "HTTP-сервер: воркеров {} ({}), client_request_timeout {} мс, keep-alive {} с, \
+             shutdown_timeout {} с",
             self.workers,
             source,
             self.client_request_timeout.as_millis(),
             self.keep_alive.as_secs(),
+            self.shutdown_timeout.as_secs(),
         );
     }
 }
 
 /// Читает `u64` из переменной окружения с откатом на `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
-    match env::var(key) {
-        Err(_) => default,
-        Ok(v) => match v.trim().parse() {
-            Ok(n) => n,
-            Err(_) => {
-                warn!("{key}: нераспознанное значение '{v}', использую {default}");
-                default
-            }
-        },
+    parse_u64(env::var(key).ok().as_deref(), key, default)
+}
+
+/// Разбирает значение переменной окружения как `u64`.
+///
+/// Отсутствие переменной, пустая строка и мусор — это `default` (последнее с
+/// предупреждением): конфигурация таймаутов, как и rate limiting, не fail-fast.
+fn parse_u64(value: Option<&str>, key: &str, default: u64) -> u64 {
+    let Some(raw) = value else {
+        return default;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return default;
+    }
+    match raw.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            warn!("{key}: нераспознанное значение '{raw}', использую {default}");
+            default
+        }
     }
 }
 
@@ -267,6 +308,88 @@ mod tests {
         // На машине меньше потолка берётся её параллелизм.
         assert_eq!(auto_workers(None, 2), (2, WorkersSource::Fallback));
         assert_eq!(auto_workers(None, 0), (1, WorkersSource::Fallback));
+    }
+
+    #[test]
+    fn parse_u64_takes_explicit_value() {
+        assert_eq!(parse_u64(Some("10"), "K", 25), 10);
+        assert_eq!(parse_u64(Some(" 0 "), "K", 25), 0);
+    }
+
+    #[test]
+    fn parse_u64_falls_back_to_default() {
+        // Мусор и пустое значение не роняют сервис — берётся дефолт.
+        assert_eq!(parse_u64(None, "K", 25), 25);
+        assert_eq!(parse_u64(Some(""), "K", 25), 25);
+        assert_eq!(parse_u64(Some("   "), "K", 25), 25);
+        assert_eq!(parse_u64(Some("полминуты"), "K", 25), 25);
+        assert_eq!(parse_u64(Some("-1"), "K", 25), 25);
+    }
+
+    /// Достаёт значение простого YAML-ключа из манифеста: первая строка,
+    /// начинающаяся с `key:` (комментарии пропускаются).
+    fn manifest_value<'a>(manifest: &'a str, key: &str) -> &'a str {
+        manifest
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("в манифесте нет ключа {key}"))
+            .trim()
+            .trim_matches('"')
+    }
+
+    /// Достаёт значение переменной окружения из env-списка k8s-манифеста:
+    /// строка `value:` сразу за `- name: <KEY>`.
+    fn env_value<'a>(manifest: &'a str, key: &str) -> &'a str {
+        let mut lines = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'));
+        lines
+            .find(|line| line == &format!("- name: {key}"))
+            .unwrap_or_else(|| panic!("в манифесте нет переменной {key}"));
+        lines
+            .next()
+            .and_then(|line| line.strip_prefix("value:"))
+            .unwrap_or_else(|| panic!("у переменной {key} в манифесте нет value"))
+            .trim()
+            .trim_matches('"')
+    }
+
+    #[test]
+    fn shutdown_timeout_fits_into_grace_periods() {
+        // Таймаут дренажа и grace period оркестратора — одна настройка на два
+        // файла, и связь между ними держится этим тестом, а не внимательностью:
+        // сравняйся они (как на дефолте actix в 30 с) — SIGKILL пришёл бы ровно
+        // в момент истечения дренажа, не оставив времени ни на последний запрос,
+        // ни на досылку телеметрии после возврата из `run()`.
+        let k8s = include_str!("../deployments/prod/k8s/deployment.yaml");
+        let compose = include_str!("../deployments/prod/docker-compose.yml");
+
+        let grace: u64 = manifest_value(k8s, "terminationGracePeriodSeconds")
+            .parse()
+            .expect("terminationGracePeriodSeconds — целое число секунд");
+        let stop_grace: u64 = manifest_value(compose, "stop_grace_period")
+            .trim_end_matches('s')
+            .parse()
+            .expect("stop_grace_period — секунды вида '30s'");
+
+        assert!(
+            DEFAULT_SHUTDOWN_TIMEOUT_SECONDS < grace,
+            "дренаж {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} с не укладывается в grace period k8s {grace} с"
+        );
+        assert!(
+            DEFAULT_SHUTDOWN_TIMEOUT_SECONDS < stop_grace,
+            "дренаж {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} с не укладывается в stop_grace_period compose {stop_grace} с"
+        );
+
+        // k8s-манифест задаёт переменную явно; значение должно совпадать с
+        // дефолтом, иначе расчёт запаса в его комментариях разойдётся с кодом.
+        let in_k8s: u64 = env_value(k8s, "SERVER_SHUTDOWN_TIMEOUT_SECONDS")
+            .parse()
+            .expect("SERVER_SHUTDOWN_TIMEOUT_SECONDS в манифесте — целое число");
+        assert_eq!(in_k8s, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS);
     }
 
     #[test]
