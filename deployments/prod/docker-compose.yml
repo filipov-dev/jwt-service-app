@@ -44,6 +44,11 @@ services:
       SERVER_CLIENT_REQUEST_TIMEOUT_MS: ${SERVER_CLIENT_REQUEST_TIMEOUT_MS:-5000}
       SERVER_KEEP_ALIVE_SECONDS: ${SERVER_KEEP_ALIVE_SECONDS:-5}
 
+      # Время на дослуживание запросов при остановке. Согласовано со
+      # stop_grace_period ниже: дефолт docker — 10 с, то есть без него контейнер
+      # получил бы SIGKILL посреди дренажа.
+      SERVER_SHUTDOWN_TIMEOUT_SECONDS: ${SERVER_SHUTDOWN_TIMEOUT_SECONDS:-25}
+
       # Секреты — только из .env, который в репозиторий не коммитится.
       AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?нужен AUTH_PROXY_SECRET}
       AUTH_TOTP_SECRET: ${AUTH_TOTP_SECRET:?нужен AUTH_TOTP_SECRET}
@@ -67,6 +72,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # Дефолт docker — 10 с, меньше дренажа (SERVER_SHUTDOWN_TIMEOUT_SECONDS=25):
+    # контейнер получал бы SIGKILL с запросами в полёте. Аналог
+    # terminationGracePeriodSeconds в k8s-манифесте, запас над дренажем тот же —
+    # на досылку телеметрии после остановки сервера.
+    stop_grace_period: 30s
     healthcheck:
       # В runtime-образе нет ни curl, ни wget — только bash. Поэтому запрос
       # делается через /dev/tcp: это встроенное в bash перенаправление, внешних
