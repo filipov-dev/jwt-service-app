@@ -40,6 +40,10 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
   [`deployments/prod/`](deployments/prod/README.md): манифесты с пробами на
   `/livez` и `/readyz`, секреты из `.env`/`Secret`, заполненный
   `RATE_LIMIT_TRUSTED_PROXIES`.
+- **Аудит истории на секреты** —
+  [`docs/security/secret-audit.md`](docs/security/secret-audit.md): чем и по
+  каким ссылкам просканирована история, разбор находок и что делать, если
+  сканер нашёл настоящий секрет.
 - **Что изменилось между версиями образа** — [`CHANGELOG.md`](CHANGELOG.md):
   разделы собираются из истории коммитов, те же тексты уходят в описание
   каждого GitHub Release.
