@@ -2,14 +2,21 @@
 //!
 //! Dependencies: standard library only (`std.crypto`, `std.http`).
 //!
-//! Env: `AUTH_TOTP_SECRET` (raw bytes here, see README.md), `JWT_SERVICE_URL`
-//! (default `http://localhost:8080`).
+//! Environment:
+//! - `AUTH_TOTP_SECRET` — shared TOTP secret (see the base32 note below);
+//! - `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
 //!
-//! See README.md for endpoints, error codes and client rules.
+//! This example treats the secret as raw bytes; add a base32 decoder for Google
+//! Authenticator compatibility.
+//!
+//! **The code is recomputed before every request.** With replay protection on
+//! (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already
+//! seen with `401`, even while that code is still inside its time window.
 
 const std = @import("std");
 
-/// Sent as the Host header, becomes the `iss` claim.
+/// Sent as the Host header and becomes the `iss` claim. Must be the same on
+/// issue and on verify, or the token will not verify.
 const issuer_host = "example.com";
 
 /// Client errors.
@@ -20,10 +27,12 @@ const ClientError = error{
     MissingEnv,
 };
 
-/// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+/// Computes a fresh TOTP code for right now.
 ///
-/// Truncation follows RFC 4226 section 5.3. The code is written into `out`
-/// (exactly 6 bytes) and returned as a slice.
+/// Service defaults: SHA-1, 6 digits, 30-second step. Truncation follows
+/// RFC 4226 section 5.3.
+///
+/// The code is written into `out` (exactly 6 bytes) and returned as a slice.
 fn totpCode(secret: []const u8, out: *[6]u8) []const u8 {
     const counter: u64 = @intCast(@divFloor(std.time.timestamp(), 30));
 
@@ -43,10 +52,10 @@ fn totpCode(secret: []const u8, out: *[6]u8) []const u8 {
     return out;
 }
 
-/// Sends a level 3 request with a code computed right before the call.
+/// Sends a level 3 request.
 ///
-/// `body` is `null` for requests without one. Returns the HTTP status; the
-/// response body is written into `response_buffer`.
+/// `body` is `null` for requests without one (revocation). Returns the HTTP
+/// status; the response body is written into `response_buffer`.
 fn request(
     allocator: std.mem.Allocator,
     method: std.http.Method,
@@ -60,6 +69,7 @@ fn request(
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ service, path });
     defer allocator.free(url);
 
+    // Computed here rather than reused: one code, one request.
     var code_buffer: [6]u8 = undefined;
     const code = totpCode(secret, &code_buffer);
 
@@ -81,9 +91,19 @@ fn request(
     return @intFromEnum(result.status);
 }
 
-/// `POST /tokens`
+/// Issues an access token (`POST /tokens`).
 ///
-/// `claims_json` carries custom claims as a JSON object, or `null`.
+/// `sub` is the subject (`sub` claim), `aud` the audience (`aud` claim),
+/// `with_refresh` also returns a refresh token for extending the session, and
+/// `claims_json` carries custom claims as a JSON object (for example
+/// `{"role":"admin"}`) or `null`.
+///
+/// Custom claims sit next to the registered ones, so the consumer reads `role`,
+/// not `extra.role`. Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`,
+/// `jti`) give `422` — change lifetime through `ttl`, not `exp`.
+///
+/// Errors: `401` bad code, `422` bad parameters or forbidden claim, `500` JWKS
+/// or Redis unavailable.
 pub fn issueToken(
     allocator: std.mem.Allocator,
     sub: []const u8,
@@ -109,8 +129,16 @@ pub fn issueToken(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
-/// once the call succeeds.
+/// Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
+///
+/// The old token dies on exchange: store the new one and drop the previous.
+///
+/// **Never retry** an exchange with the old token when the reply is lost. A
+/// second presentation reads as theft, and the server revokes the whole family
+/// — refresh tokens and the access tokens issued from them. Issue a new pair
+/// instead.
+///
+/// `401` means the token is unknown, expired or already used.
 pub fn refreshTokens(
     allocator: std.mem.Allocator,
     refresh_token: []const u8,
@@ -127,7 +155,10 @@ pub fn refreshTokens(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// `DELETE /tokens/{jti}` — idempotent.
+/// Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+///
+/// Idempotent: revoking an unknown `jti` is success too. `500` means the store
+/// is unreachable and the token is **not** revoked: retry.
 pub fn revokeToken(
     allocator: std.mem.Allocator,
     jti: []const u8,
@@ -140,7 +171,11 @@ pub fn revokeToken(
     if (status != 204) return ClientError.UnexpectedStatus;
 }
 
-/// `DELETE /subjects/{sub}/tokens` — the reply carries a `revoked` field.
+/// Revokes every active token of a subject.
+///
+/// Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens cannot
+/// be killed one by one because the caller does not know their `jti`. The reply
+/// carries a `revoked` field; expired tokens do not count.
 pub fn revokeSubject(
     allocator: std.mem.Allocator,
     sub: []const u8,
@@ -153,7 +188,7 @@ pub fn revokeSubject(
     if (status != 200) return ClientError.UnexpectedStatus;
 }
 
-/// Issue -> refresh -> revoke.
+/// Full token lifecycle: issue, refresh, bulk revoke.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

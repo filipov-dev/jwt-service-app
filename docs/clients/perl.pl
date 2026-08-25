@@ -12,15 +12,30 @@ jwt-service-client — jwt-service-app level 3 (TOTP) client
 
 =head1 DESCRIPTION
 
-Issue, refresh and revoke tokens over the four level 3 endpoints.
+Covers all four level 3 endpoints: issue a token, exchange a refresh token,
+revoke one token and revoke every token of a subject.
 
-Dependencies: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>,
-C<JSON::PP>.
+Dependencies: C<Authen::OATH>, C<Convert::Base32>, C<LWP::UserAgent>, C<JSON::PP>.
 
-Env: C<AUTH_TOTP_SECRET> (base32), C<JWT_SERVICE_URL> (default
-C<http://localhost:8080>).
+=head2 Environment
 
-See README.md for endpoints, error codes and client rules.
+=over 4
+
+=item C<AUTH_TOTP_SECRET>
+
+Shared TOTP secret, base32 (required).
+
+=item C<JWT_SERVICE_URL>
+
+Service base URL, default C<http://localhost:8080>.
+
+=back
+
+=head2 One code, one request
+
+The code is recomputed B<before every request>. With replay protection on
+(C<AUTH_TOTP_REPLAY_PROTECTION>) the server rejects a code it has already seen
+with C<401>, even while that code is still inside its time window.
 
 =cut
 
@@ -33,7 +48,8 @@ use HTTP::Request;
 use JSON::PP qw(encode_json decode_json);
 use LWP::UserAgent;
 
-# Sent as the Host header, becomes the iss claim.
+# Sent as the Host header and becomes the iss claim. Must be the same on issue
+# and on verify, or the token will not verify.
 my $ISSUER_HOST = 'example.com';
 
 my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
@@ -42,7 +58,10 @@ my $SERVICE = $ENV{JWT_SERVICE_URL} // 'http://localhost:8080';
 
     my $code = totp_code();
 
-Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+Computes a fresh TOTP code for right now. Service defaults: SHA-1, 6 digits,
+30-second step.
+
+Returns six decimal digits.
 
 =cut
 
@@ -55,9 +74,10 @@ sub totp_code {
 
     my $response = request('POST', '/tokens', { sub => 'svc-a' });
 
-Sends a level 3 request with a code computed right before the call. Takes the
-HTTP method, the endpoint path and an optional body hashref; returns an
-L<HTTP::Response>.
+Sends a level 3 request. Takes the HTTP method, the endpoint path and an
+optional body hashref.
+
+Returns an L<HTTP::Response>.
 
 =cut
 
@@ -66,6 +86,7 @@ sub request {
 
     my $req = HTTP::Request->new($method => "$SERVICE$path");
 
+    # Computed here rather than reused: one code, one request.
     $req->header('X-TOTP-Code'  => totp_code());
     $req->header('Host'         => $ISSUER_HOST);
     $req->header('Content-Type' => 'application/json');
@@ -78,8 +99,21 @@ sub request {
 
     my $issued = issue_token($sub, $aud, $with_refresh, { role => 'admin' });
 
-C<POST /tokens>. Returns a hashref with C<token> and, if requested,
-C<refresh_token>.
+Issues an access token (C<POST /tokens>).
+
+Takes the subject (C<sub> claim), the audience (C<aud> claim), whether a refresh
+token is wanted for extending the session, and an optional hashref of custom
+claims.
+
+Custom claims sit next to the registered ones, so the consumer reads C<role>,
+not C<extra.role>. Reserved names (C<iss>, C<sub>, C<aud>, C<exp>, C<iat>,
+C<nbf>, C<jti>) give C<422> — change lifetime through C<ttl>, not C<exp>. Count
+and size are capped server-side.
+
+Returns a hashref with C<token> and, if requested, C<refresh_token>.
+
+Dies on C<401> (bad code), C<422> (bad parameters or forbidden claim) and
+C<500> (JWKS or Redis unavailable).
 
 =cut
 
@@ -103,8 +137,15 @@ sub issue_token {
 
     my $refreshed = refresh_tokens($refresh_token);
 
-C<POST /tokens/refresh> — returns a new pair; the old refresh token is dead once
-the call succeeds.
+Exchanges a refresh token for a new pair (C<POST /tokens/refresh>).
+
+The old token dies on exchange: store the new one and drop the previous.
+
+B<Never retry> an exchange with the old token when the reply is lost. A second
+presentation reads as theft, and the server revokes the whole family — refresh
+tokens and the access tokens issued from them. Issue a new pair instead.
+
+Dies on C<401>: the token is unknown, expired or already used.
 
 =cut
 
@@ -123,7 +164,12 @@ sub refresh_tokens {
 
     revoke_token($jti);
 
-C<DELETE /tokens/{jti}> — idempotent.
+Revokes one token by its C<jti> (C<DELETE /tokens/{jti}>).
+
+Idempotent: revoking an unknown C<jti> is success too.
+
+Dies on C<500>: the store is unreachable and the token is B<not> revoked —
+retry.
 
 =cut
 
@@ -139,7 +185,12 @@ sub revoke_token {
 
     my $count = revoke_subject($sub);
 
-C<DELETE /subjects/{sub}/tokens> — returns the number of revoked tokens.
+Revokes every active token of a subject (C<DELETE /subjects/{sub}/tokens>).
+
+The compromise path: tokens cannot be killed one by one because the caller does
+not know their C<jti>.
+
+Returns the number of revoked tokens; expired ones do not count.
 
 =cut
 
@@ -151,7 +202,7 @@ sub revoke_subject {
     return decode_json($response->content)->{revoked};
 }
 
-# Issue -> refresh -> revoke.
+# Full token lifecycle: issue, refresh, bulk revoke.
 my $issued = issue_token('svc-a', 'svc-b', 1, { role => 'admin' });
 printf "issued: %s...\n", substr($issued->{token}, 0, 32);
 

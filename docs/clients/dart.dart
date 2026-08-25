@@ -1,9 +1,14 @@
 /// jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 ///
 /// Install: `dart pub add otp http`.
-/// Env: `AUTH_TOTP_SECRET` (base32), `JWT_SERVICE_URL` (default
-/// `http://localhost:8080`).
-/// See README.md for endpoints, error codes and client rules.
+///
+/// Env:
+/// * `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+/// * `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
+///
+/// The code is recomputed **before every request**. With replay protection on
+/// (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+/// with `401`, even while that code is still inside its time window.
 library;
 
 import 'dart:convert';
@@ -12,9 +17,10 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:otp/otp.dart';
 
-/// Client of the token service.
+/// Client of the token service, covering all four level 3 endpoints.
 class JwtServiceClient {
-  /// Sent as the Host header, becomes the `iss` claim.
+  /// Sent as the Host header and becomes the `iss` claim. Must be the same on
+  /// issue and on verify, or the token will not verify.
   static const issuerHost = 'example.com';
 
   /// Service base URL.
@@ -27,6 +33,8 @@ class JwtServiceClient {
   JwtServiceClient(this.baseUrl, this.secret);
 
   /// Builds a client from the environment.
+  ///
+  /// Throws [StateError] if `AUTH_TOTP_SECRET` is not set.
   factory JwtServiceClient.fromEnv() {
     final secret = Platform.environment['AUTH_TOTP_SECRET'];
     if (secret == null) throw StateError('AUTH_TOTP_SECRET is required');
@@ -37,7 +45,7 @@ class JwtServiceClient {
     );
   }
 
-  /// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+  /// Fresh code for right now: SHA-1, 6 digits, 30-second step.
   String _totpCode() => OTP.generateTOTPCodeString(
         secret,
         DateTime.now().millisecondsSinceEpoch,
@@ -47,19 +55,30 @@ class JwtServiceClient {
         isGoogle: true,
       );
 
-  /// Headers with a code computed right before the call.
+  /// Headers with a code computed here, not reused: one code, one request.
   Map<String, String> _headers() => {
         'X-TOTP-Code': _totpCode(),
         'Host': issuerHost,
         'Content-Type': 'application/json',
       };
 
-  /// `POST /tokens`
+  /// Issues an access token (`POST /tokens`).
   ///
-  /// [sub] subject, [aud] audience, [withRefresh] also ask for a refresh token,
-  /// [claims] custom claims.
+  /// [sub] is the subject (`sub` claim), [aud] the audience (`aud` claim, must
+  /// not be empty), [withRefresh] also returns a refresh token for extending
+  /// the session, and [claims] are custom values (role, scope, tenant) placed
+  /// next to the registered ones, so the consumer reads `role`, not
+  /// `extra.role`.
   ///
-  /// Returns `{"token": ..., "refresh_token": ...}`.
+  /// Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) are
+  /// rejected with `422` — change lifetime through `ttl`, not `exp`. Count and
+  /// size are capped server-side.
+  ///
+  /// Returns `{"token": ..., "refresh_token": ...}`; `refresh_token` is present
+  /// only if it was requested.
+  ///
+  /// Throws [HttpException]: `401` bad code, `422` bad parameters or forbidden
+  /// claim, `500` JWKS or Redis unavailable.
   Future<Map<String, dynamic>> issueToken(
     String sub,
     List<String> aud, {
@@ -82,10 +101,18 @@ class JwtServiceClient {
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
-  /// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
-  /// once the call succeeds.
+  /// Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
   ///
-  /// [refreshToken] token from an issue or a previous refresh.
+  /// The old token dies on exchange: store the new one and drop the previous.
+  ///
+  /// **Never retry** an exchange with the old token when the reply is lost. A
+  /// second presentation reads as theft, and the server revokes the whole
+  /// family — refresh tokens and the access tokens issued from them. Issue a
+  /// new pair instead.
+  ///
+  /// [refreshToken] comes from an issue or a previous exchange.
+  ///
+  /// Throws [HttpException]: `401` — token unknown, expired or already used.
   Future<Map<String, dynamic>> refreshTokens(String refreshToken) async {
     final response = await http.post(
       Uri.parse('$baseUrl/tokens/refresh'),
@@ -100,7 +127,13 @@ class JwtServiceClient {
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
-  /// `DELETE /tokens/{jti}` — idempotent.
+  /// Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+  ///
+  /// Idempotent: revoking an unknown [jti] is success too — the desired state
+  /// holds either way.
+  ///
+  /// Throws [HttpException]: `500` — store unreachable, the token is **not**
+  /// revoked; retry.
   Future<void> revokeToken(String jti) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/tokens/$jti'),
@@ -112,7 +145,12 @@ class JwtServiceClient {
     }
   }
 
-  /// `DELETE /subjects/{sub}/tokens` — returns the number of revoked tokens.
+  /// Revokes every active token of a subject.
+  ///
+  /// Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+  /// cannot be killed one by one because the caller does not know their `jti`.
+  ///
+  /// Returns the number of revoked tokens; expired ones do not count.
   Future<int> revokeSubject(String sub) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/subjects/$sub/tokens'),
@@ -127,7 +165,7 @@ class JwtServiceClient {
   }
 }
 
-/// Issue -> refresh -> revoke.
+/// Full token lifecycle: issue, refresh, bulk revoke.
 Future<void> main() async {
   final client = JwtServiceClient.fromEnv();
 

@@ -3,10 +3,15 @@
  *
  * Dependencies are pulled in with {@code @Grab}.
  *
- * Env: {@code AUTH_TOTP_SECRET} (base32), {@code JWT_SERVICE_URL} (default
- * {@code http://localhost:8080}).
+ * Env:
+ * <ul>
+ *   <li>{@code AUTH_TOTP_SECRET} — shared TOTP secret, base32 (required);</li>
+ *   <li>{@code JWT_SERVICE_URL} — base URL, default {@code http://localhost:8080}.</li>
+ * </ul>
  *
- * See README.md for endpoints, error codes and client rules.
+ * <b>The code is recomputed before every request.</b> With replay protection on
+ * ({@code AUTH_TOTP_REPLAY_PROTECTION}) the server rejects a code it has already
+ * seen with {@code 401}, even while that code is still inside its time window.
  */
 @Grab('com.eatthepath:java-otp:0.4.0')
 @Grab('commons-codec:commons-codec:1.16.0')
@@ -22,11 +27,14 @@ import java.net.http.HttpResponse
 import java.time.Instant
 
 /**
- * Client of the token service.
+ * Client of the token service, covering all four level 3 endpoints.
  */
 class JwtServiceClient {
 
-    /** Sent as the Host header, becomes the {@code iss} claim. */
+    /**
+     * Sent as the Host header and becomes the {@code iss} claim. Must be the
+     * same on issue and on verify, or the token will not verify.
+     */
     static final String ISSUER_HOST = 'example.com'
 
     private final String baseUrl
@@ -58,7 +66,7 @@ class JwtServiceClient {
     }
 
     /**
-     * Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+     * Fresh code for right now: SHA-1, 6 digits, 30-second step.
      *
      * @return six decimal digits
      */
@@ -67,12 +75,12 @@ class JwtServiceClient {
     }
 
     /**
-     * Sends a level 3 request with a code computed right before the call.
+     * Sends a level 3 request.
      *
      * @param method HTTP method
      * @param path endpoint path
-     * @param body request body, or {@code null}
-     * @return service reply
+     * @param body request body, or {@code null} when there is none
+     * @return the service reply
      */
     private HttpResponse<String> request(String method, String path, String body) {
         def publisher = body == null
@@ -80,6 +88,7 @@ class JwtServiceClient {
                 : HttpRequest.BodyPublishers.ofString(body)
 
         def request = HttpRequest.newBuilder(URI.create("$baseUrl$path"))
+                // Computed here rather than reused: one code, one request.
                 .header('X-TOTP-Code', totpCode())
                 .header('Host', ISSUER_HOST)
                 .header('Content-Type', 'application/json')
@@ -90,14 +99,20 @@ class JwtServiceClient {
     }
 
     /**
-     * {@code POST /tokens}
+     * Issues an access token ({@code POST /tokens}).
      *
-     * @param sub subject
-     * @param aud audience
-     * @param withRefresh also ask for a refresh token
-     * @param claims custom claims
+     * @param sub subject the token is issued to ({@code sub} claim)
+     * @param aud audience ({@code aud} claim); must not be empty
+     * @param withRefresh also return a refresh token for extending the session
+     * @param claims custom claims (role, scope, tenant) — they sit next to the
+     *        registered ones, so the consumer reads {@code role}, not
+     *        {@code extra.role}. Reserved names ({@code iss}, {@code sub},
+     *        {@code aud}, {@code exp}, {@code iat}, {@code nbf}, {@code jti})
+     *        give {@code 422} — change lifetime through {@code ttl}
      * @return parsed reply with {@code token} and, if requested,
      *         {@code refresh_token}
+     * @throws IllegalStateException {@code 401} bad code, {@code 422} bad
+     *         parameters or forbidden claim, {@code 500} JWKS or Redis unavailable
      */
     Map issueToken(String sub, List<String> aud, boolean withRefresh = false, Map claims = [:]) {
         def payload = [sub: sub, aud: aud, refresh: withRefresh]
@@ -114,11 +129,19 @@ class JwtServiceClient {
     }
 
     /**
-     * {@code POST /tokens/refresh} — returns a new pair; the old refresh token
-     * is dead once the call succeeds.
+     * Exchanges a refresh token for a new pair ({@code POST /tokens/refresh}).
      *
-     * @param refreshToken token from an issue or a previous refresh
+     * The old token dies on exchange: store the new one and drop the previous.
+     *
+     * <b>Never retry</b> an exchange with the old token when the reply is lost.
+     * A second presentation reads as theft, and the server revokes the whole
+     * family — refresh tokens and the access tokens issued from them. Issue a
+     * new pair instead.
+     *
+     * @param refreshToken token from an issue or a previous exchange
      * @return the new access + refresh pair
+     * @throws IllegalStateException {@code 401} — token unknown, expired or
+     *         already used
      */
     Map refreshTokens(String refreshToken) {
         def body = JsonOutput.toJson([refresh_token: refreshToken])
@@ -132,9 +155,14 @@ class JwtServiceClient {
     }
 
     /**
-     * {@code DELETE /tokens/{jti}} — idempotent.
+     * Revokes one token by its {@code jti} ({@code DELETE /tokens/{jti}}).
+     *
+     * Idempotent: revoking an unknown {@code jti} is success too — the desired
+     * state holds either way.
      *
      * @param jti token id from the {@code jti} claim
+     * @throws IllegalStateException {@code 500} — store unreachable, the token
+     *         is NOT revoked: retry
      */
     void revokeToken(String jti) {
         def response = request('DELETE', "/tokens/$jti", null)
@@ -145,10 +173,16 @@ class JwtServiceClient {
     }
 
     /**
-     * {@code DELETE /subjects/{sub}/tokens}
+     * Revokes every active token of a subject.
      *
-     * @param sub subject whose tokens are revoked
-     * @return number of revoked tokens
+     * Endpoint {@code DELETE /subjects/{sub}/tokens}. The compromise path:
+     * tokens cannot be killed one by one because the caller does not know their
+     * {@code jti}.
+     *
+     * @param sub subject whose tokens are killed
+     * @return number of revoked tokens; expired ones do not count
+     * @throws IllegalStateException {@code 500} — store unreachable, nothing
+     *         was revoked
      */
     int revokeSubject(String sub) {
         def response = request('DELETE', "/subjects/$sub/tokens", null)
@@ -161,7 +195,7 @@ class JwtServiceClient {
     }
 }
 
-// Issue -> refresh -> revoke.
+// Full token lifecycle: issue, refresh, bulk revoke.
 def client = JwtServiceClient.fromEnv()
 
 def issued = client.issueToken('svc-a', ['svc-b'], true, [role: 'admin'])

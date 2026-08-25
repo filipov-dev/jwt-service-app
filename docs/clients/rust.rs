@@ -8,9 +8,13 @@
 //! serde = { version = "1", features = ["derive"] }
 //! ```
 //!
-//! Env: `AUTH_TOTP_SECRET` (base32), `JWT_SERVICE_URL` (default
-//! `http://localhost:8080`).
-//! See README.md for endpoints, error codes and client rules.
+//! Env:
+//! - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+//! - `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
+//!
+//! **The code is recomputed before every request.** With replay protection on
+//! (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already
+//! seen with `401`, even while that code is still inside its time window.
 
 use std::env;
 
@@ -19,15 +23,16 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
 
-/// Sent as the Host header, becomes the `iss` claim.
+/// Sent as the Host header and becomes the `iss` claim. Must be the same on
+/// issue and on verify, or the token will not verify.
 const ISSUER_HOST: &str = "example.com";
 
-/// Reply of an issue or refresh call.
+/// Reply of an issue or a refresh call.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     /// Signed JWT: `header.payload.signature`.
     pub token: String,
-    /// Present only when a refresh token was requested.
+    /// Refresh token; present only if it was requested.
     #[serde(default)]
     pub refresh_token: Option<String>,
 }
@@ -35,7 +40,7 @@ pub struct TokenResponse {
 /// Reply of a bulk revoke call.
 #[derive(Debug, Deserialize)]
 pub struct RevokeGroupResponse {
-    /// Number of revoked tokens.
+    /// How many active tokens were revoked; expired ones do not count.
     pub revoked: u64,
 }
 
@@ -45,12 +50,12 @@ struct IssueRequest<'a> {
     sub: &'a str,
     aud: &'a [String],
     refresh: bool,
-    /// Custom claims; the field is omitted when empty.
+    /// Custom claims; the field is omitted when there are none.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     claims: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Client of the token service.
+/// Client of the token service, covering all four level 3 endpoints.
 pub struct Client {
     base_url: String,
     secret: String,
@@ -71,7 +76,7 @@ impl Client {
         }
     }
 
-    /// Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+    /// Fresh code for right now: SHA-1, 6 digits, 30-second step.
     fn totp_code(&self) -> Result<String, Box<dyn std::error::Error>> {
         let totp = TOTP::new(
             Algorithm::SHA1,
@@ -84,15 +89,16 @@ impl Client {
         Ok(totp.generate_current()?)
     }
 
-    /// Sends a level 3 request with a code computed right before the call.
+    /// Sends a level 3 request.
     ///
-    /// `body` is `None` for requests without one.
+    /// `body` is `None` for requests without one (revocation).
     fn request<B: Serialize>(
         &self,
         method: Method,
         path: &str,
         body: Option<&B>,
     ) -> Result<Response, Box<dyn std::error::Error>> {
+        // Computed here rather than reused: one code, one request.
         let mut builder = self
             .http
             .request(method, format!("{}{path}", self.base_url))
@@ -106,7 +112,21 @@ impl Client {
         Ok(builder.send()?)
     }
 
-    /// `POST /tokens`
+    /// Issues an access token (`POST /tokens`).
+    ///
+    /// # Arguments
+    /// - `sub` — subject the token is issued to (`sub` claim);
+    /// - `aud` — audience (`aud` claim); must not be empty;
+    /// - `with_refresh` — also return a refresh token for extending the session;
+    /// - `claims` — custom claims (role, scope, tenant). They sit next to the
+    ///   registered ones, so the consumer reads `role`, not `extra.role`.
+    ///   Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) are
+    ///   rejected with `422` — change lifetime through `ttl`, not `exp`. Count
+    ///   and size are capped server-side.
+    ///
+    /// # Errors
+    /// `401` bad code, `422` bad parameters or forbidden claim, `500` JWKS or
+    /// Redis unavailable.
     pub fn issue_token(
         &self,
         sub: &str,
@@ -129,7 +149,18 @@ impl Client {
         Ok(response.json()?)
     }
 
-    /// `POST /tokens/refresh` — returns a new pair; the old refresh token is dead.
+    /// Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
+    ///
+    /// The old token dies on exchange: store the new one and drop the previous.
+    ///
+    /// # Warning
+    /// Never retry an exchange with the old token when the reply is lost. A
+    /// second presentation reads as theft, and the server revokes the **whole
+    /// family** — refresh tokens and the access tokens issued from them. Issue
+    /// a new pair instead.
+    ///
+    /// # Errors
+    /// `401` — token unknown, expired or already used.
     pub fn refresh_tokens(
         &self,
         refresh_token: &str,
@@ -144,7 +175,13 @@ impl Client {
         Ok(response.json()?)
     }
 
-    /// `DELETE /tokens/{jti}` — idempotent.
+    /// Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+    ///
+    /// Idempotent: revoking an unknown `jti` is success too — the desired state
+    /// holds either way.
+    ///
+    /// # Errors
+    /// `500` — store unreachable, the token is **not** revoked: retry.
     pub fn revoke_token(&self, jti: &str) -> Result<(), Box<dyn std::error::Error>> {
         let response =
             self.request::<()>(Method::DELETE, &format!("/tokens/{jti}"), None)?;
@@ -156,7 +193,15 @@ impl Client {
         Ok(())
     }
 
-    /// `DELETE /subjects/{sub}/tokens` — returns the number of revoked tokens.
+    /// Revokes every active token of a subject.
+    ///
+    /// Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+    /// cannot be killed one by one because the caller does not know their `jti`.
+    ///
+    /// Returns the number of revoked tokens; expired ones do not count.
+    ///
+    /// # Errors
+    /// `500` — store unreachable, nothing was revoked.
     pub fn revoke_subject(&self, sub: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let response =
             self.request::<()>(Method::DELETE, &format!("/subjects/{sub}/tokens"), None)?;
@@ -170,7 +215,7 @@ impl Client {
     }
 }
 
-/// Issue -> refresh -> revoke.
+/// Full token lifecycle: issue, refresh, bulk revoke.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::from_env();
 

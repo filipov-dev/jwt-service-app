@@ -2,9 +2,14 @@
  * jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
  * Dependencies: `dev.turingcomplete:kotlin-onetimepassword`, `commons-codec`.
- * Env: `AUTH_TOTP_SECRET` (base32), `JWT_SERVICE_URL` (default
- * `http://localhost:8080`).
- * See README.md for endpoints, error codes and client rules.
+ *
+ * Env:
+ * - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+ * - `JWT_SERVICE_URL` — service base URL, default `http://localhost:8080`.
+ *
+ * **The code is recomputed before every request.** With replay protection on
+ * (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+ * with `401`, even while that code is still inside its time window.
  */
 
 import dev.turingcomplete.kotlinonetimepassword.HmacAlgorithm
@@ -18,7 +23,7 @@ import java.net.http.HttpResponse
 import java.util.concurrent.TimeUnit
 
 /**
- * Client of the token service.
+ * Client of the token service, covering all four level 3 endpoints.
  *
  * @property baseUrl service base URL
  * @param secret shared TOTP secret, base32
@@ -26,7 +31,10 @@ import java.util.concurrent.TimeUnit
 class JwtServiceClient(private val baseUrl: String, secret: String) {
 
     private companion object {
-        /** Sent as the Host header, becomes the `iss` claim. */
+        /**
+         * Sent as the Host header and becomes the `iss` claim. Must be the same
+         * on issue and on verify, or the token will not verify.
+         */
         const val ISSUER_HOST = "example.com"
     }
 
@@ -38,16 +46,20 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
         TimeBasedOneTimePasswordConfig(30, TimeUnit.SECONDS, 6, HmacAlgorithm.SHA1),
     )
 
-    /** Fresh TOTP code, computed right before each call. */
+    /**
+     * Fresh code for right now.
+     *
+     * @return six decimal digits
+     */
     private fun totpCode(): String = totp.generate()
 
     /**
-     * Sends a level 3 request with a fresh code.
+     * Sends a level 3 request.
      *
      * @param method HTTP method
      * @param path endpoint path
-     * @param body request body, or `null`
-     * @return service reply
+     * @param body request body, or `null` when there is none
+     * @return the service reply
      */
     private fun request(method: String, path: String, body: String?): HttpResponse<String> {
         val publisher = body
@@ -55,6 +67,7 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
             ?: HttpRequest.BodyPublishers.noBody()
 
         val request = HttpRequest.newBuilder(URI.create(baseUrl + path))
+            // Computed here rather than reused: one code, one request.
             .header("X-TOTP-Code", totpCode())
             .header("Host", ISSUER_HOST)
             .header("Content-Type", "application/json")
@@ -65,13 +78,19 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
     }
 
     /**
-     * `POST /tokens`
+     * Issues an access token (`POST /tokens`).
      *
-     * @param sub subject
-     * @param aud audience
-     * @param withRefresh also ask for a refresh token
-     * @param claimsJson custom claims as a JSON object, or `null`
+     * @param sub subject the token is issued to (`sub` claim)
+     * @param aud audience (`aud` claim)
+     * @param withRefresh also return a refresh token for extending the session
+     * @param claimsJson custom claims as a JSON object (for example
+     *   `{"role":"admin"}`) or `null`. They sit next to the registered ones, so
+     *   the consumer reads `role`, not `extra.role`; reserved names (`iss`,
+     *   `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) give `422` — change lifetime
+     *   through `ttl`, not `exp`
      * @return response body: `{"token": ..., "refresh_token": ...}`
+     * @throws IllegalStateException `401` bad code, `422` bad parameters or
+     *   forbidden claim, `500` JWKS or Redis unavailable
      */
     fun issueToken(
         sub: String,
@@ -88,11 +107,18 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
     }
 
     /**
-     * `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
-     * once the call succeeds.
+     * Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
      *
-     * @param refreshToken token from an issue or a previous refresh
+     * The old token dies on exchange: store the new one and drop the previous.
+     *
+     * **Never retry** an exchange with the old token when the reply is lost. A
+     * second presentation reads as theft, and the server revokes the whole
+     * family — refresh tokens and the access tokens issued from them. Issue a
+     * new pair instead.
+     *
+     * @param refreshToken token from an issue or a previous exchange
      * @return response body with the new pair
+     * @throws IllegalStateException `401` — token unknown, expired or already used
      */
     fun refreshTokens(refreshToken: String): String {
         val response = request("POST", "/tokens/refresh", """{"refresh_token":"$refreshToken"}""")
@@ -102,9 +128,14 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
     }
 
     /**
-     * `DELETE /tokens/{jti}` — idempotent.
+     * Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+     *
+     * Idempotent: revoking an unknown `jti` is success too — the desired state
+     * holds either way.
      *
      * @param jti token id from the `jti` claim
+     * @throws IllegalStateException `500` — store unreachable, the token is NOT
+     *   revoked; retry
      */
     fun revokeToken(jti: String) {
         val response = request("DELETE", "/tokens/$jti", null)
@@ -112,10 +143,14 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
     }
 
     /**
-     * `DELETE /subjects/{sub}/tokens`
+     * Revokes every active token of a subject.
      *
-     * @param sub subject whose tokens are revoked
-     * @return response body: `{"revoked": N}`
+     * Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+     * cannot be killed one by one because the caller does not know their `jti`.
+     *
+     * @param sub subject whose tokens are killed
+     * @return response body `{"revoked": N}`; expired tokens do not count
+     * @throws IllegalStateException `500` — store unreachable, nothing was revoked
      */
     fun revokeSubject(sub: String): String {
         val response = request("DELETE", "/subjects/$sub/tokens", null)
@@ -125,7 +160,7 @@ class JwtServiceClient(private val baseUrl: String, secret: String) {
     }
 }
 
-/** Issue -> refresh -> revoke. */
+/** Full token lifecycle: issue, refresh, bulk revoke. */
 fun main() {
     val service = System.getenv("JWT_SERVICE_URL") ?: "http://localhost:8080"
     val secret = requireNotNull(System.getenv("AUTH_TOTP_SECRET")) { "AUTH_TOTP_SECRET is required" }

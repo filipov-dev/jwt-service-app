@@ -1,17 +1,19 @@
 // jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 //
 // Install: SwiftOTP (SPM).
-// Env: AUTH_TOTP_SECRET (base32), JWT_SERVICE_URL (default http://localhost:8080).
-// See README.md for endpoints, error codes and client rules.
+//
+// Env:
+//   AUTH_TOTP_SECRET — shared TOTP secret, base32 (required);
+//   JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
 
 import Foundation
 import SwiftOTP
 
-/// Reply of an issue or refresh call.
+/// Reply of an issue or a refresh call.
 struct TokenResponse: Decodable {
     /// Signed JWT: `header.payload.signature`.
     let token: String
-    /// Present only when a refresh token was requested.
+    /// Refresh token; present only if it was requested.
     let refreshToken: String?
 
     enum CodingKeys: String, CodingKey {
@@ -22,7 +24,7 @@ struct TokenResponse: Decodable {
 
 /// Reply of a bulk revoke call.
 struct RevokeGroupResponse: Decodable {
-    /// Number of revoked tokens.
+    /// How many active tokens were revoked; expired ones do not count.
     let revoked: Int
 }
 
@@ -35,9 +37,15 @@ enum ClientError: Error {
 }
 
 /// Client of the token service, covering all four level 3 endpoints.
+///
+/// - Important: the code is recomputed **before every request**. With replay
+///   protection on (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it
+///   has already seen with `401`, even while that code is still inside its time
+///   window.
 struct JwtServiceClient {
 
-    /// Sent as the Host header, becomes the `iss` claim.
+    /// Sent as the Host header and becomes the `iss` claim. Must be the same on
+    /// issue and on verify, or the token will not verify.
     private static let issuerHost = "example.com"
 
     private let baseURL: String
@@ -58,18 +66,21 @@ struct JwtServiceClient {
         self.totp = totp
     }
 
-    /// Fresh TOTP code, computed right before each call.
+    /// Fresh code for right now.
+    ///
+    /// - Returns: six decimal digits.
+    /// - Throws: ``ClientError/totpFailed`` if the generator fails.
     private func totpCode() throws -> String {
         guard let code = totp.generate(time: Date()) else { throw ClientError.totpFailed }
         return code
     }
 
-    /// Sends a level 3 request with a fresh code.
+    /// Sends a level 3 request.
     ///
     /// - Parameters:
     ///   - method: HTTP method.
     ///   - path: endpoint path.
-    ///   - body: request body, or `nil`.
+    ///   - body: request body, or `nil` when there is none.
     /// - Returns: response body and HTTP status.
     private func request(
         _ method: String,
@@ -79,6 +90,7 @@ struct JwtServiceClient {
         var request = URLRequest(url: URL(string: baseURL + path)!)
         request.httpMethod = method
 
+        // Computed here rather than reused: one code, one request.
         request.setValue(try totpCode(), forHTTPHeaderField: "X-TOTP-Code")
         request.setValue(Self.issuerHost, forHTTPHeaderField: "Host")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -93,14 +105,19 @@ struct JwtServiceClient {
         return (data, status)
     }
 
-    /// `POST /tokens`
+    /// Issues an access token (`POST /tokens`).
     ///
     /// - Parameters:
-    ///   - sub: subject.
-    ///   - aud: audience.
-    ///   - withRefresh: also ask for a refresh token.
-    ///   - claims: custom claims.
+    ///   - sub: subject the token is issued to (`sub` claim).
+    ///   - aud: audience (`aud` claim); must not be empty.
+    ///   - withRefresh: also return a refresh token for extending the session.
+    ///   - claims: custom claims (role, scope, tenant). They sit next to the
+    ///     registered ones, so the consumer reads `role`, not `extra.role`.
+    ///     Reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`) are
+    ///     rejected with `422` — change lifetime through `ttl`, not `exp`.
     /// - Returns: the issued token and, if requested, a refresh token.
+    /// - Throws: ``ClientError/unexpectedStatus(_:)`` — `401` bad code, `422`
+    ///   bad parameters or forbidden claim, `500` JWKS or Redis unavailable.
     func issueToken(
         sub: String,
         aud: [String],
@@ -116,11 +133,19 @@ struct JwtServiceClient {
         return try JSONDecoder().decode(TokenResponse.self, from: data)
     }
 
-    /// `POST /tokens/refresh` — returns a new pair; the old refresh token is
-    /// dead once the call succeeds.
+    /// Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
     ///
-    /// - Parameter refreshToken: token from an issue or a previous refresh.
+    /// The old token dies on exchange: store the new one and drop the previous.
+    ///
+    /// - Warning: never retry an exchange with the old token when the reply is
+    ///   lost. A second presentation reads as theft, and the server revokes the
+    ///   whole family — refresh tokens and the access tokens issued from them.
+    ///   Issue a new pair instead.
+    ///
+    /// - Parameter refreshToken: token from an issue or a previous exchange.
     /// - Returns: the new access + refresh pair.
+    /// - Throws: ``ClientError/unexpectedStatus(_:)`` — `401` if the token is
+    ///   unknown, expired or already used.
     func refreshTokens(_ refreshToken: String) async throws -> TokenResponse {
         let (data, status) = try await request(
             "POST", "/tokens/refresh",
@@ -131,18 +156,27 @@ struct JwtServiceClient {
         return try JSONDecoder().decode(TokenResponse.self, from: data)
     }
 
-    /// `DELETE /tokens/{jti}` — idempotent.
+    /// Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+    ///
+    /// Idempotent: revoking an unknown `jti` is success too — the desired state
+    /// holds either way.
     ///
     /// - Parameter jti: token id from the `jti` claim.
+    /// - Throws: ``ClientError/unexpectedStatus(_:)`` — `500`, the store is
+    ///   unreachable and the token is **not** revoked: retry.
     func revokeToken(_ jti: String) async throws {
         let (_, status) = try await request("DELETE", "/tokens/\(jti)")
         guard status == 204 else { throw ClientError.unexpectedStatus(status) }
     }
 
-    /// `DELETE /subjects/{sub}/tokens`
+    /// Revokes every active token of a subject.
     ///
-    /// - Parameter sub: subject whose tokens are revoked.
-    /// - Returns: number of revoked tokens.
+    /// Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+    /// cannot be killed one by one because the caller does not know their `jti`.
+    ///
+    /// - Parameter sub: subject whose tokens are killed.
+    /// - Returns: number of revoked tokens; expired ones do not count.
+    /// - Throws: ``ClientError/unexpectedStatus(_:)`` — `500`, nothing was revoked.
     func revokeSubject(_ sub: String) async throws -> Int {
         let (data, status) = try await request("DELETE", "/subjects/\(sub)/tokens")
 
@@ -151,7 +185,7 @@ struct JwtServiceClient {
     }
 }
 
-// Issue -> refresh -> revoke.
+// Full token lifecycle: issue, refresh, bulk revoke.
 let service = ProcessInfo.processInfo.environment["JWT_SERVICE_URL"] ?? "http://localhost:8080"
 let secret = ProcessInfo.processInfo.environment["AUTH_TOTP_SECRET"]!
 

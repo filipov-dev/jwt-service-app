@@ -3,8 +3,14 @@
  * jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
  *
  * Install: composer require spomky-labs/otphp
- * Env: AUTH_TOTP_SECRET (base32), JWT_SERVICE_URL (default http://localhost:8080).
- * See README.md for endpoints, error codes and client rules.
+ *
+ * Env:
+ * - AUTH_TOTP_SECRET — shared TOTP secret, base32 (required);
+ * - JWT_SERVICE_URL — service base URL, default http://localhost:8080.
+ *
+ * The code is recomputed before every request. With replay protection on
+ * (AUTH_TOTP_REPLAY_PROTECTION) the server rejects a code it has already seen
+ * with 401, even while that code is still inside its time window.
  *
  * @package JwtServiceClient
  */
@@ -16,12 +22,13 @@ require __DIR__ . '/vendor/autoload.php';
 use OTPHP\TOTP;
 
 /**
- * Client of the token service.
+ * Client of the token service, covering all four level 3 endpoints.
  */
 final class JwtServiceClient
 {
     /**
-     * Sent as the Host header, becomes the `iss` claim.
+     * Sent as the Host header and becomes the `iss` claim. Must be the same on
+     * issue and on verify, or the token will not verify.
      */
     private const ISSUER_HOST = 'example.com';
 
@@ -49,9 +56,9 @@ final class JwtServiceClient
     }
 
     /**
-     * Fresh TOTP code: SHA-1, 6 digits, 30-second step.
+     * Fresh code for right now: SHA-1, 6 digits, 30-second step.
      *
-     * @return string
+     * @return string Six decimal digits.
      */
     private function totpCode(): string
     {
@@ -59,13 +66,14 @@ final class JwtServiceClient
     }
 
     /**
-     * Sends a level 3 request with a code computed right before the call.
+     * Sends a level 3 request. The code is computed here rather than reused:
+     * one code, one request.
      *
      * @param string            $method HTTP method.
      * @param string            $path   Endpoint path.
-     * @param array<mixed>|null $body   Request body, if any.
+     * @param array<mixed>|null $body   Request body, or null when there is none.
      *
-     * @return array{status:int, body:string}
+     * @return array{status:int, body:string} Status and response body.
      */
     private function request(string $method, string $path, ?array $body = null): array
     {
@@ -91,14 +99,26 @@ final class JwtServiceClient
     }
 
     /**
-     * POST /tokens
+     * Issues an access token (POST /tokens).
      *
-     * @param string              $sub
-     * @param list<string>        $aud
-     * @param bool                $withRefresh
-     * @param array<string,mixed> $claims
+     * @param string              $sub         Subject the token is issued to.
+     * @param list<string>        $aud         Audience; must not be empty.
+     * @param bool                $withRefresh Also return a refresh token for
+     *                                         extending the session.
+     * @param array<string,mixed> $claims      Custom claims (role, scope,
+     *                                         tenant): they sit next to the
+     *                                         registered ones, so the consumer
+     *                                         reads role, not extra.role.
+     *                                         Reserved names (iss, sub, aud,
+     *                                         exp, iat, nbf, jti) give 422 —
+     *                                         change lifetime through ttl, not
+     *                                         exp. Count and size are capped
+     *                                         server-side.
      *
-     * @return array{token:string, refresh_token?:string}
+     * @return array{token:string, refresh_token?:string} The issued token.
+     *
+     * @throws RuntimeException 401 bad code, 422 bad parameters or forbidden
+     *                          claim, 500 JWKS or Redis unavailable.
      */
     public function issueToken(
         string $sub,
@@ -121,11 +141,20 @@ final class JwtServiceClient
     }
 
     /**
-     * POST /tokens/refresh — returns a new pair; the old refresh token is dead.
+     * Exchanges a refresh token for a new pair (POST /tokens/refresh).
      *
-     * @param string $refreshToken
+     * The old token dies on exchange: store the new one and drop the previous.
      *
-     * @return array{token:string, refresh_token:string}
+     * Never retry an exchange with the old token when the reply is lost. A
+     * second presentation reads as theft, and the server revokes the whole
+     * family — refresh tokens and the access tokens issued from them. Issue a
+     * new pair instead.
+     *
+     * @param string $refreshToken Token from an issue or a previous exchange.
+     *
+     * @return array{token:string, refresh_token:string} The new pair.
+     *
+     * @throws RuntimeException 401 — token unknown, expired or already used.
      */
     public function refreshTokens(string $refreshToken): array
     {
@@ -141,9 +170,15 @@ final class JwtServiceClient
     }
 
     /**
-     * DELETE /tokens/{jti} — idempotent.
+     * Revokes one token by its jti (DELETE /tokens/{jti}).
      *
-     * @param string $jti
+     * Idempotent: revoking an unknown jti is success too — the desired state
+     * holds either way.
+     *
+     * @param string $jti Token id from the jti claim.
+     *
+     * @throws RuntimeException 500 — store unreachable, the token is NOT
+     *                          revoked; retry.
      */
     public function revokeToken(string $jti): void
     {
@@ -155,11 +190,16 @@ final class JwtServiceClient
     }
 
     /**
-     * DELETE /subjects/{sub}/tokens
+     * Revokes every active token of a subject.
      *
-     * @param string $sub
+     * Endpoint DELETE /subjects/{sub}/tokens. The compromise path: tokens
+     * cannot be killed one by one because the caller does not know their jti.
      *
-     * @return int Number of revoked tokens.
+     * @param string $sub Subject whose tokens are killed.
+     *
+     * @return int Number of revoked tokens; expired ones do not count.
+     *
+     * @throws RuntimeException 500 — store unreachable, nothing was revoked.
      */
     public function revokeSubject(string $sub): int
     {
@@ -173,6 +213,7 @@ final class JwtServiceClient
     }
 }
 
+// Full token lifecycle: issue, refresh, bulk revoke.
 $client = JwtServiceClient::fromEnv();
 
 $issued = $client->issueToken('svc-a', ['svc-b'], true, ['role' => 'admin']);

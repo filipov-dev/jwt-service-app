@@ -2,11 +2,12 @@
 '
 ' TOTP is computed with .NET HMACSHA1, no external packages needed.
 '
-' Env:
-'   AUTH_TOTP_SECRET — shared TOTP secret (raw UTF-8 bytes here, see README.md);
-'   JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
+' Environment:
+'   AUTH_TOTP_SECRET — shared TOTP secret (see the base32 note below);
+'   JWT_SERVICE_URL  — base URL, default http://localhost:8080.
 '
-' See README.md for endpoints, error codes and client rules.
+' This example treats the secret as raw UTF-8 bytes; add a base32 decoder for
+' Google Authenticator compatibility.
 
 Imports System
 Imports System.Net.Http
@@ -17,9 +18,17 @@ Imports System.Text.Json
 ''' <summary>
 ''' Client of the token service, covering all four level 3 endpoints.
 ''' </summary>
+''' <remarks>
+''' The code is recomputed <b>before every request</b>. With replay protection on
+''' (<c>AUTH_TOTP_REPLAY_PROTECTION</c>) the server rejects a code it has already
+''' seen with <c>401</c>, even while that code is still inside its time window.
+''' </remarks>
 Public Class JwtServiceClient
 
-    ''' <summary>Sent as the Host header, becomes the <c>iss</c> claim.</summary>
+    ''' <summary>
+    ''' Sent as the Host header and becomes the <c>iss</c> claim. Must be the
+    ''' same on issue and on verify, or the token will not verify.
+    ''' </summary>
     Private Const IssuerHost As String = "example.com"
 
     Private ReadOnly _baseUrl As String
@@ -49,9 +58,12 @@ Public Class JwtServiceClient
         Return New JwtServiceClient(service, secret)
     End Function
 
-    ''' <summary>Fresh TOTP code: SHA-1, 6 digits, 30-second step.</summary>
+    ''' <summary>Computes a fresh TOTP code for right now.</summary>
     ''' <returns>Six decimal digits.</returns>
-    ''' <remarks>Truncation follows RFC 4226 section 5.3.</remarks>
+    ''' <remarks>
+    ''' Service defaults: SHA-1, 6 digits, 30-second step. Truncation follows
+    ''' RFC 4226 section 5.3.
+    ''' </remarks>
     Private Function TotpCode() As String
         Dim counter As Long = DateTimeOffset.UtcNow.ToUnixTimeSeconds() \ 30
 
@@ -72,15 +84,16 @@ Public Class JwtServiceClient
         End Using
     End Function
 
-    ''' <summary>Sends a level 3 request with a code computed right before the call.</summary>
+    ''' <summary>Sends a level 3 request.</summary>
     ''' <param name="method">HTTP method.</param>
     ''' <param name="path">Endpoint path.</param>
-    ''' <param name="body">Request body, or <c>Nothing</c>.</param>
+    ''' <param name="body">Request body, or <c>Nothing</c> when there is none.</param>
     ''' <returns>HTTP status and response body.</returns>
     Private Function Request(method As HttpMethod, path As String, body As String) _
         As (Status As Integer, Body As String)
 
         Using message As New HttpRequestMessage(method, _baseUrl & path)
+            ' Computed here rather than reused: one code, one request.
             message.Headers.Add("X-TOTP-Code", TotpCode())
             message.Headers.Host = IssuerHost
 
@@ -93,12 +106,22 @@ Public Class JwtServiceClient
         End Using
     End Function
 
-    ''' <summary><c>POST /tokens</c></summary>
-    ''' <param name="subject">Subject.</param>
-    ''' <param name="audience">Audience.</param>
-    ''' <param name="withRefresh">Also ask for a refresh token.</param>
-    ''' <param name="claimsJson">Custom claims as a JSON object, or <c>Nothing</c>.</param>
+    ''' <summary>Issues an access token (<c>POST /tokens</c>).</summary>
+    ''' <param name="subject">Subject the token is issued to (claim <c>sub</c>).</param>
+    ''' <param name="audience">Audience (claim <c>aud</c>).</param>
+    ''' <param name="withRefresh">Also return a refresh token for extending the session.</param>
+    ''' <param name="claimsJson">
+    ''' Custom claims as a JSON object (for example <c>{"role":"admin"}</c>) or
+    ''' <c>Nothing</c>. They sit next to the registered ones, so the consumer
+    ''' reads <c>role</c>, not <c>extra.role</c>; reserved names (<c>iss</c>,
+    ''' <c>sub</c>, <c>aud</c>, <c>exp</c>, <c>iat</c>, <c>nbf</c>, <c>jti</c>)
+    ''' give <c>422</c> — change lifetime through <c>ttl</c>, not <c>exp</c>.
+    ''' </param>
     ''' <returns>Response body with <c>token</c> and, if requested, <c>refresh_token</c>.</returns>
+    ''' <exception cref="InvalidOperationException">
+    ''' <c>401</c> bad code, <c>422</c> bad parameters or forbidden claim,
+    ''' <c>500</c> JWKS or Redis unavailable.
+    ''' </exception>
     Public Function IssueToken(subject As String, audience As String,
                                Optional withRefresh As Boolean = False,
                                Optional claimsJson As String = Nothing) As String
@@ -114,10 +137,21 @@ Public Class JwtServiceClient
         Return result.Body
     End Function
 
-    ''' <summary><c>POST /tokens/refresh</c></summary>
-    ''' <param name="refreshToken">Token from an issue or a previous refresh.</param>
+    ''' <summary>Exchanges a refresh token for a new pair (<c>POST /tokens/refresh</c>).</summary>
+    ''' <param name="refreshToken">Token from an issue or a previous exchange.</param>
     ''' <returns>Response body with the new pair.</returns>
-    ''' <remarks>The old refresh token is dead once the call succeeds.</remarks>
+    ''' <remarks>
+    ''' The old token dies on exchange: store the new one and drop the previous.
+    ''' <para>
+    ''' <b>Never retry</b> an exchange with the old token when the reply is lost.
+    ''' A second presentation reads as theft, and the server revokes the whole
+    ''' family — refresh tokens and the access tokens issued from them. Issue a
+    ''' new pair instead.
+    ''' </para>
+    ''' </remarks>
+    ''' <exception cref="InvalidOperationException">
+    ''' <c>401</c> — token unknown, expired or already used.
+    ''' </exception>
     Public Function RefreshTokens(refreshToken As String) As String
         Dim body = $"{{""refresh_token"":""{refreshToken}""}}"
         Dim result = Request(HttpMethod.Post, "/tokens/refresh", body)
@@ -129,9 +163,12 @@ Public Class JwtServiceClient
         Return result.Body
     End Function
 
-    ''' <summary><c>DELETE /tokens/{jti}</c></summary>
+    ''' <summary>Revokes one token by its <c>jti</c> (<c>DELETE /tokens/{jti}</c>).</summary>
     ''' <param name="jti">Token id from the <c>jti</c> claim.</param>
-    ''' <remarks>Idempotent.</remarks>
+    ''' <remarks>Idempotent: revoking an unknown <c>jti</c> is success too.</remarks>
+    ''' <exception cref="InvalidOperationException">
+    ''' <c>500</c> — store unreachable, the token is NOT revoked: retry.
+    ''' </exception>
     Public Sub RevokeToken(jti As String)
         Dim result = Request(HttpMethod.Delete, $"/tokens/{jti}", Nothing)
 
@@ -140,9 +177,14 @@ Public Class JwtServiceClient
         End If
     End Sub
 
-    ''' <summary><c>DELETE /subjects/{sub}/tokens</c></summary>
-    ''' <param name="subject">Subject whose tokens are revoked.</param>
-    ''' <returns>Number of revoked tokens.</returns>
+    ''' <summary>Revokes every active token of a subject.</summary>
+    ''' <param name="subject">Subject whose tokens are killed.</param>
+    ''' <returns>Number of revoked tokens; expired ones do not count.</returns>
+    ''' <remarks>
+    ''' Endpoint <c>DELETE /subjects/{sub}/tokens</c>. The compromise path:
+    ''' tokens cannot be killed one by one because the caller does not know
+    ''' their <c>jti</c>.
+    ''' </remarks>
     Public Function RevokeSubject(subject As String) As Integer
         Dim result = Request(HttpMethod.Delete, $"/subjects/{subject}/tokens", Nothing)
 
@@ -157,7 +199,7 @@ Public Class JwtServiceClient
 
 End Class
 
-''' <summary>Issue -> refresh -> revoke.</summary>
+''' <summary>Full token lifecycle: issue, refresh, bulk revoke.</summary>
 Module Program
     ''' <summary>Entry point.</summary>
     Sub Main()

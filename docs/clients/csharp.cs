@@ -1,8 +1,10 @@
 // jwt-service-app level 3 (TOTP) client: issue, refresh, revoke.
 //
 // Install: dotnet add package Otp.NET
-// Env: AUTH_TOTP_SECRET (base32), JWT_SERVICE_URL (default http://localhost:8080).
-// See README.md for endpoints, error codes and client rules.
+//
+// Env:
+//   AUTH_TOTP_SECRET — shared TOTP secret, base32 (required);
+//   JWT_SERVICE_URL  — service base URL, default http://localhost:8080.
 
 using System;
 using System.Collections.Generic;
@@ -12,22 +14,32 @@ using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using OtpNet;
 
-/// <summary>Reply of an issue or refresh call.</summary>
+/// <summary>Reply of an issue or a refresh call.</summary>
 public sealed record TokenResponse(
     /// <summary>Signed JWT: header.payload.signature.</summary>
     [property: JsonPropertyName("token")] string Token,
-    /// <summary>Present only when a refresh token was requested.</summary>
+    /// <summary>Refresh token; present only if it was requested.</summary>
     [property: JsonPropertyName("refresh_token")] string? RefreshToken);
 
 /// <summary>Reply of a bulk revoke call.</summary>
 public sealed record RevokeGroupResponse(
-    /// <summary>Number of revoked tokens.</summary>
+    /// <summary>How many active tokens were revoked; expired ones do not count.</summary>
     [property: JsonPropertyName("revoked")] int Revoked);
 
-/// <summary>Client of the token service, covering all four level 3 endpoints.</summary>
+/// <summary>
+/// Client of the token service, covering all four level 3 endpoints.
+/// </summary>
+/// <remarks>
+/// The code is recomputed <b>before every request</b>. With replay protection on
+/// (<c>AUTH_TOTP_REPLAY_PROTECTION</c>) the server rejects a code it has already
+/// seen with <c>401</c>, even while that code is still inside its time window.
+/// </remarks>
 public sealed class JwtServiceClient
 {
-    /// <summary>Sent as the Host header, becomes the <c>iss</c> claim.</summary>
+    /// <summary>
+    /// Sent as the Host header and becomes the <c>iss</c> claim. Must be the
+    /// same on issue and on verify, or the token will not verify.
+    /// </summary>
     private const string IssuerHost = "example.com";
 
     private readonly string _baseUrl;
@@ -57,7 +69,10 @@ public sealed class JwtServiceClient
         return new JwtServiceClient(service, secret);
     }
 
-    /// <summary>Builds a request with a code computed right before the call.</summary>
+    /// <summary>
+    /// Builds a request with a code computed here rather than reused: one code,
+    /// one request.
+    /// </summary>
     /// <param name="method">HTTP method.</param>
     /// <param name="path">Endpoint path.</param>
     /// <returns>The request, ready to send.</returns>
@@ -71,12 +86,22 @@ public sealed class JwtServiceClient
         return request;
     }
 
-    /// <summary><c>POST /tokens</c></summary>
-    /// <param name="sub">Subject.</param>
-    /// <param name="aud">Audience.</param>
-    /// <param name="withRefresh">Also ask for a refresh token.</param>
-    /// <param name="claims">Custom claims, or <c>null</c>.</param>
+    /// <summary>Issues an access token (<c>POST /tokens</c>).</summary>
+    /// <param name="sub">Subject the token is issued to (<c>sub</c> claim).</param>
+    /// <param name="aud">Audience (<c>aud</c> claim); must not be empty.</param>
+    /// <param name="withRefresh">Also return a refresh token for extending the session.</param>
+    /// <param name="claims">
+    /// Custom claims (role, scope, tenant). They sit next to the registered
+    /// ones, so the consumer reads <c>role</c>, not <c>extra.role</c>. Reserved
+    /// names (<c>iss</c>, <c>sub</c>, <c>aud</c>, <c>exp</c>, <c>iat</c>,
+    /// <c>nbf</c>, <c>jti</c>) are rejected with <c>422</c> — change lifetime
+    /// through <c>ttl</c>, not <c>exp</c>. Count and size are capped server-side.
+    /// </param>
     /// <returns>The issued token and, if requested, a refresh token.</returns>
+    /// <exception cref="HttpRequestException">
+    /// <c>401</c> bad code, <c>422</c> bad parameters or forbidden claim,
+    /// <c>500</c> JWKS or Redis unavailable.
+    /// </exception>
     public async Task<TokenResponse> IssueTokenAsync(
         string sub,
         string[] aud,
@@ -95,12 +120,21 @@ public sealed class JwtServiceClient
                ?? throw new InvalidOperationException("empty response");
     }
 
-    /// <summary>
-    /// <c>POST /tokens/refresh</c> — returns a new pair; the old refresh token
-    /// is dead once the call succeeds.
-    /// </summary>
-    /// <param name="refreshToken">Token from an issue or a previous refresh.</param>
+    /// <summary>Exchanges a refresh token for a new pair (<c>POST /tokens/refresh</c>).</summary>
+    /// <remarks>
+    /// The old token dies on exchange: store the new one and drop the previous.
+    /// <para>
+    /// <b>Never retry</b> an exchange with the old token when the reply is lost.
+    /// A second presentation reads as theft, and the server revokes the whole
+    /// family — refresh tokens and the access tokens issued from them. Issue a
+    /// new pair instead.
+    /// </para>
+    /// </remarks>
+    /// <param name="refreshToken">Token from an issue or a previous exchange.</param>
     /// <returns>The new access + refresh pair.</returns>
+    /// <exception cref="HttpRequestException">
+    /// <c>401</c> — token unknown, expired or already used.
+    /// </exception>
     public async Task<TokenResponse> RefreshTokensAsync(string refreshToken)
     {
         var request = Request(HttpMethod.Post, "/tokens/refresh");
@@ -113,17 +147,32 @@ public sealed class JwtServiceClient
                ?? throw new InvalidOperationException("empty response");
     }
 
-    /// <summary><c>DELETE /tokens/{jti}</c> — idempotent.</summary>
+    /// <summary>Revokes one token by its <c>jti</c> (<c>DELETE /tokens/{jti}</c>).</summary>
+    /// <remarks>
+    /// Idempotent: revoking an unknown <c>jti</c> is success too — the desired
+    /// state holds either way.
+    /// </remarks>
     /// <param name="jti">Token id from the <c>jti</c> claim.</param>
+    /// <exception cref="HttpRequestException">
+    /// <c>500</c> — store unreachable, the token is NOT revoked: retry.
+    /// </exception>
     public async Task RevokeTokenAsync(string jti)
     {
         var response = await _http.SendAsync(Request(HttpMethod.Delete, $"/tokens/{jti}"));
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary><c>DELETE /subjects/{sub}/tokens</c></summary>
-    /// <param name="sub">Subject whose tokens are revoked.</param>
-    /// <returns>Number of revoked tokens.</returns>
+    /// <summary>Revokes every active token of a subject.</summary>
+    /// <remarks>
+    /// Endpoint <c>DELETE /subjects/{sub}/tokens</c>. The compromise path:
+    /// tokens cannot be killed one by one because the caller does not know
+    /// their <c>jti</c>.
+    /// </remarks>
+    /// <param name="sub">Subject whose tokens are killed.</param>
+    /// <returns>Number of revoked tokens; expired ones do not count.</returns>
+    /// <exception cref="HttpRequestException">
+    /// <c>500</c> — store unreachable, nothing was revoked.
+    /// </exception>
     public async Task<int> RevokeSubjectAsync(string sub)
     {
         var response = await _http.SendAsync(Request(HttpMethod.Delete, $"/subjects/{sub}/tokens"));
@@ -134,7 +183,7 @@ public sealed class JwtServiceClient
     }
 }
 
-/// <summary>Issue -> refresh -> revoke.</summary>
+/// <summary>Full token lifecycle: issue, refresh, bulk revoke.</summary>
 public static class Program
 {
     /// <summary>Entry point.</summary>

@@ -3,10 +3,13 @@
   * Dependencies: `com.eatthepath:java-otp`,
   * `com.softwaremill.sttp.client3::core`, `commons-codec`.
   *
-  * Env: `AUTH_TOTP_SECRET` (base32), `JWT_SERVICE_URL` (default
-  * `http://localhost:8080`).
+  * Env:
+  *   - `AUTH_TOTP_SECRET` — shared TOTP secret, base32 (required);
+  *   - `JWT_SERVICE_URL` — base URL, default `http://localhost:8080`.
   *
-  * See README.md for endpoints, error codes and client rules.
+  * '''The code is recomputed before every request.''' With replay protection on
+  * (`AUTH_TOTP_REPLAY_PROTECTION`) the server rejects a code it has already seen
+  * with `401`, even while that code is still inside its time window.
   */
 
 import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator
@@ -16,7 +19,7 @@ import sttp.client3.*
 import java.time.{Duration, Instant}
 import javax.crypto.spec.SecretKeySpec
 
-/** Client of the token service.
+/** Client of the token service, covering all four level 3 endpoints.
   *
   * @param baseUrl
   *   service base URL
@@ -25,7 +28,9 @@ import javax.crypto.spec.SecretKeySpec
   */
 class JwtServiceClient(baseUrl: String, secret: String):
 
-  /** Sent as the Host header, becomes the `iss` claim. */
+  /** Sent as the Host header and becomes the `iss` claim. Must be the same on
+    * issue and on verify, or the token will not verify.
+    */
   private val IssuerHost = "example.com"
 
   private val backend = HttpClientSyncBackend()
@@ -34,36 +39,47 @@ class JwtServiceClient(baseUrl: String, secret: String):
   // Service defaults: SHA-1, 6 digits, 30-second step.
   private val totp = TimeBasedOneTimePasswordGenerator(Duration.ofSeconds(30), 6)
 
-  /** Fresh TOTP code, computed right before each call. */
+  /** Fresh code for right now.
+    *
+    * @return
+    *   six decimal digits
+    */
   private def totpCode(): String =
     f"${totp.generateOneTimePassword(key, Instant.now())}%06d"
 
-  /** Sends a level 3 request with a fresh code.
+  /** Sends a level 3 request.
     *
     * @param request
     *   request without the auth headers
     * @return
-    *   service reply
+    *   the service reply
     */
   private def send(request: RequestT[Identity, Either[String, String], Any]) =
     request
+      // Computed here rather than reused: one code, one request.
       .header("X-TOTP-Code", totpCode())
       .header("Host", IssuerHost)
       .contentType("application/json")
       .send(backend)
 
-  /** `POST /tokens`
+  /** Issues an access token (`POST /tokens`).
     *
     * @param sub
-    *   subject
+    *   subject the token is issued to (`sub` claim)
     * @param aud
-    *   audience
+    *   audience (`aud` claim)
     * @param withRefresh
-    *   also ask for a refresh token
+    *   also return a refresh token for extending the session
     * @param claimsJson
-    *   custom claims as a JSON object, or `None`
+    *   custom claims as a JSON object (for example `{"role":"admin"}`) or
+    *   `None`. They sit next to the registered ones, so the consumer reads
+    *   `role`, not `extra.role`; reserved names (`iss`, `sub`, `aud`, `exp`,
+    *   `iat`, `nbf`, `jti`) give `422` — change lifetime through `ttl`
     * @return
     *   response body: `{"token": ..., "refresh_token": ...}`
+    * @throws IllegalStateException
+    *   `401` bad code, `422` bad parameters or forbidden claim, `500` JWKS or
+    *   Redis unavailable
     */
   def issueToken(
       sub: String,
@@ -80,13 +96,21 @@ class JwtServiceClient(baseUrl: String, secret: String):
       identity,
     )
 
-  /** `POST /tokens/refresh` — returns a new pair; the old refresh token is dead
-    * once the call succeeds.
+  /** Exchanges a refresh token for a new pair (`POST /tokens/refresh`).
+    *
+    * The old token dies on exchange: store the new one and drop the previous.
+    *
+    * '''Never retry''' an exchange with the old token when the reply is lost. A
+    * second presentation reads as theft, and the server revokes the whole
+    * family — refresh tokens and the access tokens issued from them. Issue a
+    * new pair instead.
     *
     * @param refreshToken
-    *   token from an issue or a previous refresh
+    *   token from an issue or a previous exchange
     * @return
     *   response body with the new pair
+    * @throws IllegalStateException
+    *   `401` — token unknown, expired or already used
     */
   def refreshTokens(refreshToken: String): String =
     val body = s"""{"refresh_token":"$refreshToken"}"""
@@ -97,10 +121,15 @@ class JwtServiceClient(baseUrl: String, secret: String):
       identity,
     )
 
-  /** `DELETE /tokens/{jti}` — idempotent.
+  /** Revokes one token by its `jti` (`DELETE /tokens/{jti}`).
+    *
+    * Idempotent: revoking an unknown `jti` is success too — the desired state
+    * holds either way.
     *
     * @param jti
     *   token id from the `jti` claim
+    * @throws IllegalStateException
+    *   `500` — store unreachable, the token is NOT revoked; retry
     */
   def revokeToken(jti: String): Unit =
     val response = send(basicRequest.delete(uri"$baseUrl/tokens/$jti"))
@@ -108,12 +137,17 @@ class JwtServiceClient(baseUrl: String, secret: String):
     if response.code.code != 204 then
       throw IllegalStateException(s"revoke failed: ${response.code}")
 
-  /** `DELETE /subjects/{sub}/tokens`
+  /** Revokes every active token of a subject.
+    *
+    * Endpoint `DELETE /subjects/{sub}/tokens`. The compromise path: tokens
+    * cannot be killed one by one because the caller does not know their `jti`.
     *
     * @param sub
-    *   subject whose tokens are revoked
+    *   subject whose tokens are killed
     * @return
-    *   response body: `{"revoked": N}`
+    *   response body `{"revoked": N}`; expired tokens do not count
+    * @throws IllegalStateException
+    *   `500` — store unreachable, nothing was revoked
     */
   def revokeSubject(sub: String): String =
     val response = send(basicRequest.delete(uri"$baseUrl/subjects/$sub/tokens"))
@@ -123,7 +157,7 @@ class JwtServiceClient(baseUrl: String, secret: String):
       identity,
     )
 
-/** Issue -> refresh -> revoke. */
+/** Full token lifecycle: issue, refresh, bulk revoke. */
 @main def run(): Unit =
   val service = sys.env.getOrElse("JWT_SERVICE_URL", "http://localhost:8080")
   val secret = sys.env.getOrElse("AUTH_TOTP_SECRET", sys.error("AUTH_TOTP_SECRET is required"))
