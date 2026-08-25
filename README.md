@@ -35,7 +35,9 @@ HTTP-сервис на Rust (actix-web) для выпуска, проверки 
   включить и куда оно течёт (stdout/JSON, Prometheus и Zabbix, OpenTelemetry и
   Monium, GlitchTip), сводная таблица переменных и готовые конфиги.
 - **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret`,
-  `totp` и `metrics_token` для уровней 2, 3 и 4).
+  `totp` и `metrics_token` для уровней 2, 3 и 4). Тот же документ лежит в
+  репозитории — [`docs/openapi.json`](docs/openapi.json), поэтому изменения
+  контракта видно в диффе PR.
 - **Прод-деплой: Docker Compose и Kubernetes** —
   [`deployments/prod/`](deployments/prod/README.md): манифесты с пробами на
   `/livez` и `/readyz`, секреты из `.env`/`Secret`, заполненный

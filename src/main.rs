@@ -17,8 +17,7 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use std::env;
 use std::rc::Rc;
 use tracing::info;
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
-use utoipa::{Modify, OpenApi};
+use utoipa::OpenApi;
 
 mod auth;
 mod error;
@@ -30,6 +29,7 @@ mod key;
 mod logging;
 mod metrics;
 mod models;
+mod openapi;
 mod rate_limit;
 mod redis;
 mod sentry_glitchtip;
@@ -43,86 +43,9 @@ use crate::handlers::{
 };
 use crate::key::KeyManager;
 use crate::logging::{init_subscriber, RequestLog};
-use crate::models::{
-    ErrorResponse, ReadinessResponse, RefreshRequest, RevokeGroupResponse, TokenRequest,
-    TokenResponse,
-};
 use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
 use crate::server::ServerConfig;
-
-/// Корневой описатель OpenAPI-документации.
-///
-/// Перечисляет пути (эндпоинты) и компоненты-схемы, из которых `utoipa`
-/// генерирует OpenAPI-спецификацию. При добавлении нового эндпоинта его нужно
-/// зарегистрировать здесь в `paths(...)`, а новые DTO — в `components(schemas(...))`,
-/// иначе они не попадут в спеку.
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        handlers::create_token,
-        handlers::verify_token,
-        handlers::refresh_token,
-        handlers::revoke_token,
-        handlers::revoke_subject_tokens,
-        handlers::livez,
-        handlers::readyz,
-        handlers::metrics
-    ),
-    components(schemas(
-        TokenRequest,
-        TokenResponse,
-        ErrorResponse,
-        ReadinessResponse,
-        RefreshRequest,
-        RevokeGroupResponse
-    )),
-    modifiers(&SecurityAddon)
-)]
-struct ApiDoc;
-
-/// Регистрирует security-схемы для уровней доступа 2 и 3.
-///
-/// Уровень 2 (`proxy_secret`) и уровень 3 (`totp`) требуют заголовка-`apiKey`.
-/// Имена заголовков — дефолтные (`X-Proxy-Secret` / `X-TOTP-Code`); при их
-/// переопределении через env обновите и описание в OpenAPI. Уровень 1 (health,
-/// OpenAPI) защиты не требует и схем не имеет.
-struct SecurityAddon;
-
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        // `components` уже создан, т.к. в схеме есть зарегистрированные DTO.
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
-                "proxy_secret",
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                    "X-Proxy-Secret",
-                    "Уровень 2: статический секрет, проставляемый обратным прокси. \
-                     Прокси ОБЯЗАН затирать клиентскую версию заголовка.",
-                ))),
-            );
-            components.add_security_scheme(
-                "totp",
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                    "X-TOTP-Code",
-                    "Уровень 3: текущий TOTP-код (RFC 6238) на общем секрете.",
-                ))),
-            );
-            components.add_security_scheme(
-                "metrics_token",
-                SecurityScheme::Http(
-                    HttpBuilder::new()
-                        .scheme(HttpAuthScheme::Bearer)
-                        .description(Some(
-                            "Уровень 4: статический Bearer-токен для скрейпа /metrics \
-                             (AUTH_METRICS_TOKEN).",
-                        ))
-                        .build(),
-                ),
-            );
-        }
-    }
-}
 
 /// Рестриктивный CORS для НЕ-публичных ручек.
 ///
@@ -265,7 +188,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
 pub async fn openapi_spec() -> impl Responder {
     HttpResponse::Ok()
         .content_type("application/json")
-        .body(ApiDoc::openapi().to_json().unwrap())
+        .body(crate::openapi::ApiDoc::openapi().to_json().unwrap())
 }
 
 /// Инициализирует и запускает HTTP-сервер.
@@ -643,33 +566,6 @@ mod tests {
 
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Спека перечисляет все опубликованные пути.
-    ///
-    /// Аннотации `#[utoipa::path]` живут на **обобщённых** обработчиках (JWT-60):
-    /// потеряться при рефакторинге они могут молча — компилятор на это не ругается,
-    /// а Swagger UI просто недосчитается ручки.
-    // `#[test]` здесь разрешился бы в `actix_web::test` (модуль импортирован
-    // выше), поэтому берём его же явно — тесту async не нужен, но и не мешает.
-    #[actix_web::test]
-    async fn openapi_spec_lists_all_endpoints() {
-        let spec = ApiDoc::openapi();
-        for expected in [
-            "/tokens",
-            "/tokens/verify",
-            "/tokens/refresh",
-            "/tokens/{jti}",
-            "/subjects/{sub}/tokens",
-            "/livez",
-            "/readyz",
-            "/metrics",
-        ] {
-            assert!(
-                spec.paths.paths.contains_key(expected),
-                "{expected} отсутствует в OpenAPI-спеке"
-            );
-        }
     }
 
     #[actix_web::test]
