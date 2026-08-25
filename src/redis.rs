@@ -147,7 +147,9 @@ impl RedisClient {
                 JtiError::BadConnection
             })
     }
+}
 
+impl JtiStore for RedisClient {
     /// Проверяет доступность Redis командой `PING`.
     ///
     /// Используется в readiness-проверке (`GET /readyz`): открывает соединение и
@@ -157,7 +159,7 @@ impl RedisClient {
     /// - [`JtiError::BadConnection`] — не удалось открыть соединение;
     /// - [`JtiError::WrongOperation`] — команда `PING` не выполнилась.
     #[tracing::instrument(name = "redis.ping", skip_all, err(level = "debug"))]
-    pub async fn ping(&self) -> Result<(), JtiError> {
+    async fn ping(&self) -> Result<(), JtiError> {
         let mut conn = self.connection().await?;
 
         let started = Instant::now();
@@ -174,9 +176,7 @@ impl RedisClient {
             }
         }
     }
-}
 
-impl JtiStore for RedisClient {
     /// Записывает `jti` со значением-заглушкой `1` и TTL `ttl` секунд (`SETEX`).
     #[tracing::instrument(name = "redis.store_jti", skip_all, err(level = "debug"))]
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError> {

@@ -312,6 +312,10 @@ mod tests {
     }
 
     impl JtiStore for StoreWithRefresh {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
             Ok(())
         }

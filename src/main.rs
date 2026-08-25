@@ -39,8 +39,7 @@ mod tracing_otel;
 use crate::auth::{Auth, AuthConfig, AuthLevel};
 use crate::handlers::metrics as metrics_handler;
 use crate::handlers::{
-    create_token_impl, livez, readyz, refresh_token_impl, revoke_subject_tokens_impl,
-    revoke_token_impl, verify_token_impl,
+    create_token, livez, readyz, refresh_token, revoke_subject_tokens, revoke_token, verify_token,
 };
 use crate::key::KeyManager;
 use crate::logging::{init_subscriber, RequestLog};
@@ -183,7 +182,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(RateLimit::global(internal_limiter.clone()))
                 .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
-                .route(web::post().to(create_token_impl::<S>)),
+                .route(web::post().to(create_token::<S>)),
         )
         // Уровень 2 (proxy-secret): проверка токена. Регистрируется до
         // `/tokens/{jti}`, чтобы путь `/tokens/verify` не поглотился шаблоном.
@@ -196,7 +195,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(Auth::<S>::new(AuthLevel::ProxySecret, auth.clone()))
                 .wrap(RateLimit::per_ip(verify_limiter.clone()))
                 .wrap(cors)
-                .route(web::post().to(verify_token_impl::<S>)),
+                .route(web::post().to(verify_token::<S>)),
         )
         // Уровень 3 (TOTP): обмен refresh-токена. Это операция ВЫПУСКА, просто
         // с другим основанием — вместо «доверенный бэкенд попросил» действует
@@ -209,14 +208,14 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(RateLimit::global(internal_limiter.clone()))
                 .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
-                .route(web::post().to(refresh_token_impl::<S>)),
+                .route(web::post().to(refresh_token::<S>)),
         )
         .service(
             web::resource("/tokens/{jti}")
                 .wrap(RateLimit::global(internal_limiter.clone()))
                 .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
-                .route(web::delete().to(revoke_token_impl::<S>)),
+                .route(web::delete().to(revoke_token::<S>)),
         )
         // Уровень 3 (TOTP): массовый отзыв токенов субъекта. Обвязка та же,
         // что у поштучного отзыва, — это операция того же класса, только
@@ -226,7 +225,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(RateLimit::global(internal_limiter.clone()))
                 .wrap(Auth::<S>::new(AuthLevel::Totp, auth.clone()))
                 .wrap(deny_cors())
-                .route(web::delete().to(revoke_subject_tokens_impl::<S>)),
+                .route(web::delete().to(revoke_subject_tokens::<S>)),
         );
 
     // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
@@ -255,7 +254,7 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
             .wrap(deny_cors())
             .route("/api-docs/openapi.json", web::get().to(openapi_spec))
             .service(livez)
-            .service(readyz),
+            .route("/readyz", web::get().to(readyz::<S>)),
     );
 }
 
@@ -459,6 +458,10 @@ mod tests {
     }
 
     impl JtiStore for StubStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
             self.jtis.lock().insert(jti.to_string());
             Ok(())
@@ -640,6 +643,33 @@ mod tests {
 
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Спека перечисляет все опубликованные пути.
+    ///
+    /// Аннотации `#[utoipa::path]` живут на **обобщённых** обработчиках (JWT-60):
+    /// потеряться при рефакторинге они могут молча — компилятор на это не ругается,
+    /// а Swagger UI просто недосчитается ручки.
+    // `#[test]` здесь разрешился бы в `actix_web::test` (модуль импортирован
+    // выше), поэтому берём его же явно — тесту async не нужен, но и не мешает.
+    #[actix_web::test]
+    async fn openapi_spec_lists_all_endpoints() {
+        let spec = ApiDoc::openapi();
+        for expected in [
+            "/tokens",
+            "/tokens/verify",
+            "/tokens/refresh",
+            "/tokens/{jti}",
+            "/subjects/{sub}/tokens",
+            "/livez",
+            "/readyz",
+            "/metrics",
+        ] {
+            assert!(
+                spec.paths.paths.contains_key(expected),
+                "{expected} отсутствует в OpenAPI-спеке"
+            );
+        }
     }
 
     #[actix_web::test]
