@@ -1,17 +1,20 @@
 //! Общий тип ошибки HTTP-слоя.
 //!
-//! [`Error`] агрегирует ошибки нижележащих слоёв (JWT, Redis, HTTP-клиент) и
-//! реализует [`ResponseError`], сопоставляя каждый вариант с HTTP-статусом.
-//! Тело ответа всегда структурировано ([`ErrorResponse`]). Внутренние причины
-//! (Redis/reqwest/JWT) наружу не раскрываются — клиент получает обобщённое
-//! «Internal server error».
+//! [`Error`] агрегирует ошибки нижележащих слоёв (JWT, хранилище `jti`,
+//! HTTP-клиент) и реализует [`ResponseError`], сопоставляя каждый вариант с
+//! HTTP-статусом. Тело ответа всегда структурировано ([`ErrorResponse`]).
+//! Внутренние причины (хранилище/reqwest/JWT) наружу не раскрываются — клиент
+//! получает обобщённое «Internal server error».
+//!
+//! О конкретном бэкенде хранилища модуль **не знает**: сюда приходит
+//! [`JtiError`] из трейта [`JtiStore`](crate::models::jwt::JtiStore), а не
+//! `redis::RedisError`. Иначе смена бэкенда тянула бы за собой HTTP-слой.
 
 use actix_web::{HttpResponse, ResponseError};
-use redis::RedisError;
 use reqwest::Error as ReqwestError;
 use thiserror::Error;
 
-use crate::models::jwt::JwtError;
+use crate::models::jwt::{JtiError, JwtError};
 use crate::models::ErrorResponse;
 
 /// Ошибка уровня приложения, преобразуемая в HTTP-ответ.
@@ -23,8 +26,8 @@ pub enum Error {
     Unprocessable(String),
     #[error("JWT error: {0}")]
     Jwt(#[from] JwtError),
-    #[error("Redis error: {0}")]
-    Redis(#[from] RedisError),
+    #[error("Store error: {0}")]
+    Store(#[from] JtiError),
     #[error("HTTP error: {0}")]
     Reqwest(#[from] ReqwestError),
     #[error("Internal error: {0}")]
@@ -45,8 +48,8 @@ impl ResponseError for Error {
     /// [`ErrorResponse`].
     ///
     /// `Validation` → 400, `Unprocessable` → 422, `Unauthorized` → 401,
-    /// `Forbidden` → 403, `NotFound` → 404. Остальные варианты (`Jwt`, `Redis`, `Reqwest`,
-    /// `Internal`) считаются внутренними и возвращают 500 с обобщённым
+    /// `Forbidden` → 403, `NotFound` → 404. Остальные варианты (`Jwt`, `Store`,
+    /// `Reqwest`, `Internal`) считаются внутренними и возвращают 500 с обобщённым
     /// сообщением — детали наружу не раскрываются.
     fn error_response(&self) -> HttpResponse {
         match self {
@@ -129,6 +132,13 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.error, "Internal server error");
         assert!(!body.error.contains("secret"));
+    }
+
+    #[actix_web::test]
+    async fn store_error_maps_to_500_generic() {
+        let (status, body) = render(Error::Store(JtiError::BadConnection)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "Internal server error");
     }
 
     #[actix_web::test]

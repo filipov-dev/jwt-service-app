@@ -10,13 +10,19 @@
 //! - `GET /livez`, `GET /readyz` — пробы ([`livez`], [`readyz`]);
 //! - `GET /metrics` — метрики Prometheus ([`metrics`]).
 //!
+//! Обработчики, работающие с хранилищем `jti`, обобщены по трейту
+//! [`JtiStore`] и о конкретном бэкенде (Redis) не знают: тип хранилища
+//! подставляется при регистрации роутов в `main.rs`, а тесты передают
+//! in-memory-мок. Поэтому роуты собираются вручную (`web::resource(...)`), а не
+//! атрибут-макросами actix — те не умеют обобщённые обработчики.
+//!
 //! Обработчики намеренно тонкие: вся доменная логика вынесена в
 //! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
 //! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации; список
 //! допустимых значений при этом ограничивается аллоулистом (см.
 //! [`crate::issuer`]).
 
-use actix_web::{delete, get, post, web, HttpResponse};
+use actix_web::{get, web, HttpResponse};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::{debug, error, info, warn};
 
@@ -28,7 +34,6 @@ use crate::models::{
     ErrorResponse, ReadinessResponse, RefreshRequest, RevokeGroupResponse, TokenRequest,
     TokenResponse, TokenVerifyRequest,
 };
-use crate::redis::RedisClient;
 
 /// Достаёт заголовок `Host` — значение будущего claim `iss`.
 ///
@@ -91,22 +96,10 @@ fn issuer_for_issuance(req: &actix_web::HttpRequest) -> Result<&str, Error> {
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`;
 /// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
 /// - `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).
-#[post("/tokens")]
-pub async fn create_token(
-    req: web::Json<TokenRequest>,
-    redis: web::Data<RedisClient>,
-    keys: web::Data<KeyManager>,
-    host: actix_web::HttpRequest,
-) -> Result<HttpResponse, Error> {
-    create_token_impl(req, redis, keys, host).await
-}
-
-/// Реализация [`create_token`], обобщённая по хранилищу `jti` ([`JtiStore`]).
 ///
-/// Вынесена отдельно, чтобы в интеграционных тестах подставлять in-memory-хранилище
-/// вместо [`RedisClient`] (для которого в CI нет реального Redis). Продакшн-обработчик
-/// [`create_token`] вызывает её с [`RedisClient`], поведение при этом не меняется.
-pub async fn create_token_impl<S: JtiStore + 'static>(
+/// Обобщён по хранилищу `jti` ([`JtiStore`]) — см. примечание о шве в начале
+/// модуля.
+pub async fn create_token<S: JtiStore + 'static>(
     req: web::Json<TokenRequest>,
     store: web::Data<S>,
     keys: web::Data<KeyManager>,
@@ -194,20 +187,9 @@ pub async fn create_token_impl<S: JtiStore + 'static>(
 /// - `401 Unauthorized` — любая ошибка проверки (намеренно без деталей), в том
 ///   числе `Host` вне `TOKEN_ISSUER_ALLOWLIST`;
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
-#[post("/tokens/verify")]
-pub async fn verify_token(
-    request: web::Json<TokenVerifyRequest>,
-    redis: web::Data<RedisClient>,
-    keys: web::Data<KeyManager>,
-    host: actix_web::HttpRequest,
-) -> Result<HttpResponse, Error> {
-    verify_token_impl(request, redis, keys, host).await
-}
-
-/// Реализация [`verify_token`], обобщённая по хранилищу `jti` ([`JtiStore`]).
 ///
-/// Как и [`create_token_impl`], вынесена для подмены хранилища в тестах.
-pub async fn verify_token_impl<S: JtiStore + 'static>(
+/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+pub async fn verify_token<S: JtiStore + 'static>(
     request: web::Json<TokenVerifyRequest>,
     store: web::Data<S>,
     keys: web::Data<KeyManager>,
@@ -271,18 +253,9 @@ pub async fn verify_token_impl<S: JtiStore + 'static>(
 /// - `500 Internal Server Error` — хранилище недоступно, отзыв **не выполнен**.
 ///   Отличать этот случай от успеха обязательно: вызывающий отзывает
 ///   скомпрометированный токен и должен узнать, что попытка не удалась.
-#[delete("/tokens/{jti}")]
-pub async fn revoke_token(
-    jti: web::Path<String>,
-    redis: web::Data<RedisClient>,
-) -> Result<HttpResponse, Error> {
-    revoke_token_impl(jti, redis).await
-}
-
-/// Реализация [`revoke_token`], обобщённая по хранилищу `jti` ([`JtiStore`]).
 ///
-/// Как и [`create_token_impl`], вынесена для подмены хранилища в тестах.
-pub async fn revoke_token_impl<S: JtiStore + 'static>(
+/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+pub async fn revoke_token<S: JtiStore + 'static>(
     jti: web::Path<String>,
     store: web::Data<S>,
 ) -> Result<HttpResponse, Error> {
@@ -328,16 +301,9 @@ pub async fn revoke_token_impl<S: JtiStore + 'static>(
 /// - `500 Internal Server Error` — хранилище недоступно. В отличие от
 ///   `DELETE /tokens/{jti}`, ошибка **не** проглатывается: молчаливый «успех»
 ///   при неудавшемся отзыве скомпрометированных токенов опаснее честной ошибки.
-#[delete("/subjects/{sub}/tokens")]
-pub async fn revoke_subject_tokens(
-    sub: web::Path<String>,
-    redis: web::Data<RedisClient>,
-) -> Result<HttpResponse, Error> {
-    revoke_subject_tokens_impl(sub, redis).await
-}
-
-/// Реализация [`revoke_subject_tokens`], обобщённая по хранилищу.
-pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
+///
+/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+pub async fn revoke_subject_tokens<S: JtiStore + 'static>(
     sub: web::Path<String>,
     store: web::Data<S>,
 ) -> Result<HttpResponse, Error> {
@@ -388,18 +354,9 @@ pub async fn revoke_subject_tokens_impl<S: JtiStore + 'static>(
 ///   наружу не раскрываются, как и при проверке токена);
 /// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
 /// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
-#[post("/tokens/refresh")]
-pub async fn refresh_token(
-    request: web::Json<RefreshRequest>,
-    redis: web::Data<RedisClient>,
-    keys: web::Data<KeyManager>,
-    host: actix_web::HttpRequest,
-) -> Result<HttpResponse, Error> {
-    refresh_token_impl(request, redis, keys, host).await
-}
-
-/// Реализация [`refresh_token`], обобщённая по хранилищу.
-pub async fn refresh_token_impl<S: JtiStore + 'static>(
+///
+/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+pub async fn refresh_token<S: JtiStore + 'static>(
     request: web::Json<RefreshRequest>,
     store: web::Data<S>,
     keys: web::Data<KeyManager>,
@@ -480,7 +437,7 @@ pub async fn livez() -> HttpResponse {
 )]
 /// Readiness-проба: может ли под обслуживать запросы.
 ///
-/// Пингует Redis и запрашивает JWKS у `jwks-service-app`
+/// Пингует хранилище `jti` и запрашивает JWKS у `jwks-service-app`
 /// (`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обслуживать можем,
 /// иначе `503 Service Unavailable`. В обоих случаях тело —
 /// [`ReadinessResponse`] с детализацией по каждой зависимости.
@@ -494,18 +451,23 @@ pub async fn livez() -> HttpResponse {
 /// как `degraded`, а когда снимок перестанет быть пригодным — под уйдёт из
 /// балансировки сам.
 ///
-/// Redis такой поблажки не имеет: без него не проверить `jti`, то есть отозванный
-/// токен стал бы валидным — это не деградация, а дыра.
-#[get("/readyz")]
-pub async fn readyz(redis: web::Data<RedisClient>, keys: web::Data<KeyManager>) -> HttpResponse {
-    let redis_ok = redis.ping().await.is_ok();
+/// Хранилище такой поблажки не имеет: без него не проверить `jti`, то есть
+/// отозванный токен стал бы валидным — это не деградация, а дыра.
+///
+/// Обобщён по хранилищу `jti` ([`JtiStore`]): проба ходит в него через
+/// [`JtiStore::ping`], а не в конкретный бэкенд.
+pub async fn readyz<S: JtiStore + 'static>(
+    store: web::Data<S>,
+    keys: web::Data<KeyManager>,
+) -> HttpResponse {
+    let store_ok = store.ping().await.is_ok();
 
     let jwks_live = keys.check_jwks().await.is_ok();
     // Сервис ключей не ответил, но снимок в памяти ещё обслуживает верификацию.
     let jwks_stale = !jwks_live && keys.has_servable_jwks_snapshot();
     let jwks_ok = jwks_live || jwks_stale;
 
-    let ready = redis_ok && jwks_ok;
+    let ready = store_ok && jwks_ok;
 
     let body = ReadinessResponse {
         status: match (ready, jwks_stale) {
@@ -514,7 +476,10 @@ pub async fn readyz(redis: web::Data<RedisClient>, keys: web::Data<KeyManager>) 
             (true, false) => "ok",
         }
         .into(),
-        redis: redis_ok,
+        // Поле ответа так и называется `redis` — это публичный контракт пробы,
+        // на который завязаны дашборды и алерты; переименование сломало бы их
+        // ради косметики.
+        redis: store_ok,
         jwks: jwks_ok,
         jwks_stale,
     };
@@ -540,9 +505,9 @@ mod tests {
     //! проходят в CI без реальной инфраструктуры. Часть проверок конструирует токены
     //! напрямую (истёкший, с чужой подписью), чего нельзя добиться через публичный API.
     //!
-    //! Обработчики регистрируются через обобщённые `*_impl`-реализации
-    //! ([`create_token_impl`] и др.) с подстановкой [`MockStore`]; продакшн-обёртки
-    //! (`create_token` и т.п.) идентичны им, но жёстко завязаны на [`RedisClient`].
+    //! Обработчики обобщены по хранилищу, поэтому в тестах регистрируются те же
+    //! функции, что и в проде ([`create_token`] и др.), — просто с [`MockStore`]
+    //! вместо Redis. Отдельных «тестовых» реализаций нет.
 
     // `env_guard` намеренно держит std-`MutexGuard` через `.await`: `#[actix_web::test]`
     // запускает каждый тест на отдельном однопоточном рантайме, задача с потока не
@@ -553,6 +518,7 @@ mod tests {
     use super::*;
     use crate::models::jwt::{JsonWebToken, JtiError, RefreshRecord, TokenClaims, TokenHeaders};
     use crate::models::TokenResponse;
+    use crate::redis::RedisClient;
     use actix_web::http::header::HeaderValue;
     use actix_web::http::StatusCode;
     use actix_web::{test, App};
@@ -604,6 +570,10 @@ mod tests {
     }
 
     impl JtiStore for MockStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
             self.jtis.lock().insert(jti.to_string());
             Ok(())
@@ -701,6 +671,10 @@ mod tests {
     struct UnavailableStore;
 
     impl JtiStore for UnavailableStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
         async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
             Err(JtiError::BadConnection)
         }
@@ -826,22 +800,16 @@ mod tests {
             App::new()
                 .app_data($store)
                 .app_data(keys)
-                .route("/tokens", web::post().to(create_token_impl::<MockStore>))
-                .route(
-                    "/tokens/verify",
-                    web::post().to(verify_token_impl::<MockStore>),
-                )
-                .route(
-                    "/tokens/{jti}",
-                    web::delete().to(revoke_token_impl::<MockStore>),
-                )
+                .route("/tokens", web::post().to(create_token::<MockStore>))
+                .route("/tokens/verify", web::post().to(verify_token::<MockStore>))
+                .route("/tokens/{jti}", web::delete().to(revoke_token::<MockStore>))
                 .route(
                     "/subjects/{sub}/tokens",
-                    web::delete().to(revoke_subject_tokens_impl::<MockStore>),
+                    web::delete().to(revoke_subject_tokens::<MockStore>),
                 )
                 .route(
                     "/tokens/refresh",
-                    web::post().to(refresh_token_impl::<MockStore>),
+                    web::post().to(refresh_token::<MockStore>),
                 )
         }};
     }
@@ -933,6 +901,69 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn readyz_reports_ready_over_arbitrary_store() {
+        let _guard = env_guard();
+
+        // Проба ходит в хранилище через трейт, а не в Redis: с любым исправным
+        // `JtiStore` и живым сервисом ключей под готов. Это и есть проверка шва —
+        // раньше `readyz` был прибит к `RedisClient` и такой тест был невозможен.
+        let key = make_key("kid-ready-ok");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let keys = KeyManager::new("EdDSA".to_string());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(MockStore::new()))
+                .app_data(web::Data::new(keys))
+                .route("/readyz", web::get().to(readyz::<MockStore>)),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: ReadinessResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "ok");
+        assert!(body.redis);
+        assert!(body.jwks);
+        assert!(!body.jwks_stale);
+    }
+
+    #[actix_web::test]
+    async fn readyz_reports_503_when_store_ping_fails() {
+        let _guard = env_guard();
+
+        // Сервис ключей жив, падает только хранилище: без него не проверить
+        // `jti`, то есть отозванный токен стал бы валидным — это не деградация,
+        // а причина уйти из балансировки.
+        let key = make_key("kid-ready-nostore");
+        let server = start_jwks_mock(&key).await;
+        set_jwks_env(&server);
+
+        let keys = KeyManager::new("EdDSA".to_string());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(UnavailableStore))
+                .app_data(web::Data::new(keys))
+                .route("/readyz", web::get().to(readyz::<UnavailableStore>)),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body: ReadinessResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "unavailable");
+        assert!(!body.redis);
+        assert!(body.jwks);
+    }
+
+    #[actix_web::test]
     async fn readyz_reports_503_when_dependencies_unavailable() {
         let _guard = env_guard();
 
@@ -948,7 +979,7 @@ mod tests {
             App::new()
                 .app_data(web::Data::new(redis))
                 .app_data(web::Data::new(keys))
-                .service(readyz),
+                .route("/readyz", web::get().to(readyz::<RedisClient>)),
         )
         .await;
 
@@ -1003,7 +1034,7 @@ mod tests {
             App::new()
                 .app_data(web::Data::new(redis))
                 .app_data(web::Data::new(keys))
-                .service(readyz),
+                .route("/readyz", web::get().to(readyz::<RedisClient>)),
         )
         .await;
 
@@ -1357,7 +1388,7 @@ mod tests {
         let store = web::Data::new(UnavailableStore);
         let app = test::init_service(App::new().app_data(store).route(
             "/tokens/{jti}",
-            web::delete().to(revoke_token_impl::<UnavailableStore>),
+            web::delete().to(revoke_token::<UnavailableStore>),
         ))
         .await;
 

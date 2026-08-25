@@ -642,6 +642,10 @@ mod tests {
     }
 
     impl JtiStore for NoopStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
             Ok(())
         }

@@ -149,15 +149,15 @@ access + refresh. Refresh-токен — непрозрачная строка, 
 | `sentry_glitchtip.rs` | Интеграция с GlitchTip (Sentry-совместимый): ошибки/паники → Issues, span-ы → Performance, структурные логи → Logs. Включается по DSN. |
 | `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
 | `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
-| `handlers.rs` | HTTP-обработчики трёх эндпоинтов + аннотации `utoipa::path`. |
+| `handlers.rs` | HTTP-обработчики эндпоинтов (обобщены по `JtiStore`) + аннотации `utoipa::path`. |
 | `issuer.rs` | Аллоулист issuer'ов (`TOKEN_ISSUER_ALLOWLIST`): какие значения `Host` допустимы в claim `iss`. |
 | `jwt.rs` | `JwtManager` — фасад для генерации и проверки токенов. |
-| `models/jwt.rs` | `TokenClaims`, `TokenHeaders`, `JsonWebToken`, трейт `JtiStore`, ошибки. |
+| `models/jwt.rs` | `TokenClaims`, `TokenHeaders`, `JsonWebToken`, трейт `JtiStore` (включая `ping` для readiness), ошибки. |
 | `models/mod.rs` | DTO запросов/ответов (`ToSchema`) и структуры JWK/JWKS. |
 | `key.rs` | `KeyManager` — получение приватного ключа и реконструкция публичного из JWK. |
 | `jwk.rs` | `JwkService` — HTTP-клиент к `jwks-service-app`. |
 | `redis.rs` | `RedisClient` — реализация трейта `JtiStore` поверх Redis. |
-| `error.rs` | Общий `Error` с `ResponseError` для actix. |
+| `error.rs` | Общий `Error` с `ResponseError` для actix. О бэкенде хранилища не знает: агрегирует `JtiError`, а не `redis::RedisError`. |
 
 ## Команды
 
@@ -486,6 +486,23 @@ Release — формулировки в файле и в релизе совпа
     задачу выполненной и не повторяет попытку. При этом **идемпотентность
     сохраняется**: отзыв несуществующего `jti` — это `204`, а не ошибка, потому
     что желаемое состояние достигнуто.
+- **Хранилище `jti` доступно только через трейт `JtiStore` (JWT-60).** Ни один
+  модуль выше `redis.rs` не должен упоминать `RedisClient`, `redis::` или
+  `RedisError` — иначе шов протекает и второй бэкенд не подключить.
+  - **HTTP-обработчики обобщены по хранилищу** (`create_token<S: JtiStore>` и
+    т.п.), конкретный тип подставляется один раз в `main.rs` (`configure_api::<RedisClient>`).
+    Отдельных «продакшн-обёрток» поверх обобщённых реализаций нет: они принимали
+    `web::Data<RedisClient>` и были ровно тем местом, где шов и протекал.
+  - **Поэтому роуты собираются вручную** (`web::resource(...)`/`.route(...)`), а
+    не атрибут-макросами actix (`#[post("/tokens")]`): те не умеют обобщённые
+    обработчики. Исключение — `livez`, он от хранилища не зависит.
+    `#[utoipa::path]` на обобщённой функции работает; полноту спеки сторожит тест
+    `openapi_spec_lists_all_endpoints`.
+  - **`/readyz` пингует хранилище через `JtiStore::ping`**, а не `RedisClient`
+    напрямую. Добавляя бэкенд, реализуйте `ping` честно: readiness — это
+    «сможем ли обслуживать», и без хранилища ответ «нет».
+  - **`where Self: Sized` в трейте не нужен**: `async fn` в трейте и так делает
+    его не объектно-безопасным, а хранилище всюду берётся по статическому типу.
 - **Новый ключ создаётся только на `404` от сервиса ключей.** В
   `JwkService::private_key` ветка создания срабатывает исключительно на
   [`JwkError::NotFound`], а он возвращается только при честном `404`; `5xx`,

@@ -50,10 +50,21 @@ pub enum JtiError {
 /// Абстрагирует бэкенд (в проекте — Redis) от доменной логики. Наличие `jti` в
 /// хранилище означает, что токен «активен»: при выпуске `jti` записывается с
 /// TTL, при отзыве — удаляется, при проверке — проверяется на существование.
-pub trait JtiStore
-where
-    Self: Sized,
-{
+///
+/// Трейт покрывает **всё**, что HTTP-слою нужно от хранилища, включая
+/// readiness-пробу ([`JtiStore::ping`]): иначе `/readyz` ходил бы в конкретный
+/// бэкенд напрямую, и шов протекал бы ровно в том месте, где его удобнее всего
+/// не заметить.
+///
+/// `where Self: Sized` здесь не нужен: `async fn` в трейте и так делает трейт
+/// не объектно-безопасным, а хранилище всюду берётся по статическому типу
+/// (`web::Data<S>`), не через `dyn`.
+pub trait JtiStore {
+    /// Проверяет доступность хранилища (readiness-проба `GET /readyz`).
+    ///
+    /// Ошибка означает «обслуживать запросы нельзя»: без хранилища не проверить
+    /// `jti`, то есть отозванный токен стал бы валидным.
+    async fn ping(&self) -> Result<(), JtiError>;
     /// Сохраняет `jti` со временем жизни `ttl` (в секундах).
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError>;
     /// Возвращает `true`, если `jti` присутствует (токен не отозван и не истёк).
@@ -738,6 +749,10 @@ mod tests {
     }
 
     impl JtiStore for MockStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
             self.jtis.lock().insert(jti.to_string());
             Ok(())
@@ -818,6 +833,10 @@ mod tests {
     struct FailingStore;
 
     impl JtiStore for FailingStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Err(JtiError::BadConnection)
+        }
+
         async fn store_jti(&self, _jti: &str, _ttl: u64) -> Result<(), JtiError> {
             Err(JtiError::BadConnection)
         }
@@ -883,6 +902,10 @@ mod tests {
     }
 
     impl JtiStore for FailingGroupStore {
+        async fn ping(&self) -> Result<(), JtiError> {
+            Ok(())
+        }
+
         async fn store_jti(&self, jti: &str, _ttl: u64) -> Result<(), JtiError> {
             self.jtis.lock().insert(jti.to_string());
             Ok(())
