@@ -72,7 +72,8 @@ cp .env.example .env   # заполнить секреты
 docker compose -p jwt-prod --env-file .env up -d
 ```
 
-**Kubernetes** — Deployment (3 реплики), Service, образец Secret:
+**Kubernetes** — Deployment (3 реплики), Service, PodDisruptionBudget,
+NetworkPolicy, образец Secret:
 
 ```bash
 kubectl apply -k deployments/prod/k8s/
@@ -81,6 +82,19 @@ kubectl apply -k deployments/prod/k8s/
 Пробы: `livenessProbe` на `/livez`, `readinessProbe` на `/readyz`. Разделение
 принципиальное — `/livez` не ходит в зависимости, поэтому недоступный Redis
 выводит под из балансировки, но не устраивает ему цикл перезапусков.
+
+Три реплики держатся живыми двумя настройками сразу:
+`topologySpreadConstraints` разносят поды по узлам и зонам, а PDB с
+`minAvailable: 2` заставляет drain узла отпускать их по одному. Жёсткий разнос
+по узлам ждёт кластера минимум из трёх узлов — на меньшем поменяйте
+`whenUnsatisfiable` на `ScheduleAnyway`, иначе лишние реплики зависнут в
+`Pending`. Меняете число реплик — пересчитайте и `minAvailable`.
+
+NetworkPolicy закрепляет то же, что сказано выше словами: до порта 8080
+достают только ingress-контроллер и скрейпер метрик, остальным подам кластера
+он недоступен. Имена namespace и меток там кластерозависимы — правьте под свой
+стенд. Учтите, что политику исполняет CNI: плагин без её поддержки примет
+манифест молча и не сделает ничего.
 
 ## Healthcheck своими силами
 

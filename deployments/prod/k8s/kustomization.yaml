@@ -9,6 +9,8 @@ kind: Kustomization
 resources:
   - deployment.yaml
   - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
 
 # `labels` (без includeSelectors), а не `commonLabels`: последний дописывает
 # метки и в selector Deployment'а, а selector после создания неизменяем — такой

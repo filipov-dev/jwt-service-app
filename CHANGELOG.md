@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.14.1] - 2026-08-25
+
+### Документация
+
+- PodDisruptionBudget, разнос реплик и NetworkPolicy в k8s-манифестах (JWT-49)
+
 ## [1.14.0] - 2026-07-31
 
 ### Добавлено
@@ -335,6 +341,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.14.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.5...v1.14.0
 [1.13.5]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.4...v1.13.5
 [1.13.4]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.3...v1.13.4
