@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.17.7] - 2026-08-26
+
+### Внутреннее
+
+- релизный профиль — fat LTO, один codegen-unit, strip символов (JWT-47)
+
 ## [1.14.1] - 2026-08-25
 
 ### Документация
@@ -341,6 +347,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.7]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.6...v1.17.7
 [1.14.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.5...v1.14.0
 [1.13.5]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.4...v1.13.5
