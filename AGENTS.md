@@ -227,6 +227,16 @@ scripts/scan-secrets.sh --reports out   # с JSON-отчётами в ./out
 переписывать историю) — в
 [`docs/security/secret-audit.md`](docs/security/secret-audit.md).
 
+**CI устроен в расчёте на публичный репозиторий**: `ci.yml`, `audit.yml` и
+`secrets.yml` запускаются на `pull_request`, то есть в том числе на PR с чужого
+форка, и потому не ссылаются на `secrets.` ни разу. Workflow с секретами
+(`docker.yml`, `release.yml`) запускаются только привилегированными событиями —
+пуш тега, публикация релиза, ручной dispatch, пуш в `master`. Разбор модели
+угрозы, таблица триггеров и чеклист для нового workflow —
+[`docs/security/workflow-audit.md`](docs/security/workflow-audit.md).
+**`pull_request_target` в репозитории не используется; не вводите его попутной
+правкой.**
+
 **CI строгий** (`.github/workflows/ci.yml`, на PR и на пуш в `master`):
 `cargo fmt --all -- --check` и `cargo clippy --all-targets -- -D warnings`.
 Любое предупреждение линтера и любое расхождение с `rustfmt` роняют пайплайн,

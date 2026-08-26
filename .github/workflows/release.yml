@@ -21,9 +21,12 @@ jobs:
     steps:
       # fetch-depth: 0 — нужна вся история и теги: описание релиза собирается по
       # коммитам от предыдущего тега, а при обычном shallow-клоне их нет.
+      # persist-credentials: false — токен из `.git/config` ниже не нужен:
+      # в git по сети не ходит ни один шаг (см. ci.yml).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Get version from Cargo.toml
         run: |

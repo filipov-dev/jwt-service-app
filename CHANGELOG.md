@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.17.8] - 2026-08-26
+
+### Безопасность
+
+- аудит workflow на PR с форков (JWT-54)
+
 ## [1.17.7] - 2026-08-26
 
 ### Внутреннее
@@ -347,6 +353,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.8]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.7...v1.17.8
 [1.17.7]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.6...v1.17.7
 [1.14.1]: https://github.com/filipov-dev/jwt-service-app/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.5...v1.14.0
