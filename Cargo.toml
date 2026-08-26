@@ -93,7 +93,7 @@ tracing-opentelemetry = "0.33"
 # структурные логи. Лицензия MIT. Все три канала включаются по DSN — см.
 # `sentry_glitchtip.rs`. Фичи: `tracing` — мост из `tracing`-шины (события → issues,
 # span-ы → транзакции), `logs` — структурные логи.
-sentry = { version = "0.48", features = ["tracing", "logs"] }
+sentry = { version = "0.49", features = ["tracing", "logs"] }
 
 [dev-dependencies]
 # HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов
