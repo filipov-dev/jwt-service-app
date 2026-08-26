@@ -1,0 +1,636 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "jwt-service-app",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "1.17.5"
+  },
+  "paths": {
+    "/livez": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Liveness-проба: подтверждает, что процесс жив.",
+        "description": "Всегда возвращает `200 OK` без тела. Зависимости не проверяются — для этого\nслужит [`readyz`]. Предназначен для liveness-проверки оркестратора.",
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "description": "Процесс жив"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Отдаёт метрики в формате экспозиции Prometheus.",
+        "description": "Уровень доступа 4: статический Bearer-токен (`AUTH_METRICS_TOKEN`) — его\nнативно умеют слать Prometheus (`authorization: {credentials_file}`), Zabbix\n`agent2` и OTel Collector, через который метрики забирает Monium.\n\nТокен — не замена сетевой изоляции: ручку всё равно не стоит публиковать\nнаружу, метрики раскрывают операционную картину (объём трафика, доли отказов,\nлатентности зависимостей).\n\nРоут регистрируется в `main.rs` (не через атрибут-макрос), потому что ручка\nоборачивается auth-middleware уровня 4 и публикуется **условно**: без\n`AUTH_METRICS_TOKEN` её нет вовсе и путь отдаёт `404`.",
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "description": "Метрики в текстовом формате Prometheus",
+            "content": {
+              "text/plain": {}
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Readiness-проба: может ли под обслуживать запросы.",
+        "description": "Пингует хранилище `jti` и запрашивает JWKS у `jwks-service-app`\n(`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обслуживать можем,\nиначе `503 Service Unavailable`. В обоих случаях тело —\n[`ReadinessResponse`] с детализацией по каждой зависимости.\n\n**Проба спрашивает не «жива ли зависимость», а «сможем ли мы ответить».**\nРазница только в сервисе ключей: пока в памяти лежит пригодный снимок JWKS,\nверификация работает и без него (см. [`crate::jwk`]), поэтому выводить под из\nбалансировки не за что — иначе stale-кеш не спасал бы ровно в той аварии,\nради которой сделан: readiness погасил бы поды за десяток секунд, и трафик до\nснимка в памяти просто не дошёл бы. Состояние при этом честно показывается\nкак `degraded`, а когда снимок перестанет быть пригодным — под уйдёт из\nбалансировки сам.\n\nХранилище такой поблажки не имеет: без него не проверить `jti`, то есть\nотозванный токен стал бы валидным — это не деградация, а дыра.\n\nОбобщён по хранилищу `jti` ([`JtiStore`]): проба ходит в него через\n[`JtiStore::ping`], а не в конкретный бэкенд.",
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Сервис готов обслуживать запросы (`ok` либо `degraded`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Обслуживать запросы нельзя: недоступен Redis либо у сервиса ключей нет ни ответа, ни пригодного снимка",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subjects/{sub}/tokens": {
+      "delete": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Отзывает все активные токены субъекта.",
+        "description": "Нужно при компрометации: гасить токены по одному через\n`DELETE /tokens/{jti}` вызывающий не может — он не знает их `jti`.\n\n# Ответы\n- `200 OK` — [`RevokeGroupResponse`] с числом отозванных токенов (уже\n  истёкшие не считаются, они и так невалидны);\n- `500 Internal Server Error` — хранилище недоступно. В отличие от\n  `DELETE /tokens/{jti}`, ошибка **не** проглатывается: молчаливый «успех»\n  при неудавшемся отзыве скомпрометированных токенов опаснее честной ошибки.\n\nОбобщён по хранилищу `jti` ([`JtiStore`]).",
+        "operationId": "revoke_subject_tokens",
+        "parameters": [
+          {
+            "name": "sub",
+            "in": "path",
+            "description": "Субъект (claim `sub`), чьи токены отзываются",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeGroupResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Уровень 3: отсутствует/некорректен TOTP-код",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Превышен глобальный cap эндпоинта (если включён)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Хранилище недоступно — отзыв НЕ выполнен",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "totp": []
+          }
+        ]
+      }
+    },
+    "/tokens": {
+      "post": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Выпускает новый JWT.",
+        "description": "Тело запроса — [`TokenRequest`] с `sub` (subject), `aud` (audience) и\nнеобязательным `ttl` (кастомное время жизни в секундах). Issuer (`iss`)\nподставляется из заголовка `Host`. При выпуске генерируется `jti` и\nсохраняется в Redis с TTL, равным времени жизни токена.\n\n# Ответы\n- `200 OK` — [`TokenResponse`] с подписанным токеном;\n- `422 Unprocessable Entity` — некорректные входные данные (например, пустой\n  `aud`, невалидный `TOKEN_EXPIRATION_SECONDS` или `ttl` вне допустимых\n  границ);\n- `400 Bad Request` — отсутствует/некорректен заголовок `Host`;\n- `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);\n- `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).\n\nОбобщён по хранилищу `jti` ([`JtiStore`]) — см. примечание о шве в начале\nмодуля.",
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Уровень 3: отсутствует/некорректен TOTP-код",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`Host` вне `TOKEN_ISSUER_ALLOWLIST` (если задан)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Превышен глобальный cap эндпоинта (если включён)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "totp": []
+          }
+        ]
+      }
+    },
+    "/tokens/refresh": {
+      "post": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Обменивает refresh-токен на новую пару access + refresh.",
+        "description": "Старый refresh после обмена не работает: выдаётся новый, из той же семьи.\nПредъявление уже использованного токена означает утечку — тогда гасится вся\nсемья, включая выданные по ней access-токены (см.\n[`JwtManager::refresh_token_pair`]).\n\nУровень доступа 3 (TOTP), как и у `POST /tokens`: обмен — это выпуск токена,\nпросто основанием служит предъявленный refresh, а не запрос доверенного\nбэкенда. Ручку дёргает тот же internal-клиент, что выпускает токены; конечное\nприложение с сервисом напрямую не общается.\n\n# Ответы\n- `200 OK` — [`TokenResponse`] с новыми `token` и `refresh_token`;\n- `401 Unauthorized` — токен неизвестен, истёк или уже использован (детали\n  наружу не раскрываются, как и при проверке токена);\n- `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);\n- `400 Bad Request` — отсутствует/некорректен заголовок `Host`.\n\nОбобщён по хранилищу `jti` ([`JtiStore`]).",
+        "operationId": "refresh_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Уровень 3: нет TOTP-кода, либо refresh-токен неизвестен/использован",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Превышен глобальный cap эндпоинта (если включён)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "totp": []
+          }
+        ]
+      }
+    },
+    "/tokens/verify": {
+      "post": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Проверяет валидность JWT.",
+        "description": "Тело запроса — [`TokenVerifyRequest`] с самим `token` и ожидаемым\n`audience`. Проверяются подпись (по публичному ключу из JWKS, найденному по\n`kid`), совпадение `iss` с заголовком `Host` (и его допустимость по\nаллоулисту issuer'ов), вхождение `audience` в `aud`,\nвременные границы (`nbf`/`iat`/`exp`) и наличие `jti` в Redis (не отозван).\n\n# Ответы\n- `200 OK` — токен валиден, в теле возвращаются его claims;\n- `401 Unauthorized` — любая ошибка проверки (намеренно без деталей), в том\n  числе `Host` вне `TOKEN_ISSUER_ALLOWLIST`;\n- `400 Bad Request` — отсутствует/некорректен заголовок `Host`.\n\nОбобщён по хранилищу `jti` ([`JtiStore`]).",
+        "operationId": "verify_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenVerifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Уровень 2: нет proxy-secret, либо токен невалиден/истёк",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Превышен per-IP лимит запросов",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "proxy_secret": []
+          }
+        ]
+      }
+    },
+    "/tokens/{jti}": {
+      "delete": {
+        "tags": [
+          "handlers"
+        ],
+        "summary": "Отзывает токен по его идентификатору `jti`.",
+        "description": "Удаляет запись `jti` из Redis; после этого проверка соответствующего токена\nв [`verify_token`] будет неуспешной.\n\n# Ответы\n- `204 No Content` — токен отозван. **Идемпотентно**: несуществующий `jti`\n  тоже даёт `204`, потому что желаемое состояние достигнуто — такого токена\n  нет;\n- `500 Internal Server Error` — хранилище недоступно, отзыв **не выполнен**.\n  Отличать этот случай от успеха обязательно: вызывающий отзывает\n  скомпрометированный токен и должен узнать, что попытка не удалась.\n\nОбобщён по хранилищу `jti` ([`JtiStore`]).",
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "jti",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Токен отозван. Идемпотентно: несуществующий `jti` — тоже 204"
+          },
+          "401": {
+            "description": "Уровень 3: отсутствует/некорректен TOTP-код",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Превышен глобальный cap эндпоинта (если включён)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Хранилище недоступно — отзыв НЕ выполнен",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "totp": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Унифицированное тело ответа об ошибке.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "details": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Необязательные детали."
+          },
+          "error": {
+            "type": "string",
+            "description": "Краткое сообщение об ошибке."
+          }
+        }
+      },
+      "ReadinessResponse": {
+        "type": "object",
+        "description": "Ответ readiness-проверки (`GET /readyz`).\n\n`status` — агрегированное состояние (`\"ok\"`/`\"degraded\"`/`\"unavailable\"`),\nполя `redis` и `jwks` отражают готовность обслуживать запросы по каждой\nзависимости.",
+        "required": [
+          "status",
+          "redis",
+          "jwks",
+          "jwks_stale"
+        ],
+        "properties": {
+          "jwks": {
+            "type": "boolean",
+            "description": "Готовность по сервису ключей: он ответил **или** в памяти есть пригодный\nснимок JWKS, которым верификация обслуживается и без него."
+          },
+          "jwks_stale": {
+            "type": "boolean",
+            "description": "Сервис ключей не ответил, и `jwks` держится на устаревшем снимке. Это\nвременная деградация: когда снимок перестанет быть пригодным, `jwks`\nстанет `false`."
+          },
+          "redis": {
+            "type": "boolean",
+            "description": "Доступность Redis."
+          },
+          "status": {
+            "type": "string",
+            "description": "Агрегированный статус: `\"ok\"` — все зависимости доступны, `\"degraded\"` —\nобслуживать можем, но сервис ключей отвечает не сам (снимок из памяти),\n`\"unavailable\"` — обслуживать не можем.",
+            "example": "ok"
+          }
+        }
+      },
+      "RefreshRequest": {
+        "type": "object",
+        "description": "Тело запроса на обмен refresh-токена (`POST /tokens/refresh`).",
+        "required": [
+          "refresh_token"
+        ],
+        "properties": {
+          "refresh_token": {
+            "type": "string",
+            "description": "Refresh-токен, полученный при выпуске или предыдущем обмене."
+          }
+        }
+      },
+      "RevokeGroupResponse": {
+        "type": "object",
+        "description": "Результат массового отзыва токенов субъекта.",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Сколько активных токенов было отозвано.\n\nУже истёкшие в счёт не идут: они и так невалидны, отзывать их незачем.",
+            "example": 3,
+            "minimum": 0
+          }
+        }
+      },
+      "TokenRequest": {
+        "type": "object",
+        "description": "Тело запроса на выпуск токена (`POST /tokens`).",
+        "required": [
+          "sub",
+          "aud"
+        ],
+        "properties": {
+          "aud": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "example": [
+              "api1",
+              "api2"
+            ]
+          },
+          "claims": {
+            "type": "object",
+            "description": "Произвольные claims, которые попадут в payload токена рядом с\nзарегистрированными (роли, scope, tenant, внутренний id).\n\nСлужебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)\nпереопределять **нельзя** — попытка даёт `422`. Иначе клиент подменил бы\n`exp` и обошёл границы `TOKEN_TTL_MIN_SECONDS` / `TOKEN_TTL_MAX_SECONDS`.\n\nОграничения по числу ключей и суммарному объёму задают\n`TOKEN_CLAIMS_MAX_COUNT` и `TOKEN_CLAIMS_MAX_BYTES`: токен ездит в\nзаголовках, и раздутый payload ломает прокси.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": {
+              "role": "admin",
+              "scope": [
+                "read",
+                "write"
+              ]
+            }
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "Выдать вместе с токеном refresh-токен для продления сессии.\n\nПо умолчанию `false` — контракт существующих клиентов не меняется, а\nrefresh появляется только у тех, кто его осознанно попросил.",
+            "example": false
+          },
+          "sub": {
+            "type": "string",
+            "example": "user123"
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Необязательное кастомное время жизни токена в секундах.\n\nЕсли не задано, используется `TOKEN_EXPIRATION_SECONDS`. При наличии\nзначение проверяется на границы `TOKEN_TTL_MIN_SECONDS` /\n`TOKEN_TTL_MAX_SECONDS`; выход за них — `422 Unprocessable Entity`.",
+            "example": 3600,
+            "minimum": 0
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "Успешный ответ на выпуск токена.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "refresh_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Refresh-токен, если он запрашивался.\n\nНепрозрачная строка, а не JWT: разбирать её клиенту незачем, она лишь\nпредъявляется в `POST /tokens/refresh`. Отсутствует в ответе, когда\nrefresh не запрашивали."
+          },
+          "token": {
+            "type": "string",
+            "description": "Подписанный JWT.",
+            "example": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+          }
+        }
+      },
+      "TokenVerifyRequest": {
+        "type": "object",
+        "description": "Тело запроса на проверку токена (`POST /tokens/verify`).",
+        "required": [
+          "token",
+          "audience"
+        ],
+        "properties": {
+          "audience": {
+            "type": "string",
+            "description": "Ожидаемый получатель; должен присутствовать в claim `aud` токена.",
+            "example": "api1"
+          },
+          "token": {
+            "type": "string",
+            "description": "Проверяемый токен целиком (`header.payload.signature`).",
+            "example": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "metrics_token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Уровень 4: статический Bearer-токен для скрейпа /metrics (AUTH_METRICS_TOKEN)."
+      },
+      "proxy_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Proxy-Secret",
+        "description": "Уровень 2: статический секрет, проставляемый обратным прокси. Прокси ОБЯЗАН затирать клиентскую версию заголовка."
+      },
+      "totp": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-TOTP-Code",
+        "description": "Уровень 3: текущий TOTP-код (RFC 6238) на общем секрете."
+      }
+    }
+  }
+}
