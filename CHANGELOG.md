@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.17.10] - 2026-08-27
+
+### Документация
+
+- SECURITY.md — приватный канал для сообщений об уязвимостях, сроки и поддерживаемые версии (JWT-57)
+
 ## [1.17.9] - 2026-08-27
 
 ### Документация
@@ -359,6 +365,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.10]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.9...v1.17.10
 [1.17.9]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.8...v1.17.9
 [1.17.8]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.7...v1.17.8
 [1.17.7]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.6...v1.17.7
