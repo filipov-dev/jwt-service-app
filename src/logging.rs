@@ -122,7 +122,7 @@ pub fn init_subscriber() -> Telemetry {
     let (sentry_guard, sentry_status) = crate::sentry_glitchtip::init();
     let sentry_layer = sentry_guard
         .as_ref()
-        .map(|_| crate::sentry_glitchtip::layer());
+        .map(|_| crate::sentry_glitchtip::layer(sentry_status.logs_enabled()));
 
     tracing_subscriber::registry()
         .with(filter)
