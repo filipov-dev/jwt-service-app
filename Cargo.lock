@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "jwt-service-app"
-version = "1.17.8"
+version = "1.17.9"
 dependencies = [
  "actix-cors",
  "actix-web",

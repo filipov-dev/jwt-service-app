@@ -4,9 +4,10 @@
     "title": "jwt-service-app",
     "description": "",
     "license": {
-      "name": ""
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
     },
-    "version": "1.17.8"
+    "version": "1.17.9"
   },
   "paths": {
     "/livez": {

@@ -56,8 +56,24 @@ RUN apt-get update --fix-missing && \
         ca-certificates \
         && rm -rf /var/lib/apt/lists/*
 
+# Метки OCI. Ключевая здесь — `licenses`: образ раздаётся публично в Docker Hub
+# и GHCR, и до JWT-56 по нему нельзя было понять условия использования вообще
+# никак. Строка совпадает с полем `license` в `Cargo.toml` и с `LICENSE` в корне
+# репозитория; при смене лицензии правятся все три. `version` намеренно нет:
+# теги проставляет `docker.yml` из `Cargo.toml`, а зашитая в Dockerfile метка
+# протухала бы молча.
+LABEL org.opencontainers.image.title="jwt-service-app" \
+      org.opencontainers.image.description="Сервис выпуска, проверки и отзыва JWT" \
+      org.opencontainers.image.source="https://github.com/filipov-dev/jwt-service-app" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # Copy the built application from the builder stage
 COPY --from=builder /app/target/release/jwt-service-app /usr/local/bin/jwt-service-app
+
+# Текст лицензии внутрь образа: Apache-2.0 (раздел 4) требует отдавать копию
+# лицензии получателям работы, а получатель бинаря здесь — тот, кто скачал образ,
+# а не тот, кто зашёл в репозиторий.
+COPY LICENSE /usr/share/doc/jwt-service-app/LICENSE
 
 # Set the working directory
 WORKDIR /app

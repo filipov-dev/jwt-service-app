@@ -147,3 +147,18 @@ healthcheck:
 ## Изменения между версиями
 
 [CHANGELOG.md](https://github.com/filipov-dev/jwt-service-app/blob/master/CHANGELOG.md).
+
+## Лицензия
+
+[Apache-2.0](https://github.com/filipov-dev/jwt-service-app/blob/master/LICENSE)
+— та же строка лежит в метке образа `org.opencontainers.image.licenses`:
+
+```
+docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' filipov/jwt-service-app:latest
+```
+
+Полный текст лежит и внутри образа —
+`/usr/share/doc/jwt-service-app/LICENSE`.
+
+Образ можно использовать, в том числе коммерчески, форкать и менять; при
+распространении сохраните текст лицензии и отметьте внесённые изменения.
