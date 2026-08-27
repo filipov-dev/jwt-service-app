@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.17.7"
+version = "1.17.8"
 edition = "2021"
 
 [dependencies]

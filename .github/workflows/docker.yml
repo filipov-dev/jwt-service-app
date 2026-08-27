@@ -39,7 +39,11 @@ jobs:
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
+      # persist-credentials: false — токен из `.git/config` ниже не нужен:
+      # в git по сети не ходит ни один шаг (см. ci.yml).
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4.5.2
@@ -103,6 +107,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Download digests
         uses: actions/download-artifact@v4
