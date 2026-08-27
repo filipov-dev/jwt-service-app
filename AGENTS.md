@@ -18,6 +18,11 @@
 - Хранилище `jti`: Redis (`redis` crate, multiplexed async connection).
 - OpenAPI: `utoipa`, спека отдаётся на `/api-docs/openapi.json` и лежит в
   репозитории — [`docs/openapi.json`](docs/openapi.json).
+- Лицензия: Apache-2.0 — [`LICENSE`](LICENSE), поле `license` в `Cargo.toml`,
+  метка `org.opencontainers.image.licenses` в прод-образе и `info.license` в
+  OpenAPI-спеке. Апстрим-зависимости — permissive (MIT / Apache-2.0);
+  copyleft-крейты не тянем, потому что образы раздаются публично (см. комментарий
+  к `governor` в `Cargo.toml`).
 
 ## Архитектура
 
