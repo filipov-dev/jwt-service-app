@@ -12,6 +12,12 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.17.12] - 2026-08-28
+
+### Документация
+
+- CONTRIBUTING, кодекс поведения, шаблоны issue/PR и README для внешнего читателя (JWT-58)
+
 ## [1.17.11] - 2026-08-28
 
 ### Внутреннее
@@ -383,6 +389,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.12]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.11...v1.17.12
 [1.17.11]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.10...v1.17.11
 [1.17.10]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.9...v1.17.10
 [1.17.9]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.8...v1.17.9

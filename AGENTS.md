@@ -25,6 +25,12 @@
   к `governor` в `Cargo.toml`).
 - Политика безопасности: [`SECURITY.md`](SECURITY.md) — приватный канал для
   сообщений об уязвимостях, сроки ответа и раскрытия, поддерживаемые версии.
+- Документы для внешнего участника: [`README.md`](README.md) — витрина проекта
+  (что сервис делает и чего не делает, быстрый старт, карта документации),
+  [`CONTRIBUTING.md`](CONTRIBUTING.md) — сборка, команды, соглашения по коду и
+  коммитам, чеклист PR, [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor
+  Covenant 2.1, контакт `andrey@filipov.dev`. Шаблоны issue и PR —
+  в [`.github/`](.github) (см. «Гигиена публичного репозитория»).
 
 ## Архитектура
 
@@ -436,6 +442,56 @@ Release — формулировки в файле и в релизе совпа
 > создаётся один — на финальную версию мержа. Поэтому в тегах есть пропуски
 > (1.11.0, 1.12.0, 1.12.1): их коммиты вошли в следующий выпущенный тег, а не
 > потерялись.
+
+### Гигиена публичного репозитория
+
+Репозиторий рассчитан на внешнего читателя, и «входные» документы разведены по
+ролям — не сваливайте всё в один файл:
+
+| Файл | Кому и о чём |
+|------|--------------|
+| [`README.md`](README.md) | Пришедшему извне: что сервис делает и чего **не** делает, где он стоит в системе, быстрый старт, карта остальной документации. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Тому, кто хочет прислать PR: окружение, команды, что проверяет CI, соглашения по коду и коммитам, чеклист PR, лицензия вклада. |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Правила общения (Contributor Covenant 2.1), контакт для жалоб — `andrey@filipov.dev`. |
+| [`SECURITY.md`](SECURITY.md) | Приватный канал для уязвимостей, сроки, область действия. |
+| `AGENTS.md` (этот файл) | Тому, кто уже внутри: архитектура, подводные камни, полная конфигурация. |
+
+Шаблоны в [`.github/`](.github): формы issue
+([`ISSUE_TEMPLATE/bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml),
+[`feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml),
+[`docs.yml`](.github/ISSUE_TEMPLATE/docs.yml)) и
+[`PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
+
+> **Пустые issue выключены** (`blank_issues_enabled: false` в
+> [`ISSUE_TEMPLATE/config.yml`](.github/ISSUE_TEMPLATE/config.yml)) — иначе разбор
+> начинается с выпрашивания версии и шагов воспроизведения. Там же `contact_links`
+> уводит уязвимости в приватный адвайзори, а вопросы про ключи — в
+> `jwks-service-app`: это единственный способ показать человеку правильный канал
+> **до** того, как он опубликует находку.
+
+Чеклист PR в шаблоне дублирует правила из «Правил для агентов» (версия,
+`docs/openapi.json`, `internal_endpoints()`, генерируемый `CHANGELOG.md`).
+Меняете правило — правьте оба места, иначе шаблон начнёт требовать не то.
+
+**Метаданные самого репозитория** (`description`, `homepage`, `topics`) живут не
+в файлах, а в настройках GitHub, и потому уезжают тише всего. Текущие значения:
+
+```bash
+curl -s https://api.github.com/repos/filipov-dev/jwt-service-app \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["description"], d["homepage"], d["topics"], sep="\n")'
+```
+
+- `description` — «Сервис выпуска, проверки и отзыва JWT: RS/ES/EdDSA, ключи из
+  внешнего JWKS, отзыв по `jti`, четыре уровня доступа». Та же по смыслу строка
+  лежит в метке образа `org.opencontainers.image.description`
+  ([`deployments/prod/Dockerfile`](deployments/prod/Dockerfile)) и в шапке
+  [`deployments/prod/README.md`](deployments/prod/README.md) — описании образа на
+  Docker Hub. Правите одну — сверьте остальные.
+- `homepage` — страница образа на Docker Hub: репозиторий читают, а запускают
+  образ.
+- `topics` — `jwt`, `jwks`, `rust`, `actix-web`, `authentication`,
+  `authorization`, `microservice`, `redis`, `openapi`, `totp`, `docker`,
+  `security`.
 
 ## Конфигурация (переменные окружения)
 
@@ -874,6 +930,10 @@ Release — формулировки в файле и в релизе совпа
   --insert` (см. «Релизы и CHANGELOG»). Тег появляется только после мержа,
   поэтому пересборка `--all` в этот момент положила бы изменения в «Не
   выпущено» — раздел с номером версии даёт только `--insert`.
+- **Правило, вписанное в чеклист PR, живёт в двух местах** — в этом разделе и
+  в [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md)
+  (плюс краткий пересказ в [`CONTRIBUTING.md`](CONTRIBUTING.md)). Меняете
+  правило — правьте все места сразу, см. «Гигиена публичного репозитория».
 - Не коммитьте и не пушьте без явной просьбы пользователя.
 - Не добавляйте секреты в репозиторий; креды CI лежат в GitHub Secrets.
 - При добавлении эндпоинта не забудьте аннотацию `utoipa::path` и регистрацию

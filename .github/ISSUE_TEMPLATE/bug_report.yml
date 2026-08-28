@@ -1,0 +1,102 @@
+name: Баг
+description: Сервис ведёт себя не так, как описано в документации
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Нашли уязвимость — закройте эту форму.** Публичный issue раскрывает
+        её всем, кто запустил образ, раньше, чем выйдет патч. Приватный
+        адвайзори (Security → Report a vulnerability) или письмо на
+        security@filipov.dev — см. [SECURITY.md](https://github.com/filipov-dev/jwt-service-app/blob/master/SECURITY.md).
+
+        **Секреты, приватные ключи и живые токены в issue не вставляйте.**
+        Значения замените на `...`.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия сервиса
+      description: Тег образа или `info.version` из `GET /api-docs/openapi.json`.
+      placeholder: "1.17.11"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Как запущен
+      options:
+        - Docker (одиночный контейнер)
+        - Docker Compose
+        - Kubernetes
+        - cargo run / cargo build
+        - Иначе (опишите ниже)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: Что происходит
+      description: Фактическое поведение — код ответа, тело, строка лога.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: Что ожидалось
+      description: >-
+        И, если можно, откуда взялось ожидание: строка в README/AGENTS.md,
+        OpenAPI-спека, RFC.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: >-
+        `curl` или короткий скрипт нагляднее описания словами. Заголовки
+        оставьте, значения секретов замените на `...`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Относящаяся к делу конфигурация
+      description: >-
+        Переменные окружения **без значений секретов**: какие уровни доступа
+        включены, задан ли `RATE_LIMIT_TRUSTED_PROXIES`, включена ли
+        `AUTH_TOTP_REPLAY_PROTECTION`, какой `TOKEN_ALGORITHM`.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: >-
+        Строки вокруг ошибки. Читаемее с `LOG_FORMAT=json` и
+        `RUST_LOG=jwt_service_app=debug`.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Проверил, что на последнем теге поведение то же (или указал, что не проверял)
+          required: false
+        - label: Секретов и живых токенов в тексте нет
+          required: true
+        - label: >-
+            Это не одно из решений, разобранных в разделе «Что уязвимостью не
+            считается» SECURITY.md и «Соглашения и подводные камни» AGENTS.md
+          required: false

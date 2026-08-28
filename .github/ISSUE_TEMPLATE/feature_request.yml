@@ -1,0 +1,61 @@
+name: Предложение
+description: Не хватает возможности или хочется изменить поведение
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Полезнее всего описать **задачу**, а не только желаемую реализацию:
+        так у неё может найтись решение дешевле предложенного.
+
+        Учтите границы проекта: сервис выпускает, проверяет и отзывает JWT. Он
+        не генерирует и не хранит ключи (это `jwks-service-app`), не
+        терминирует TLS (это обратный прокси) и не заводит пользователей.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу решаете
+      description: Что вы пытаетесь сделать и обо что упёрлись сейчас.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Что предлагаете
+      description: >-
+        Ручка, поле в теле запроса, переменная окружения — насколько конкретно
+        получается. Если меняется контракт API, покажите запрос и ответ.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Что пробовали вместо этого
+      description: >-
+        Обходные пути, которые уже есть, и чем они не устроили. Пустой раздел —
+        частая причина отказа: возможно, решение уже существует.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: compat
+    attributes:
+      label: Совместимость
+      description: Ломает ли предложение существующее поведение.
+      options:
+        - Обратно совместимо
+        - Ломает совместимость (API, формат токенов, конфигурация)
+        - Не знаю
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Участие
+      options:
+        - label: Готов прислать pull request
+          required: false
