@@ -1,8 +1,9 @@
-# Kong (declarative config). Плагин request-transformer:
-#   - remove.headers удаляет клиентскую версию;
-#   - add.headers (при отсутствии) / replace.headers ставит секрет.
-# Значение секрета подставляется при рендере конфига из env KONG_PROXY_SECRET
-# (Kong не разворачивает env внутри значений плагина сам).
+# Kong (declarative config). The request-transformer plugin:
+#   - remove.headers deletes the client-supplied version;
+#   - add.headers (when absent) / replace.headers applies the secret.
+# The secret value is substituted when the config is rendered, from the
+# KONG_PROXY_SECRET env var (Kong does not expand env inside plugin values
+# itself).
 
 _format_version: "3.0"
 services:
@@ -14,10 +15,10 @@ services:
     plugins:
       - name: request-transformer
         config:
-          # (1) Удаляем входящий заголовок от клиента.
+          # (1) Delete the incoming header from the client.
           remove:
             headers: ["X-Proxy-Secret"]
-          # (2) Ставим секрет (replace гарантирует перезапись).
+          # (2) Set the secret (replace guarantees an overwrite).
           replace:
             headers: ["X-Proxy-Secret:${PROXY_SECRET}"]
           add:

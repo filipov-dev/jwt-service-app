@@ -1,32 +1,35 @@
-//! Ограничение частоты запросов (rate limiting).
+//! Rate limiting.
 //!
-//! Алгоритм — token-bucket (GCRA) из crate [`governor`] (MIT); actix-обёртку
-//! `actix-governor` (GPL-3.0) осознанно не тянем из-за копилефта на публично
-//! раздаваемые Docker-образы — middleware реализован здесь свой, по образцу
-//! [`crate::auth`]. Превышение лимита → `429 Too Many Requests` (скупое тело
-//! [`ErrorResponse`], заголовок `Retry-After` в секундах).
+//! The algorithm is a token bucket (GCRA) from the [`governor`] crate (MIT); the
+//! actix wrapper `actix-governor` (GPL-3.0) is deliberately kept out because of
+//! its copyleft on publicly distributed Docker images — the middleware here is
+//! our own, modelled on [`crate::auth`]. Exceeding the limit gives
+//! `429 Too Many Requests` (a terse [`ErrorResponse`] body and a `Retry-After`
+//! header in seconds).
 //!
-//! Модель согласована с уровнями доступа (см. `AGENTS.md`):
+//! The model matches the access levels (see `AGENTS.md`):
 //!
-//! - **`POST /tokens/verify` (уровень 2, публичная за прокси) — per-IP.** Ключ —
-//!   IP клиента; лимит применяется к каждому адресу независимо. Middleware ставится
-//!   **снаружи** auth, чтобы флуд отсекался до проверки секрета.
-//! - **`POST /tokens` / `DELETE /tokens/{jti}` (уровень 3, internal) — опциональный
-//!   глобальный cap.** Не per-IP (клиент один), а общий потолок на эндпоинт:
-//!   defense-in-depth при утечке TOTP-секрета и backpressure для JWKS/Redis.
-//!   Ставится **внутри** auth — потолок расходуют только запросы, прошедшие TOTP,
-//!   иначе неаутентифицированный флуд исчерпал бы cap и заблокировал настоящего
-//!   клиента.
+//! - **`POST /tokens/verify` (level 2, public behind a proxy) — per-IP.** The
+//!   key is the client IP and the limit applies to each address independently.
+//!   The middleware sits **outside** auth so that a flood is cut off before the
+//!   secret is checked.
+//! - **`POST /tokens` / `DELETE /tokens/{jti}` (level 3, internal) — an optional
+//!   global cap.** Not per-IP (there is one client) but a shared ceiling per
+//!   endpoint: defense in depth against a leaked TOTP secret and backpressure
+//!   for JWKS and Redis. It sits **inside** auth — only requests that passed
+//!   TOTP consume the cap, otherwise an unauthenticated flood would drain it and
+//!   lock out the real client.
 //!
-//! ## IP за обратным прокси
+//! ## The client IP behind a reverse proxy
 //!
-//! Peer-адрес соединения за прокси — это всегда адрес прокси, поэтому реальный IP
-//! клиента берётся из `X-Forwarded-For`. Но заголовок подделываем клиентом, поэтому
-//! доверяем ему **только если peer входит в список доверенных прокси**
-//! (`RATE_LIMIT_TRUSTED_PROXIES`, IP или CIDR). Разбор XFF идёт справа налево —
-//! первый адрес, не являющийся доверенным прокси, и есть клиент (так корректно
-//! отрабатывается цепочка прокси). Если список пуст или peer недоверенный, XFF
-//! игнорируется и ключом служит peer-адрес — безопасный по умолчанию режим.
+//! The peer address of a connection behind a proxy is always the address of the
+//! proxy, so the real client IP comes from `X-Forwarded-For`. But that header is
+//! forgeable by the client, so it is trusted **only when the peer is in the list
+//! of trusted proxies** (`RATE_LIMIT_TRUSTED_PROXIES`, an IP or a CIDR). XFF is
+//! parsed right to left — the first address that is not a trusted proxy is the
+//! client (which handles a chain of proxies correctly). When the list is empty
+//! or the peer is untrusted, XFF is ignored and the peer address serves as the
+//! key — the safe default.
 
 use std::env;
 use std::future::{ready, Future, Ready};
@@ -49,17 +52,17 @@ use tracing::{info, warn};
 
 use crate::models::ErrorResponse;
 
-/// Keyed-лимитер (по IP) поверх дефолтного хранилища состояния и часов.
+/// A keyed limiter (by IP) over the default state store and clock.
 type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
-/// Direct-лимитер (единственное ведро) для глобального потолка.
+/// A direct limiter (a single bucket) for the global ceiling.
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-/// Период между чистками устаревших per-IP записей (`retain_recent`).
+/// Interval between sweeps of stale per-IP entries (`retain_recent`).
 ///
-/// Ограничивает рост памяти на публичной ручке при большом числе разных IP.
+/// It bounds memory growth on the public endpoint when many distinct IPs appear.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Читает `u64` из переменной окружения с откатом на `default`.
+/// Reads a `u64` from an environment variable, falling back to `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -67,7 +70,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Читает `u32` из переменной окружения с откатом на `default`.
+/// Reads a `u32` from an environment variable, falling back to `default`.
 fn env_u32(key: &str, default: u32) -> u32 {
     env::var(key)
         .ok()
@@ -75,9 +78,9 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Читает булев флаг (`1/true/yes/on` — истина, `0/false/no/off/""` — ложь).
+/// Reads a boolean flag (`1/true/yes/on` is true, `0/false/no/off/""` is false).
 ///
-/// Нераспознанное значение → `default` с предупреждением в лог.
+/// An unrecognised value gives `default` with a warning in the log.
 fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Err(_) => default,
@@ -85,15 +88,16 @@ fn env_bool(key: &str, default: bool) -> bool {
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" | "" => false,
             other => {
-                warn!("{key}: нераспознанное булево значение '{other}', использую {default}");
+                warn!("{key}: unrecognised boolean value '{other}', using {default}");
                 default
             }
         },
     }
 }
 
-/// Приводит IPv4-mapped IPv6 (`::ffff:a.b.c.d`) к IPv4 — чтобы peer/XFF и записи
-/// доверенных прокси сравнивались в одном семействе.
+/// Normalises an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to IPv4 — so that
+/// the peer/XFF addresses and the trusted proxy entries are compared within one
+/// family.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -104,9 +108,9 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Группирует IPv6 по префиксу `/56` (как дефолтный экстрактор governor): один
-/// клиент обычно получает `/56`, и лимитировать разумнее подсеть, а не адрес.
-/// IPv4 возвращается без изменений.
+/// Groups IPv6 by the `/56` prefix (like the default governor extractor): one
+/// client usually gets a `/56`, and limiting the subnet makes more sense than
+/// limiting a single address. IPv4 is returned unchanged.
 fn group_v6(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
@@ -118,7 +122,7 @@ fn group_v6(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Совпадают ли первые `prefix` бит двух адресов одной длины.
+/// Whether the first `prefix` bits of two addresses of the same length match.
 fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
     let whole = (prefix / 8) as usize;
     if a[..whole] != b[..whole] {
@@ -132,7 +136,7 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
     (a[whole] & mask) == (b[whole] & mask)
 }
 
-/// Диапазон адресов доверенного прокси: одиночный IP или CIDR (`10.0.0.0/8`).
+/// The address range of a trusted proxy: a single IP or a CIDR (`10.0.0.0/8`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Cidr {
     addr: IpAddr,
@@ -140,7 +144,7 @@ struct Cidr {
 }
 
 impl Cidr {
-    /// Разбирает `"IP"` или `"IP/prefix"`. `None` — если адрес/префикс некорректны.
+    /// Parses `"IP"` or `"IP/prefix"`. `None` when the address or prefix is invalid.
     fn parse(input: &str) -> Option<Self> {
         let input = input.trim();
         let (addr_str, prefix) = match input.split_once('/') {
@@ -162,7 +166,7 @@ impl Cidr {
         Some(Self { addr, prefix })
     }
 
-    /// Входит ли `ip` (предполагается уже канонизированным) в диапазон.
+    /// Whether `ip` (assumed already normalised) falls into the range.
     fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(a), IpAddr::V4(b)) => prefix_match(&a.octets(), &b.octets(), self.prefix),
@@ -172,30 +176,31 @@ impl Cidr {
     }
 }
 
-/// Доверенный ли адрес (входит хотя бы в один диапазон списка).
+/// Whether the address is trusted (falls into at least one range of the list).
 fn ip_is_trusted(ip: IpAddr, trusted: &[Cidr]) -> bool {
     trusted.iter().any(|c| c.contains(ip))
 }
 
-/// Разбирает одну запись `X-Forwarded-For` (голый IP или `IP:port`) в адрес.
+/// Parses one `X-Forwarded-For` entry (a bare IP or `IP:port`) into an address.
 fn parse_forwarded_ip(entry: &str) -> Option<IpAddr> {
     let entry = entry.trim();
     if let Ok(ip) = entry.parse::<IpAddr>() {
         return Some(canonical(ip));
     }
-    // Возможен `IPv4:port` — отсекаем порт (для `[IPv6]:port` разбор выше уже
-    // не сработал, но такие записи в XFF нетипичны).
+    // An `IPv4:port` is possible — strip the port (for `[IPv6]:port` the parsing
+    // above has already failed, but such entries are unusual in XFF).
     entry
         .rsplit_once(':')
         .and_then(|(host, _)| host.parse::<IpAddr>().ok())
         .map(canonical)
 }
 
-/// Выбирает IP клиента из `X-Forwarded-For` при доверенном peer.
+/// Picks the client IP out of `X-Forwarded-For` when the peer is trusted.
 ///
-/// Идёт справа налево и возвращает первый адрес, не являющийся доверенным прокси
-/// (реальный клиент за цепочкой прокси). Если все записи доверенные — крайняя
-/// левая; если заголовка нет — `None` (наверх выберут peer).
+/// It walks right to left and returns the first address that is not a trusted
+/// proxy (the real client behind a chain of proxies). When every entry is
+/// trusted it returns the leftmost one; when the header is absent it returns
+/// `None` (the caller then picks the peer).
 fn client_from_forwarded(headers: &HeaderMap, header: &str, trusted: &[Cidr]) -> Option<IpAddr> {
     let mut ips: Vec<IpAddr> = Vec::new();
     for value in headers.get_all(header) {
@@ -214,10 +219,10 @@ fn client_from_forwarded(headers: &HeaderMap, header: &str, trusted: &[Cidr]) ->
         .or_else(|| ips.first().copied())
 }
 
-/// Итоговый ключ per-IP лимитера для запроса.
+/// The resulting per-IP limiter key for a request.
 ///
-/// XFF учитывается **только** если peer доверенный; иначе — peer-адрес.
-/// Результат группируется по `/56` для IPv6.
+/// XFF is honoured **only** when the peer is trusted; otherwise the peer address
+/// is used. The result is grouped by `/56` for IPv6.
 fn resolve_key_ip(
     peer: Option<IpAddr>,
     headers: &HeaderMap,
@@ -233,8 +238,8 @@ fn resolve_key_ip(
     Some(group_v6(ip))
 }
 
-/// Строит quota: `per_second` пополнений в секунду с ёмкостью всплеска `burst`.
-/// Значения приводятся к минимуму 1, чтобы quota была валидной.
+/// Builds a quota: `per_second` refills per second with a burst capacity of
+/// `burst`. The values are clamped to a minimum of 1 so that the quota is valid.
 fn quota(per_second: u64, burst: u32) -> Quota {
     let per_second = per_second.max(1);
     let burst = NonZeroU32::new(burst.max(1)).expect("burst >= 1");
@@ -244,8 +249,8 @@ fn quota(per_second: u64, burst: u32) -> Quota {
         .allow_burst(burst)
 }
 
-/// Секунды до следующего разрешённого запроса (для заголовка `Retry-After`),
-/// не меньше 1.
+/// Seconds until the next allowed request (for the `Retry-After` header), never
+/// below 1.
 fn retry_after_secs(negative: NotUntil<QuantaInstant>) -> u64 {
     negative
         .wait_time_from(DefaultClock::default().now())
@@ -253,11 +258,11 @@ fn retry_after_secs(negative: NotUntil<QuantaInstant>) -> u64 {
         .max(1)
 }
 
-/// Собранная из окружения конфигурация rate limiting.
+/// The rate limiting configuration assembled from the environment.
 ///
-/// Все параметры опциональны и имеют разумные дефолты; ошибки конфигурации
-/// (например нераспознанный CIDR) не фатальны — деградируем к безопасному режиму
-/// с предупреждением в лог.
+/// Every parameter is optional and has a sensible default; configuration errors
+/// (an unparsable CIDR, for example) are not fatal — we degrade to the safe mode
+/// with a warning in the log.
 pub struct RateLimitConfig {
     verify_enabled: bool,
     verify_per_second: u64,
@@ -270,15 +275,15 @@ pub struct RateLimitConfig {
 }
 
 impl RateLimitConfig {
-    /// Читает конфигурацию из окружения.
+    /// Reads the configuration from the environment.
     ///
-    /// Переменные:
-    /// - `RATE_LIMIT_VERIFY_ENABLED` (дефолт `true`) — per-IP лимит на `/tokens/verify`;
-    /// - `RATE_LIMIT_VERIFY_PER_SECOND` (дефолт 10), `RATE_LIMIT_VERIFY_BURST` (дефолт 20);
-    /// - `RATE_LIMIT_INTERNAL_ENABLED` (дефолт `false`) — глобальный cap на internal-ручки;
-    /// - `RATE_LIMIT_INTERNAL_PER_SECOND` (дефолт 50), `RATE_LIMIT_INTERNAL_BURST` (дефолт 100);
-    /// - `RATE_LIMIT_TRUSTED_PROXIES` — список доверенных прокси (IP/CIDR через запятую);
-    /// - `RATE_LIMIT_FORWARDED_HEADER` (дефолт `X-Forwarded-For`) — заголовок с IP клиента.
+    /// The variables:
+    /// - `RATE_LIMIT_VERIFY_ENABLED` (default `true`) — the per-IP limit on `/tokens/verify`;
+    /// - `RATE_LIMIT_VERIFY_PER_SECOND` (default 10), `RATE_LIMIT_VERIFY_BURST` (default 20);
+    /// - `RATE_LIMIT_INTERNAL_ENABLED` (default `false`) — the global cap on the internal endpoints;
+    /// - `RATE_LIMIT_INTERNAL_PER_SECOND` (default 50), `RATE_LIMIT_INTERNAL_BURST` (default 100);
+    /// - `RATE_LIMIT_TRUSTED_PROXIES` — the list of trusted proxies (IP/CIDR, comma-separated);
+    /// - `RATE_LIMIT_FORWARDED_HEADER` (default `X-Forwarded-For`) — the header carrying the client IP.
     pub fn from_env() -> Self {
         let trusted_raw = env::var("RATE_LIMIT_TRUSTED_PROXIES").unwrap_or_default();
         let mut trusted = Vec::new();
@@ -290,7 +295,7 @@ impl RateLimitConfig {
             match Cidr::parse(entry) {
                 Some(cidr) => trusted.push(cidr),
                 None => {
-                    warn!("RATE_LIMIT_TRUSTED_PROXIES: не разобран IP/CIDR '{entry}', пропускаю")
+                    warn!("RATE_LIMIT_TRUSTED_PROXIES: could not parse the IP/CIDR '{entry}', skipping")
                 }
             }
         }
@@ -308,33 +313,33 @@ impl RateLimitConfig {
         }
     }
 
-    /// Пишет в лог сводку активной конфигурации (без секретов — секретов тут нет).
+    /// Writes a summary of the active configuration to the log (no secrets — there are none here).
     pub fn log_summary(&self) {
         if self.verify_enabled {
             info!(
-                "Rate limit /tokens/verify: per-IP {}/s, burst {}, доверенных прокси: {}",
+                "Rate limit /tokens/verify: per-IP {}/s, burst {}, trusted proxies: {}",
                 self.verify_per_second,
                 self.verify_burst,
                 self.trusted.len()
             );
             if self.trusted.is_empty() {
                 warn!(
-                    "RATE_LIMIT_TRUSTED_PROXIES пуст: X-Forwarded-For не учитывается, ключ — peer-адрес. \
-                     За обратным прокси задайте список доверенных прокси, иначе все клиенты делят один лимит."
+                    "RATE_LIMIT_TRUSTED_PROXIES is empty: X-Forwarded-For is ignored and the key is the peer address. \
+                     Behind a reverse proxy set the list of trusted proxies, or every client shares one limit."
                 );
             }
         } else {
-            warn!("Rate limit /tokens/verify отключён (RATE_LIMIT_VERIFY_ENABLED=false)");
+            warn!("Rate limit /tokens/verify is disabled (RATE_LIMIT_VERIFY_ENABLED=false)");
         }
         if self.internal_enabled {
             info!(
-                "Rate limit internal-ручек: глобальный cap {}/s, burst {}",
+                "Rate limit on the internal endpoints: global cap {}/s, burst {}",
                 self.internal_per_second, self.internal_burst
             );
         }
     }
 
-    /// Строит per-IP лимитер для `/tokens/verify`, если он включён.
+    /// Builds the per-IP limiter for `/tokens/verify` when it is enabled.
     pub fn build_verify(&self) -> Option<PerIpLimiter> {
         if !self.verify_enabled {
             return None;
@@ -349,7 +354,7 @@ impl RateLimitConfig {
         })
     }
 
-    /// Строит глобальный cap для internal-ручек, если он включён.
+    /// Builds the global cap for the internal endpoints when it is enabled.
     pub fn build_internal(&self) -> Option<GlobalLimiter> {
         if !self.internal_enabled {
             return None;
@@ -363,7 +368,7 @@ impl RateLimitConfig {
     }
 }
 
-/// Per-IP лимитер (для публичной ручки). Дёшево клонируется — внутри `Arc`.
+/// The per-IP limiter (for the public endpoint). Cheap to clone — an `Arc` inside.
 #[derive(Clone)]
 pub struct PerIpLimiter {
     limiter: Arc<KeyedLimiter>,
@@ -372,8 +377,8 @@ pub struct PerIpLimiter {
 }
 
 impl PerIpLimiter {
-    /// Запускает фоновый поток периодической чистки устаревших per-IP записей.
-    /// Вызывать один раз на старте (лимитер общий на все worker-потоки).
+    /// Starts a background thread that periodically sweeps stale per-IP entries.
+    /// Call it once at startup (the limiter is shared by every worker thread).
     pub fn spawn_cleanup(&self) {
         let limiter = self.limiter.clone();
         std::thread::spawn(move || loop {
@@ -383,28 +388,28 @@ impl PerIpLimiter {
     }
 }
 
-/// Глобальный лимитер (единое ведро на эндпоинт). Дёшево клонируется.
+/// The global limiter (a single bucket per endpoint). Cheap to clone.
 #[derive(Clone)]
 pub struct GlobalLimiter {
     limiter: Arc<DirectLimiter>,
 }
 
-/// Стратегия проверки конкретного middleware-экземпляра.
+/// The checking strategy of a particular middleware instance.
 enum Strategy {
-    /// Лимит выключен — пропускаем всё.
+    /// The limit is off — let everything through.
     Disabled,
-    /// Per-IP по ключу клиента.
+    /// Per-IP, keyed by the client.
     PerIp {
         limiter: Arc<KeyedLimiter>,
         trusted: Arc<Vec<Cidr>>,
         forwarded_header: Arc<str>,
     },
-    /// Единый глобальный потолок.
+    /// A single global ceiling.
     Global { limiter: Arc<DirectLimiter> },
 }
 
 impl Strategy {
-    /// `Ok(())` — пропустить; `Err(secs)` — отклонить с `Retry-After: secs`.
+    /// `Ok(())` means let it through; `Err(secs)` means reject with `Retry-After: secs`.
     fn check(&self, req: &ServiceRequest) -> Result<(), u64> {
         match self {
             Strategy::Disabled => Ok(()),
@@ -417,8 +422,9 @@ impl Strategy {
                 let peer = req.peer_addr().map(|addr| addr.ip());
                 match resolve_key_ip(peer, req.headers(), forwarded_header, trusted) {
                     Some(ip) => limiter.check_key(&ip).map_err(retry_after_secs),
-                    // Не смогли определить IP (нет peer-адреса) — fail-open: запрос
-                    // всё равно защищён proxy-secret'ом на уровне auth.
+                    // The IP could not be determined (no peer address) —
+                    // fail-open: the request is protected by the proxy secret at
+                    // the auth layer anyway.
                     None => Ok(()),
                 }
             }
@@ -426,13 +432,13 @@ impl Strategy {
     }
 }
 
-/// Middleware-фабрика rate limiting. Ставится через `.wrap(...)` на ресурсе.
+/// The rate limiting middleware factory. Installed with `.wrap(...)` on a resource.
 pub struct RateLimit {
     strategy: Rc<Strategy>,
 }
 
 impl RateLimit {
-    /// Per-IP лимит для публичной ручки. `None` → пропуск (лимит выключен).
+    /// The per-IP limit for the public endpoint. `None` means pass through (the limit is off).
     pub fn per_ip(limiter: Option<PerIpLimiter>) -> Self {
         let strategy = match limiter {
             Some(l) => Strategy::PerIp {
@@ -447,7 +453,7 @@ impl RateLimit {
         }
     }
 
-    /// Глобальный cap для internal-ручки. `None` → пропуск (cap выключен).
+    /// The global cap for an internal endpoint. `None` means pass through (the cap is off).
     pub fn global(limiter: Option<GlobalLimiter>) -> Self {
         let strategy = match limiter {
             Some(l) => Strategy::Global { limiter: l.limiter },
@@ -478,7 +484,7 @@ where
     }
 }
 
-/// Собственно middleware: проверяет лимит до вызова внутреннего сервиса.
+/// The middleware itself: it checks the limit before calling the inner service.
 pub struct RateLimitMiddleware<S> {
     service: Rc<S>,
     strategy: Rc<Strategy>,
@@ -506,12 +512,13 @@ where
                     Ok(res.map_into_left_body())
                 }
                 Err(retry_after) => {
-                    // Срабатывание лимита — не сбой сервиса, но повод смотреть
-                    // (флуд, зациклившийся клиент, заниженный лимит) → WARN.
-                    warn!(retry_after, "Превышен лимит частоты запросов");
+                    // The limit firing is not a service failure, but it is worth
+                    // looking at (a flood, a client stuck in a loop, a limit set
+                    // too low) → WARN.
+                    warn!(retry_after, "Request rate limit exceeded");
                     crate::metrics::record_rate_limited();
 
-                    // Скупой ответ без деталей — как и на остальных ручках.
+                    // A terse response with no details — as on the other endpoints.
                     let (req, _payload) = req.into_parts();
                     let response = HttpResponse::TooManyRequests()
                         .insert_header((RETRY_AFTER, retry_after))
@@ -526,9 +533,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    //! Тесты разбора CIDR, извлечения IP из-за прокси и работы middleware поверх
-    //! полного actix-стека (429 при превышении, независимость ведёр по IP,
-    //! доверие XFF только за доверенным прокси).
+    //! Tests of CIDR parsing, of extracting the IP from behind a proxy and of
+    //! the middleware over the full actix stack (429 on exceeding the limit,
+    //! independence of the buckets per IP, trusting XFF only behind a trusted
+    //! proxy).
 
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -580,7 +588,7 @@ mod tests {
         let net = Cidr::parse("10.0.0.0/8").unwrap();
         assert!(net.contains("10.255.1.2".parse().unwrap()));
         assert!(!net.contains("11.0.0.1".parse().unwrap()));
-        // Разные семейства не пересекаются.
+        // Different families do not intersect.
         assert!(!net.contains("::1".parse().unwrap()));
 
         let net = Cidr::parse("192.168.1.0/24").unwrap();
@@ -611,7 +619,7 @@ mod tests {
 
     #[test]
     fn key_uses_peer_when_no_trusted_proxies() {
-        // XFF есть, но список доверенных пуст → доверять нельзя, ключ = peer.
+        // XFF is present but the trusted list is empty → it cannot be trusted, key = peer.
         let key = resolve_key_ip(
             Some(ip("203.0.113.9")),
             &xff(&["1.2.3.4"]),
@@ -623,7 +631,7 @@ mod tests {
 
     #[test]
     fn key_ignores_forwarded_from_untrusted_peer() {
-        // Peer не в списке доверенных — XFF мог быть подделан, берём peer.
+        // The peer is not in the trusted list — XFF could have been forged, take the peer.
         let trusted = cidrs(&["10.0.0.0/8"]);
         let key = resolve_key_ip(
             Some(ip("203.0.113.9")),
@@ -637,7 +645,7 @@ mod tests {
     #[test]
     fn key_takes_client_from_forwarded_behind_trusted_proxy() {
         let trusted = cidrs(&["10.0.0.0/8"]);
-        // Peer = доверенный прокси; XFF = "клиент".
+        // Peer = a trusted proxy; XFF = "the client".
         let key = resolve_key_ip(
             Some(ip("10.0.0.5")),
             &xff(&["198.51.100.7"]),
@@ -650,8 +658,8 @@ mod tests {
     #[test]
     fn key_skips_trusted_hops_in_forwarded_chain() {
         let trusted = cidrs(&["10.0.0.0/8"]);
-        // Цепочка: клиент, внешний-прокси-недоверенный? Здесь все внутренние — доверенные.
-        // client, proxyA(10.x), proxyB(10.x); справа налево первый недоверенный = client.
+        // A chain: client, proxyA(10.x), proxyB(10.x); every internal hop is
+        // trusted, so right to left the first untrusted one is the client.
         let headers = xff(&["198.51.100.7, 10.0.0.9, 10.0.0.5"]);
         let key = resolve_key_ip(Some(ip("10.0.0.5")), &headers, "X-Forwarded-For", &trusted);
         assert_eq!(key, Some(ip("198.51.100.7")));
@@ -671,8 +679,9 @@ mod tests {
             "X-Forwarded-For",
             &[],
         );
-        // Оба адреса в одном /56 → один ключ. /56 = 7 байт: младший байт 4-го
-        // хекстета (byte 7) зануляется, поэтому оба сводятся к 2001:db8:1::.
+        // Both addresses are in the same /56 → one key. /56 = 7 bytes: the low
+        // byte of the 4th hextet (byte 7) is zeroed, so both reduce to
+        // 2001:db8:1::.
         assert_eq!(a, b);
         assert_eq!(
             a,
@@ -694,7 +703,7 @@ mod tests {
         assert_eq!(canonical(mapped), ip("1.2.3.4"));
     }
 
-    // --- Интеграция middleware поверх actix ---
+    // --- Middleware integration over actix ---
 
     mod middleware {
         use super::*;
@@ -702,7 +711,7 @@ mod tests {
         use actix_web::{test, web, App, HttpResponse};
         use std::net::SocketAddr;
 
-        /// Приложение с ручкой `/x`, обёрнутой per-IP лимитером.
+        /// An application with an `/x` endpoint wrapped in the per-IP limiter.
         macro_rules! per_ip_app {
             ($limiter:expr) => {
                 test::init_service(
@@ -731,7 +740,7 @@ mod tests {
         #[actix_web::test]
         async fn returns_429_after_burst_exhausted() {
             let app = per_ip_app!(Some(per_ip(1, 2, &[])));
-            // burst=2: два запроса проходят, третий — 429.
+            // burst=2: two requests go through, the third gets a 429.
             for _ in 0..2 {
                 let req = test::TestRequest::get()
                     .uri("/x")
@@ -751,7 +760,7 @@ mod tests {
         #[actix_web::test]
         async fn buckets_are_independent_per_ip() {
             let app = per_ip_app!(Some(per_ip(1, 1, &[])));
-            // Первый IP исчерпал ведро.
+            // The first IP has drained its bucket.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("203.0.113.1"))
@@ -765,7 +774,7 @@ mod tests {
                 test::call_service(&app, req).await.status(),
                 StatusCode::TOO_MANY_REQUESTS
             );
-            // Другой IP — своё ведро, проходит.
+            // A different IP has its own bucket and goes through.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("203.0.113.2"))
@@ -776,14 +785,14 @@ mod tests {
         #[actix_web::test]
         async fn forwarded_client_gets_own_bucket_behind_trusted_proxy() {
             let app = per_ip_app!(Some(per_ip(1, 1, &["10.0.0.0/8"])));
-            // Оба запроса приходят с одного прокси-peer (10.0.0.5), но XFF — разные клиенты.
+            // Both requests come from the same proxy peer (10.0.0.5) but XFF names different clients.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("10.0.0.5"))
                 .insert_header(("X-Forwarded-For", "198.51.100.1"))
                 .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
-            // Тот же клиент → 429 (ведро исчерпано).
+            // The same client → 429 (the bucket is drained).
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("10.0.0.5"))
@@ -793,7 +802,7 @@ mod tests {
                 test::call_service(&app, req).await.status(),
                 StatusCode::TOO_MANY_REQUESTS
             );
-            // Другой клиент за тем же прокси → своё ведро, проходит.
+            // A different client behind the same proxy → its own bucket, goes through.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("10.0.0.5"))
@@ -805,8 +814,9 @@ mod tests {
         #[actix_web::test]
         async fn spoofed_forwarded_from_untrusted_peer_is_ignored() {
             let app = per_ip_app!(Some(per_ip(1, 1, &["10.0.0.0/8"])));
-            // Peer недоверенный, но пытается подделать XFF разными IP — ключ всё равно peer,
-            // поэтому второй запрос ловит 429 несмотря на смену XFF.
+            // The peer is untrusted but tries to forge XFF with different IPs —
+            // the key is still the peer, so the second request gets a 429 despite
+            // the changed XFF.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("203.0.113.9"))
@@ -849,7 +859,7 @@ mod tests {
                 ),
             )
             .await;
-            // burst=2 на весь эндпоинт: два любых запроса ок, третий — 429, даже с другого IP.
+            // burst=2 for the whole endpoint: any two requests are fine, the third gets a 429, even from another IP.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .peer_addr(peer("203.0.113.1"))

@@ -1,148 +1,153 @@
 # Baseline `POST /tokens/verify`
 
-Снят **до** оптимизаций горячего пути (JWT-24, JWT-25), на версии `1.8.4`.
-Здесь только цифры и условия; как повторить — в [README.md](README.md).
+Taken **before** the hot-path optimisations (JWT-24, JWT-25), on version
+`1.8.4`. Only the numbers and the conditions are here; how to repeat it is in
+[README.md](README.md).
 
-Результат после кеша JWKS — в конце файла,
-[«После JWT-25»](#после-jwt-25-кеш-jwks).
+The result after the JWKS cache is at the end of the file,
+["After JWT-25"](#after-jwt-25-the-jwks-cache).
 
-## Условия
+## Conditions
 
-- macOS, Docker Desktop; клиент (k6), сервис и зависимости — на одной машине.
-- Сервис — release-сборка, запущен с хоста, `RATE_LIMIT_VERIFY_ENABLED=false`,
-  `RUST_LOG=warn`.
-- Redis и `jwks-service-app` — в контейнерах из `docker-compose.yml`.
-- Алгоритм подписи — `RS256` (дефолт), 10–20 предвыпущенных токенов, 20–30 с
-  на прогон.
+- macOS, Docker Desktop; the client (k6), the service and the dependencies all on
+  one machine.
+- The service is a release build started from the host, with
+  `RATE_LIMIT_VERIFY_ENABLED=false` and `RUST_LOG=warn`.
+- Redis and `jwks-service-app` run in containers from `docker-compose.yml`.
+- The signature algorithm is `RS256` (the default), with 10–20 pre-issued tokens
+  and 20–30 s per run.
 
-Абсолютные значения к прод-железу неприменимы. Смысл имеет только сравнение
-с повторным прогоном на этом же стенде.
+The absolute values do not apply to production hardware. Only a comparison
+against a repeat run on this same stand means anything.
 
-## Результат
+## The result
 
-| VU | RPS | Успешных | p50 | p95 | p99 | max |
+| VU | RPS | Successful | p50 | p95 | p99 | max |
 |---:|----:|---------:|----:|----:|----:|----:|
 | 1 | 238 | **100 %** | 3.3 ms | 8.0 ms | 16.5 ms | 49 ms |
 | 2 | 443 | 90.8 % | 3.7 ms | 8.8 ms | 16.9 ms | 80 ms |
 | 5 | 1738 | 15.4 % | 2.0 ms | 6.2 ms | 12.3 ms | 92 ms |
 | 50 | 1589 | 16.8 % | 17.4 ms | 89.2 ms | 182.4 ms | 5.3 s |
 
-**Опорная строка — 1 VU:** единственный прогон без отказов, только его латентности
-сравнимы с будущими. Строки 5 и 50 VU меряют преимущественно скорость отказа
-(отказ быстрее успеха, поэтому p50 там даже ниже — цифры выглядят лучше, чем
-реальность).
+**The reference row is 1 VU:** the only run without failures, and only its
+latencies are comparable with future ones. The 5 and 50 VU rows measure mostly
+the speed of failure (a failure is faster than a success, so p50 there is even
+lower — the numbers look better than reality).
 
-**Стоимость одной верификации:**
+**The cost of one verification:**
 
-| Метрика | Значение |
-|---------|---------:|
-| Запросов к JWKS на верификацию | **1.00** |
-| Команд Redis на верификацию | **1.00** |
+| Metric | Value |
+|--------|------:|
+| JWKS requests per verification | **1.00** |
+| Redis commands per verification | **1.00** |
 
-## Что это значит
+## What this means
 
-Потолок — между 1 и 2 VU, то есть около **240–440 rps**, и упирается он не в сам
-сервис, а в трансляцию нагрузки на `jwks-service-app` один к одному: каждая
-верификация тянет весь `/.well-known/jwks.json` (JWT-25). При 2 VU сервис ключей
-начинает отказывать, к 5 VU выживает уже около 15 % запросов. В логе это видно
-как поток `JWKS недоступен ... error sending request`, а в метриках — как
+The ceiling is between 1 and 2 VU, that is around **240–440 rps**, and it rests
+not on the service itself but on load being translated to `jwks-service-app` one
+to one: every verification pulls the whole `/.well-known/jwks.json` (JWT-25). At
+2 VU the key service starts failing, and by 5 VU about 15 % of the requests
+survive. In the log that shows as a stream of
+`JWKS is unavailable ... error sending request`, and in the metrics as
 `jwks_request_duration_seconds_count{success="false"}`.
 
-Отказ выглядит для клиента как `401`: причина проверки наружу намеренно не
-раскрывается, поэтому отличить «токен невалиден» от «сервис ключей лёг» можно
-только по метрикам и логам.
+To the client a failure looks like a `401`: the reason for a verification failure
+is deliberately not revealed, so telling "the token is invalid" from "the key
+service went down" is only possible through the metrics and the logs.
 
-Исчерпания сокетов при этом не происходит — в `TIME_WAIT` к порту JWKS во время
-прогона держится не более пары десятков соединений.
+No socket exhaustion happens along the way — no more than a couple of dozen
+connections to the JWKS port sit in `TIME_WAIT` during a run.
 
-## Ожидания от оптимизаций
+## What is expected from the optimisations
 
-| Задача | Что должно измениться |
-|--------|----------------------|
-| JWT-25 (кеш JWKS) | Запросов к JWKS на верификацию → близко к 0. Потолок перестаёт зависеть от сервиса ключей; отказы при 2–5 VU должны исчезнуть. |
-| JWT-24 (соединение Redis) | Команд Redis останется 1.00 — изменится их цена, это видно по p50/p95 на 1 VU. |
+| Task | What should change |
+|------|--------------------|
+| JWT-25 (the JWKS cache) | JWKS requests per verification → close to 0. The ceiling stops depending on the key service; the failures at 2–5 VU should disappear. |
+| JWT-24 (the Redis connection) | The Redis commands stay at 1.00 — their cost changes, which shows in p50/p95 at 1 VU. |
 
-Повторный прогон делать теми же командами и на той же машине, результат
-дописывать сюда таблицей рядом.
+Repeat the run with the same commands on the same machine and append the result
+here as a table alongside.
 
 ---
 
-## После JWT-25 (кеш JWKS)
+## After JWT-25 (the JWKS cache)
 
-Версия `1.9.0`, та же машина и те же команды.
+Version `1.9.0`, the same machine and the same commands.
 
-| VU | RPS (до → после) | Успешных (до → после) | p50 | p95 | p99 |
+| VU | RPS (before → after) | Successful (before → after) | p50 | p95 | p99 |
 |---:|:----------------:|:---------------------:|----:|----:|----:|
 | 1 | 238 → **305** | 100 % → 100 % | 3.3 → **0.9** ms | 8.0 → 11.4 ms | 16.5 → 29.5 ms |
 | 2 | 443 → **800** | 90.8 % → **100 %** | 3.7 → **1.4** ms | 8.8 → **6.2** ms | 16.9 → **12.7** ms |
 | 5 | 1738 → 1254 | 15.4 % → **64.2 %** | — | — | — |
 
-**Стоимость одной верификации:**
+**The cost of one verification:**
 
-| Метрика | До | После |
-|---------|---:|------:|
-| Запросов к JWKS на верификацию | 1.00 | **0.00** |
-| Команд Redis на верификацию | 1.00 | 1.00 |
+| Metric | Before | After |
+|--------|-------:|------:|
+| JWKS requests per verification | 1.00 | **0.00** |
+| Redis commands per verification | 1.00 | 1.00 |
 
-За прогон в 18 599 верификаций в JWKS ушёл **один** запрос:
+Over a run of 18,599 verifications **one** request went to the JWKS:
 `jwks_cache_total{result="hit"} = 18598`, `miss = 1`.
 
-Показательнее всего строка 2 VU — единственный режим, где до и после почти нет
-отказов и потому сравнимы все перцентили: пропускная способность выросла вдвое,
-латентности упали по всем трём.
+The most telling row is 2 VU — the only mode where before and after have almost
+no failures and every percentile is therefore comparable: the throughput doubled
+and all three latencies dropped.
 
-Строку 5 VU читать как «стало заметно лучше, но всё ещё есть отказы»: доля
-успешных выросла вчетверо, а падение RPS означает лишь, что меньше запросов
-отваливается мгновенно (отказ дешевле успеха).
+Read the 5 VU row as "noticeably better, but there are still failures": the share
+of successful requests grew fourfold, while the drop in RPS only means fewer
+requests fall over instantly (a failure is cheaper than a success).
 
-### Узкое место переехало на Redis
+### The bottleneck moved to Redis
 
-Ограничителем стал не JWKS, а Redis: под нагрузкой в логе появляется
-`Can't assign requested address (os error 49)` — исчерпание локальных эфемерных
-портов, потому что `get_multiplexed_async_connection()` открывает новое
-соединение на **каждую** команду. Это ровно JWT-24, и до кеша его не было видно
-за отказами JWKS.
+The limiter became Redis rather than the JWKS: under load the log fills with
+`Can't assign requested address (os error 49)` — exhaustion of the local
+ephemeral ports, because `get_multiplexed_async_connection()` opens a new
+connection for **every** command. That is JWT-24 exactly, and before the cache it
+was hidden behind the JWKS failures.
 
-Отсюда же единственная метрика, которая не улучшилась, — p95/p99 на 1 VU:
-хвост латентности теперь формируют коннекты к Redis. После JWT-24 замер стоит
-повторить и дописать третьей колонкой.
+Hence the one metric that did not improve — p95/p99 at 1 VU: the latency tail is
+now formed by connections to Redis. After JWT-24 the measurement is worth
+repeating and appending as a third column.
 
 ---
 
-## После JWT-24 (переиспользование соединения Redis)
+## After JWT-24 (reusing the Redis connection)
 
-Версия `1.9.1`, та же машина и те же команды.
+Version `1.9.1`, the same machine and the same commands.
 
-| VU | RPS (baseline → JWT-25 → JWT-24) | Успешных |
+| VU | RPS (baseline → JWT-25 → JWT-24) | Successful |
 |---:|:--------------------------------:|:--------:|
 | 1 | 238 → 305 → **2836** | 100 % → 100 % → **100 %** |
 | 2 | 443 → 800 → **4783** | 90.8 % → 100 % → **100 %** |
 | 5 | 1738 → 1254 → **6585** | 15.4 % → 64.2 % → **100 %** |
 | 50 | 1589 → — → **4033** | 16.8 % → — → **100 %** |
 
-Латентности на 1 VU:
+The latencies at 1 VU:
 
-| Перцентиль | baseline | после JWT-25 | после JWT-24 |
+| Percentile | baseline | after JWT-25 | after JWT-24 |
 |------------|---------:|-------------:|-------------:|
 | p50 | 3.3 ms | 0.9 ms | **0.3 ms** |
 | p95 | 8.0 ms | 11.4 ms | **0.5 ms** |
 | p99 | 16.5 ms | 29.5 ms | **1.3 ms** |
 
-**Стоимость одной верификации** осталась прежней — 0.00 запроса к JWKS и 1.00
-команда Redis. Изменилась цена команды: соединение больше не открывается заново.
+**The cost of one verification** stayed the same — 0.00 JWKS requests and 1.00
+Redis command. What changed is the cost of the command: the connection is no
+longer opened anew.
 
-### Итог двух задач
+### The result of both tasks
 
-Пропускная способность выросла с **238 до 2836 rps** на одном VU (×11.9), а на
-пяти — с 1738 rps при 15.4 % успешных до 6585 rps при 100 %. Отказы исчезли во
-всех режимах: `os error 49` в логе больше не встречается ни разу.
+Throughput grew from **238 to 2836 rps** at one VU (×11.9), and at five from 1738
+rps with 15.4 % successful to 6585 rps with 100 %. The failures disappeared in
+every mode: `os error 49` no longer appears in the log at all.
 
-p99 улучшился в 12.7 раза относительно baseline — при том, что после одного
-только JWT-25 он был почти вдвое хуже исходного. Это хорошая иллюстрация к тому,
-почему обе задачи имело смысл мерить: кеш JWKS снял ограничитель, но обнажил
-следующий, и цифры «после JWT-25» без этого контекста выглядели противоречиво.
+p99 improved 12.7 times against the baseline — even though after JWT-25 alone it
+was almost twice as bad as the original. That is a good illustration of why both
+tasks were worth measuring: the JWKS cache removed the limiter but exposed the
+next one, and the "after JWT-25" numbers looked contradictory without that
+context.
 
-Строка 50 VU показывает, где теперь предел: отказов нет, но p99 растёт до 101 мс
-— это уже насыщение CPU машины, на которой одновременно живут клиент, сервис,
-Redis и сервис ключей. Следующее узкое место, если оно понадобится, надо искать
-уже на раздельном железе.
+The 50 VU row shows where the limit is now: there are no failures, but p99 grows
+to 101 ms — that is already CPU saturation of the machine hosting the client, the
+service, Redis and the key service at once. The next bottleneck, if one is
+needed, has to be looked for on separate hardware.

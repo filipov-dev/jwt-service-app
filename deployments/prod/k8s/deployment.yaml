@@ -5,8 +5,8 @@ metadata:
   labels:
     app.kubernetes.io/name: jwt-service-app
 spec:
-  # Три реплики: сервис без локального состояния (jti и refresh-токены лежат в
-  # Redis), поэтому масштабируется горизонтально без оговорок.
+  # Three replicas: the service holds no local state (the jti values and refresh
+  # tokens live in Redis), so it scales horizontally without caveats.
   replicas: 3
   selector:
     matchLabels:
@@ -16,40 +16,43 @@ spec:
       labels:
         app.kubernetes.io/name: jwt-service-app
     spec:
-      # Разнос реплик по кластеру. Без него планировщик вправе поставить все
-      # три пода на один узел: тогда replicas: 3 страхуют только от падения
-      # процесса, а drain или отказ узла уносят verify целиком. В такой
-      # раскладке бесполезен и PDB (pdb.yaml) — отпускать поды по одному не
-      # выйдет, они выселяются вместе с узлом.
+      # Spreading the replicas across the cluster. Without it the scheduler may
+      # place all three pods on one node: replicas: 3 then insures only against a
+      # process crash, while a drain or a node failure takes verify down
+      # entirely. In such a layout the PDB (pdb.yaml) is useless too — releasing
+      # pods one at a time is impossible, they are evicted together with the
+      # node.
       topologySpreadConstraints:
-        # По узлам — жёстко. Перекос больше одного пода не допускается, то есть
-        # при трёх репликах нужно минимум три узла, готовых их принять.
+        # Across nodes it is strict. A skew larger than one pod is not allowed,
+        # so three replicas need at least three nodes ready to take them.
         #
-        # ВАЖНО: на кластере меньше чем из трёх узлов лишние реплики останутся
-        # в Pending навсегда, а вместе с ними встанет и drain (PDB не наберёт
-        # minAvailable: 2). Меньше трёх узлов — меняйте на ScheduleAnyway.
+        # IMPORTANT: on a cluster of fewer than three nodes the extra replicas
+        # stay Pending forever, and a drain stalls along with them (the PDB never
+        # reaches minAvailable: 2). Fewer than three nodes means switching to
+        # ScheduleAnyway.
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: jwt-service-app
-          # Перекос считается отдельно по каждой ревизии Deployment'а. Без
-          # этого при обновлении новый под считается вместе со старыми: на трёх
-          # узлах с тремя старыми подами surge-под нарушает maxSkew и висит в
-          # Pending, а maxUnavailable по умолчанию для трёх реплик равен нулю —
-          # старый под не удалят, пока не поднялся новый. Выкатка встаёт
-          # намертво.
+          # The skew is computed per Deployment revision. Without this, during an
+          # update the new pod counts together with the old ones: on three nodes
+          # with three old pods the surge pod violates maxSkew and hangs Pending,
+          # while the default maxUnavailable for three replicas is zero — an old
+          # pod is not removed until a new one is up. The rollout stalls
+          # completely.
           #
-          # Поле доступно с Kubernetes 1.27. На 1.25/1.26 удалите его и
-          # задайте spec.strategy.rollingUpdate.maxUnavailable: 1.
+          # The field is available since Kubernetes 1.27. On 1.25/1.26 delete it
+          # and set spec.strategy.rollingUpdate.maxUnavailable: 1.
           matchLabelKeys:
             - pod-template-hash
 
-        # По зонам — мягко: однозональный кластер (и любой, где зон меньше
-        # трёх) — норма, и жёсткое требование оставило бы поды в Pending на
-        # ровном месте. ScheduleAnyway превращает правило в предпочтение:
-        # есть зоны — разложит по ним, нет — просто разложит по узлам.
+        # Across zones it is soft: a single-zone cluster (and any with fewer
+        # than three zones) is normal, and a hard requirement would leave pods
+        # Pending for no reason. ScheduleAnyway turns the rule into a preference:
+        # with zones it spreads across them, without them it just spreads across
+        # nodes.
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
           whenUnsatisfiable: ScheduleAnyway
@@ -65,8 +68,9 @@ spec:
         fsGroup: 10001
       containers:
         - name: app
-          # Тег пинится на версию, а не latest: с latest откат сводится к
-          # «надеемся, что реестр ещё помнит прошлый образ».
+          # The tag is pinned to a version rather than latest: with latest a
+          # rollback amounts to "we hope the registry still remembers the previous
+          # image".
           image: filipov/jwt-service-app:1.13.4
           imagePullPolicy: IfNotPresent
 
@@ -75,8 +79,9 @@ spec:
               containerPort: 8080
 
           env:
-            # 0.0.0.0 обязателен: дефолт 127.0.0.1 слушает только петлю внутри
-            # контейнера, и kubelet не достучится даже до probe.
+            # 0.0.0.0 is required: the default 127.0.0.1 listens only on the
+            # loopback inside the container, and the kubelet cannot even reach a
+            # probe.
             - name: HOST
               value: "0.0.0.0"
             - name: PORT
@@ -87,30 +92,32 @@ spec:
             - name: JWKS_SERVICE_URL
               value: "http://jwks-service-app:8080"
 
-            # Число воркер-потоков задаётся ЯВНО. Дефолт actix — по числу ядер
-            # хоста, а лимит CPU здесь снят намеренно (см. resources ниже),
-            # поэтому квоты, от которой сервис считает воркеров сам, в этом
-            # поде нет: на 64-ядерном узле поднялось бы 64 воркера, и все они
-            # делили бы лимит памяти. Значение согласовано с requests.cpu:
-            # два воркера — это две параллельные подписи/проверки на под, при
-            # трёх репликах шесть на сервис.
+            # The number of worker threads is set EXPLICITLY. The actix default
+            # follows the host core count, and the CPU limit is deliberately
+            # absent here (see resources below), so this pod has no quota for the
+            # service to derive the worker count from: on a 64-core node it would
+            # start 64 workers, all sharing the memory limit. The value is aligned
+            # with requests.cpu: two workers means two concurrent
+            # signings/verifications per pod, six per service across three
+            # replicas.
             - name: SERVER_WORKERS
               value: "2"
 
-            # Дренаж соединений при остановке. Связан с
-            # terminationGracePeriodSeconds ниже и обязан быть строго меньше:
-            # дефолт actix (30 с) совпал бы с grace period, и SIGKILL пришёл бы
-            # ровно в момент истечения дренажа — не осталось бы времени ни
-            # дослужить последний запрос, ни досдать телеметрию. Меняете одно —
-            # пересчитайте другое.
+            # Draining connections on shutdown. It is tied to
+            # terminationGracePeriodSeconds below and must be strictly smaller:
+            # the actix default (30 s) would coincide with the grace period and
+            # SIGKILL would arrive exactly as the drain runs out — leaving time
+            # neither to finish the last request nor to flush telemetry. Change
+            # one and recompute the other.
             - name: SERVER_SHUTDOWN_TIMEOUT_SECONDS
               value: "25"
 
-            # Домены, допустимые в claim `iss` (значение заголовка Host).
-            # Пусто/не задано — любой Host, как раньше. Уточняется под кластер:
-            # это те же имена, что в ingress. Обязательно, если этот и соседние
-            # сервисы ходят в один jwks-service-app: общий ключ делает токен с
-            # чужим `iss` валидным у соседа.
+            # The domains acceptable in the `iss` claim (the value of the Host
+            # header). Empty or unset means any Host, as before. Cluster-specific:
+            # these are the same names as in the ingress. Mandatory when this and
+            # neighbouring services talk to the same jwks-service-app: the shared
+            # key makes a token with someone else's `iss` valid at the
+            # neighbour.
             - name: TOKEN_ISSUER_ALLOWLIST
               value: "jwt.example.com"
 
@@ -122,17 +129,19 @@ spec:
             - name: AUTH_TOTP_REPLAY_PROTECTION
               value: "true"
 
-            # Адреса, с которых доверяем X-Forwarded-For. Здесь это pod-сеть
-            # ingress-контроллера, а НЕ сеть клиентов: запрос до сервиса
-            # доезжает от pod'а ingress-контроллера. Уточняется под кластер:
+            # The addresses whose X-Forwarded-For we trust. Here it is the pod
+            # network of the ingress controller, NOT the client network: the
+            # request reaches the service from an ingress controller pod.
+            # Cluster-specific:
             #   kubectl -n ingress-nginx get pods -o wide
-            # Оставить пустым нельзя — тогда ключом per-IP лимита станет адрес
-            # ingress-пода и все клиенты будут делить один лимит.
+            # It must not be left empty — the per-IP limit would then be keyed by
+            # the ingress pod address and every client would share one limit.
             - name: RATE_LIMIT_TRUSTED_PROXIES
               value: "10.244.0.0/16"
 
-            # Секреты — из Secret, а не value. Целиком через envFrom не берём:
-            # так в манифесте видно, какие именно переменные приходят снаружи.
+            # The secrets come from a Secret rather than from value. We do not
+            # take the whole thing through envFrom: this way the manifest shows
+            # exactly which variables arrive from outside.
             - name: AUTH_PROXY_SECRET
               valueFrom:
                 secretKeyRef:
@@ -162,10 +171,11 @@ spec:
                   key: GLITCHTIP_DSN
                   optional: true
 
-          # /livez отвечает, пока жив HTTP-слой, и НЕ ходит в зависимости.
-          # Именно поэтому он тут: liveness на /readyz перезапускал бы поды
-          # при недоступном Redis — то есть в момент аварии зависимости мы бы
-          # ещё и укладывали сервис рестартами.
+          # /livez answers as long as the HTTP layer is alive and does NOT touch
+          # the dependencies. That is exactly why it is here: liveness on /readyz
+          # would restart pods whenever Redis was unavailable — that is, during a
+          # dependency outage we would also be taking the service down with
+          # restarts.
           livenessProbe:
             httpGet:
               path: /livez
@@ -174,12 +184,12 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 3
 
-          # /readyz проверяет Redis и сервис ключей: пока они недоступны, под
-          # выводится из балансировки, но не перезапускается. Недоступность
-          # jwks-service-app при этом отказом не считается, пока в памяти есть
-          # пригодный снимок JWKS: верификация им обслуживается, и гасить под
-          # не за что (иначе stale-кеш не спасал бы ровно в той аварии, ради
-          # которой сделан).
+          # /readyz checks Redis and the key service: while they are unavailable
+          # the pod leaves the load balancer but is not restarted. An unavailable
+          # jwks-service-app does not count as a failure while a usable JWKS
+          # snapshot is in memory: verification is served from it and there is no
+          # reason to kill the pod (otherwise the stale cache would not help in
+          # exactly the outage it was built for).
           readinessProbe:
             httpGet:
               path: /readyz
@@ -188,8 +198,8 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 2
 
-          # Отдельная startup-проба даёт время на первый прогрев, не заставляя
-          # ослаблять liveness: до её успеха liveness не считается.
+          # A separate startup probe allows time for the first warm-up without
+          # weakening liveness: until it succeeds, liveness does not count.
           startupProbe:
             httpGet:
               path: /livez
@@ -200,21 +210,24 @@ spec:
           resources:
             requests:
               cpu: 100m
-              # Под с двумя воркерами: рантайм и статика ~30Mi, стеки воркеров
-              # по 2Mi (виртуально 8Mi, резидентно меньше), кеш JWKS и таблица
-              # per-IP лимита — единицы Mi. 64Mi покрывают установившийся режим.
+              # A pod with two workers: the runtime and static data ~30Mi, the
+              # worker stacks 2Mi each (8Mi virtual, less resident), the JWKS
+              # cache and the per-IP limit table a few Mi. 64Mi covers the steady
+              # state.
               memory: 64Mi
             limits:
-              # CPU не лимитируем намеренно: throttling бьёт по хвостам задержек
-              # на криптографии (подпись/проверка), а requests уже гарантируют
-              # долю. Лимит по памяти есть — утечка не должна валить узел.
+              # The CPU is deliberately not limited: throttling hurts the latency
+              # tails of the cryptography (signing and verification), while
+              # requests already guarantee a share. A memory limit is in place — a
+              # leak must not take the node down.
               #
-              # 256Mi — это ~4x от установившегося потребления при SERVER_WORKERS=2.
-              # Запас нужен под всплеск таблицы per-IP лимита (она чистится раз в
-              # 5 минут) и пиковые аллокации крипты, но он больше не должен
-              # покрывать неизвестное число воркеров: до JWT-37 их было столько,
-              # сколько ядер у узла, и лимит с ними никак не соотносился. Меняете
-              # SERVER_WORKERS — пересчитайте и лимит.
+              # 256Mi is about 4x the steady-state consumption at
+              # SERVER_WORKERS=2. The headroom covers a burst of the per-IP limit
+              # table (swept every 5 minutes) and peak crypto allocations, but it
+              # no longer has to cover an unknown number of workers: before JWT-37
+              # there were as many as the node had cores, and the limit bore no
+              # relation to them. Change SERVER_WORKERS and recompute the limit
+              # too.
               memory: 256Mi
 
           securityContext:
@@ -223,8 +236,8 @@ spec:
             capabilities:
               drop: ["ALL"]
 
-      # Пересоздание пода не должно рвать запросы в полёте: под сначала уходит
-      # из endpoints, и только потом ему прилетает SIGTERM. Запас над
-      # SERVER_SHUTDOWN_TIMEOUT_SECONDS (25 с) — время на досылку телеметрии
-      # после остановки сервера; меняете здесь — правьте и переменную.
+      # Recreating a pod must not tear in-flight requests: the pod first leaves
+      # the endpoints and only then receives SIGTERM. The headroom over
+      # SERVER_SHUTDOWN_TIMEOUT_SECONDS (25 s) is the time to flush telemetry
+      # after the server stops; change it here and change the variable too.
       terminationGracePeriodSeconds: 30

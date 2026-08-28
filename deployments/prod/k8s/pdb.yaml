@@ -1,8 +1,8 @@
-# PodDisruptionBudget: сколько подов разрешено отпустить ДОБРОВОЛЬНЫМ
-# выселениям — drain узла перед обновлением, дескейл пула, работы на железе.
-# Отказ узла, OOM-kill и падение самого процесса PDB не покрывает: это
-# договорённость с оператором кластера о планируемых операциях, а не защита
-# от аварий.
+# PodDisruptionBudget: how many pods VOLUNTARY evictions may take — a node drain
+# before an upgrade, a pool scale-down, hardware work. A node failure, an OOM
+# kill and a crash of the process itself are not covered by a PDB: it is an
+# agreement with the cluster operator about planned operations, not protection
+# against outages.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -10,34 +10,36 @@ metadata:
   labels:
     app.kubernetes.io/name: jwt-service-app
 spec:
-  # minAvailable, а не maxUnavailable: при replicas: 3 это «в балансировке
-  # всегда минимум два пода». Drain отпускает поды по одному и ждёт, пока
-  # замена поднимется, вместо того чтобы выселить все три разом вместе с узлом.
+  # minAvailable rather than maxUnavailable: with replicas: 3 it means "at least
+  # two pods are always in the load balancer". A drain releases the pods one at a
+  # time and waits for a replacement to come up instead of evicting all three at
+  # once together with the node.
   #
-  # Абсолютное число, а не проценты: 50% от трёх — те же 2, но при смене числа
-  # реплик такое значение молча уедет.
+  # An absolute number rather than a percentage: 50% of three is the same 2, but
+  # such a value drifts silently when the replica count changes.
   #
-  # ВАЖНО: значение связано с `replicas` в deployment.yaml. Уменьшите реплики
-  # до двух, не тронув PDB, — и любой drain встанет намертво: бюджет и так на
-  # грани, отпускать нечего. Меняете replicas — пересчитайте minAvailable.
+  # IMPORTANT: the value is tied to `replicas` in deployment.yaml. Reduce the
+  # replicas to two without touching the PDB and any drain blocks outright: the
+  # budget is already at its edge and there is nothing to release. Change
+  # replicas and recompute minAvailable.
   minAvailable: 2
 
-  # Что делать с подами, которые не в Ready. По умолчанию (IfHealthyBudget) их
-  # разрешено выселять, только когда бюджет и без того выполнен. У этого
-  # сервиса readiness завязана на Redis и сервис ключей: при их недоступности
-  # из балансировки уходят разом все поды, бюджет не выполняется — и drain
-  # оказывается заблокирован ровно тогда, когда узел и надо освободить.
-  # AlwaysAllow разрешает выселять уже неработающие поды: сервису от этого
-  # хуже не станет, он в таком состоянии всё равно не обслуживает.
+  # What to do with pods that are not Ready. By default (IfHealthyBudget) they
+  # may be evicted only when the budget is met anyway. The readiness of this
+  # service depends on Redis and the key service: when those are unavailable
+  # every pod leaves the load balancer at once, the budget is not met — and a
+  # drain is blocked at exactly the moment the node needs to be freed.
+  # AlwaysAllow permits evicting pods that are already not working: it makes
+  # nothing worse for the service, which is not serving in that state anyway.
   #
-  # Поле стабильно с Kubernetes 1.27; на более старом кластере просто удалите
-  # его — остальное продолжит работать.
+  # The field is stable since Kubernetes 1.27; on an older cluster simply delete
+  # it — the rest keeps working.
   unhealthyPodEvictionPolicy: AlwaysAllow
 
-  # Селектор тот же, что у Deployment'а. Отдельного `part-of` здесь нет
-  # намеренно: kustomize дописывает общие метки в metadata, но не в селекторы
-  # (см. комментарий в kustomization.yaml), и PDB должен ловить поды по той же
-  # паре меток, по которой их создаёт Deployment.
+  # The same selector as the Deployment's. A separate `part-of` is deliberately
+  # absent here: kustomize writes the common labels into metadata but not into
+  # selectors (see the comment in kustomization.yaml), and the PDB must match
+  # pods by the same pair of labels the Deployment creates them with.
   selector:
     matchLabels:
       app.kubernetes.io/name: jwt-service-app

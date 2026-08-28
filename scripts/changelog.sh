@@ -1,51 +1,52 @@
 #!/usr/bin/env bash
 #
-# Собирает CHANGELOG по conventional commits из истории git.
+# Builds the CHANGELOG from conventional commits in the git history.
 #
-# Один и тот же код используется в двух местах, поэтому формат секций в
-# CHANGELOG.md и в теле GitHub Release совпадает по построению:
-#   * `--all` — весь файл целиком (так CHANGELOG.md заполнен задним числом);
-#   * без аргументов — тело секции для очередного релиза, его кладёт в описание
-#     релиза `release.yml`.
+# The same code is used in two places, so the format of the sections in
+# CHANGELOG.md and in the body of a GitHub release matches by construction:
+#   * `--all` — the whole file (that is how CHANGELOG.md was filled in
+#     retroactively);
+#   * no arguments — the body of the section for the next release, which
+#     `release.yml` puts into the release description.
 #
-# Использование:
-#   scripts/changelog.sh                        # тело секции: последний тег..HEAD
-#   scripts/changelog.sh --heading              # то же плюс «## [версия] - дата»
-#   scripts/changelog.sh --insert               # вписать секцию версии в CHANGELOG.md
+# Usage:
+#   scripts/changelog.sh                        # section body: last tag..HEAD
+#   scripts/changelog.sh --heading              # the same plus "## [version] - date"
+#   scripts/changelog.sh --insert               # insert the version section into CHANGELOG.md
 #   scripts/changelog.sh --range v1.9.0..v1.10.0
-#   scripts/changelog.sh --version 1.13.0       # версия в заголовке (иначе из Cargo.toml)
-#   scripts/changelog.sh --all > CHANGELOG.md   # перегенерировать файл целиком
+#   scripts/changelog.sh --version 1.13.0       # the version in the heading (otherwise from Cargo.toml)
+#   scripts/changelog.sh --all > CHANGELOG.md   # regenerate the whole file
 #
-# Раскладка типов коммитов по разделам — в `bucket_for`.
+# The mapping of commit types to sections is in `bucket_for`.
 
 set -euo pipefail
 
 readonly REPO_URL="https://github.com/filipov-dev/jwt-service-app"
 
-# Разделы в порядке вывода: ключ и заголовок. Пустые разделы не печатаются,
-# поэтому у большинства версий их два-три.
+# The sections in output order: key and heading. Empty sections are not printed,
+# so most versions have two or three.
 readonly SECTIONS=(
-    "breaking:Ломающие изменения"
-    "added:Добавлено"
-    "changed:Изменено"
-    "fixed:Исправлено"
-    "security:Безопасность"
-    "docs:Документация"
-    "internal:Внутреннее"
-    "other:Прочее"
+    "breaking:Breaking changes"
+    "added:Added"
+    "changed:Changed"
+    "fixed:Fixed"
+    "security:Security"
+    "docs:Documentation"
+    "internal:Internal"
+    "other:Other"
 )
 
 usage() {
     sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# Раздел, в который попадает коммит данного типа.
+# The section a commit of a given type lands in.
 #
-# Keep a Changelog описывает шесть разделов для пользовательских изменений.
-# К ним добавлены два: «Документация» (в этом проекте docs-коммиты — это
-# клиентские примеры и инструкции по эксплуатации, то есть тоже наружу) и
-# «Внутреннее» (CI, тесты, форматирование). Без второго релизы вроде v1.8.5,
-# где был только нагрузочный тест, выглядели бы пустыми.
+# Keep a Changelog describes six sections for user-facing changes. Two more are
+# added here: "Documentation" (in this project docs commits are client examples
+# and operating instructions, which face outwards too) and "Internal" (CI, tests,
+# formatting). Without the latter, releases like v1.8.5 — which held only a load
+# test — would look empty.
 bucket_for() {
     case "$1" in
         feat) echo added ;;
@@ -53,15 +54,16 @@ bucket_for() {
         security) echo security ;;
         perf | revert) echo changed ;;
         docs) echo docs ;;
-        # `deps` — префикс коммитов dependabot (см. .github/dependabot.yml).
-        # Без него обновления зависимостей сыпались в «Прочее».
+        # `deps` is the prefix of dependabot commits (see
+        # .github/dependabot.yml). Without it, dependency updates fell into
+        # "Other".
         refactor | style | test | ci | build | chore | deps) echo internal ;;
         *) echo other ;;
     esac
 }
 
-# Разбирает subject'ы коммитов диапазона и раскладывает их по файлам-разделам
-# в каталоге $2. Файл существует только у непустого раздела.
+# Parses the commit subjects of a range and files them into per-section files in
+# the directory $2. A file exists only for a non-empty section.
 collect() {
     local range="$1" dir="$2"
     local subject type scope bang text entry bucket
@@ -69,9 +71,9 @@ collect() {
     rm -rf "$dir"
     mkdir -p "$dir"
 
-    # --reverse: внутри релиза изменения читаются в том порядке, в котором их
-    # делали. --format (не --pretty=format) — чтобы последняя строка тоже
-    # заканчивалась переводом строки и не терялась в read.
+    # --reverse: within a release the changes read in the order they were made.
+    # --format (not --pretty=format) so that the last line also ends with a
+    # newline and is not lost by read.
     while IFS= read -r subject; do
         [ -n "$subject" ] || continue
 
@@ -81,8 +83,9 @@ collect() {
             bang="${BASH_REMATCH[4]}"
             text="${BASH_REMATCH[5]}"
         else
-            # Ранняя история (Init, Build, Clean) — до перехода на conventional
-            # commits. Такие коммиты уходят в «Прочее», а не теряются.
+            # The early history (Init, Build, Clean) predates the move to
+            # conventional commits. Such commits go into "Other" rather than
+            # getting lost.
             type="_plain"
             scope=""
             bang=""
@@ -95,9 +98,10 @@ collect() {
             entry="- ${text}"
         fi
 
-        # Восклицательный знак в типе (`feat!:`) по спецификации conventional
-        # commits означает слом обратной совместимости — такие изменения важнее
-        # своей категории и выносятся в отдельный раздел наверх.
+        # An exclamation mark in the type (`feat!:`) means a break of backwards
+        # compatibility per the conventional commits specification — such changes
+        # matter more than their category and are moved to a separate section at
+        # the top.
         if [ -n "$bang" ]; then
             bucket=breaking
         else
@@ -108,7 +112,7 @@ collect() {
     done < <(git log --no-merges --reverse --format='%s' "$range")
 }
 
-# Печатает непустые разделы из каталога $1.
+# Prints the non-empty sections from the directory $1.
 emit() {
     local dir="$1" pair key title printed=0
 
@@ -124,15 +128,15 @@ emit() {
         printed=1
     done
 
-    [ "$printed" = 1 ] || printf '_Изменений нет._\n\n'
+    [ "$printed" = 1 ] || printf '_No changes._\n\n'
 }
 
-# Есть ли в диапазоне $1 хоть один коммит (кроме merge-коммитов).
+# Whether the range $1 holds at least one commit (merge commits aside).
 has_commits() {
     [ -n "$(git log --no-merges --format='%s' "$1")" ]
 }
 
-# Тело секции для диапазона $1.
+# The section body for the range $1.
 section_body() {
     local dir
     dir="$(mktemp -d)"
@@ -141,15 +145,16 @@ section_body() {
     rm -rf "$dir"
 }
 
-# Теги в порядке возрастания версии. Релизов меньше, чем поднятий версии:
-# в одном PR версия поднимается каждым коммитом, а тег создаётся один — на
-# финальную. Поэтому в списке есть пропуски (1.11.0, 1.12.0, 1.12.1 и т.п.),
-# и это не потеря истории: их коммиты входят в следующий выпущенный тег.
+# The tags in ascending version order. There are fewer releases than version
+# bumps: within one pull request the version is bumped by every commit while a
+# single tag is created, for the final one. That is why the list has gaps
+# (1.11.0, 1.12.0, 1.12.1 and so on), and it is not lost history: those commits
+# are part of the next released tag.
 tags_ascending() {
     git tag --sort=v:refname
 }
 
-# Дата коммита, на который указывает ref.
+# The date of the commit a ref points at.
 ref_date() {
     git log -1 --format=%ad --date=short "$1"
 }
@@ -158,13 +163,14 @@ version_from_cargo() {
     grep -m1 '^version' Cargo.toml | cut -d '"' -f 2
 }
 
-# Последний выпущенный тег — точка отсчёта для очередного релиза.
+# The last released tag — the starting point for the next release.
 last_tag() {
     tags_ascending | tail -n 1
 }
 
-# Весь файл: шапка, «Не выпущено» (если есть коммиты после последнего тега),
-# затем версии от новых к старым и ссылки на diff между тегами.
+# The whole file: the header, "Unreleased" (when there are commits after the
+# last tag), then the versions from newest to oldest and the links to the diffs
+# between tags.
 render_all() {
     local tags=() tag prev range i
 
@@ -175,24 +181,29 @@ render_all() {
     cat <<'HEADER'
 # Changelog
 
-Все заметные изменения этого проекта. Формат основан на
-[Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по
-[семантическому версионированию](https://semver.org/lang/ru/).
+All notable changes to this project. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
+[semantic versioning](https://semver.org/).
 
-Файл собран из истории коммитов и перегенерируется командой
-`scripts/changelog.sh --all`; тело каждого релиза на GitHub собирает тот же
-скрипт. Записи — это subject'ы коммитов дословно, в скобках указан ключ задачи.
+The file is assembled from the commit history and regenerated with
+`scripts/changelog.sh --all`; the body of every GitHub release is built by the
+same script. The entries are commit subjects verbatim, with the task key in
+parentheses.
 
-К шести разделам Keep a Changelog добавлены «Документация» (клиентские примеры
-и инструкции по эксплуатации — изменения для потребителя сервиса) и
-«Внутреннее» (CI, тесты, форматирование).
+Two sections are added to the six of Keep a Changelog: "Documentation" (client
+examples and operating instructions — changes for the consumer of the service)
+and "Internal" (CI, tests, formatting).
+
+Entries before 1.17.13 are in Russian: the repository switched to English in
+JWT-114 and the commit history was deliberately left as it was.
 
 HEADER
 
-    # Раздел «Не выпущено» появляется только когда после последнего тега
-    # действительно что-то накопилось: на master сразу после релиза его нет.
+    # The "Unreleased" section appears only when something has actually
+    # accumulated after the last tag: on master right after a release there is
+    # none.
     if has_commits "$(last_tag)..HEAD"; then
-        printf '## [Не выпущено]\n\n'
+        printf '## [Unreleased]\n\n'
         section_body "$(last_tag)..HEAD"
     fi
 
@@ -210,8 +221,8 @@ HEADER
         section_body "$range"
     done
 
-    # Ссылки на сравнение версий: из строки «## [1.13.0]» кликом видно диапазон.
-    printf '[Не выпущено]: %s/compare/%s...HEAD\n' "$REPO_URL" "$(last_tag)"
+    # Version comparison links: from a "## [1.13.0]" line one click shows the range.
+    printf '[Unreleased]: %s/compare/%s...HEAD\n' "$REPO_URL" "$(last_tag)"
     for ((i = ${#tags[@]} - 1; i >= 0; i--)); do
         tag="${tags[$i]}"
 
@@ -224,26 +235,28 @@ HEADER
     done
 }
 
-# Вставляет секцию версии $1 (диапазон $2) в CHANGELOG.md: и сам раздел после
-# шапки, и строку сравнения версий в блок ссылок внизу.
+# Inserts the section for version $1 (range $2) into CHANGELOG.md: both the
+# section itself, after the header, and the version comparison line in the links
+# block at the bottom.
 #
-# Нужно потому, что версия поднимается в том же PR, что и изменение, а тег
-# появляется только после мержа. Перегенерация `--all` в этот момент положила бы
-# коммиты в «Не выпущено» — раздел с номером версии можно получить только так.
+# It is needed because the version is bumped in the same pull request as the
+# change while the tag only appears after the merge. Regenerating with `--all` at
+# that moment would file the commits under "Unreleased" — a section with a
+# version number can only be produced this way.
 insert_section() {
     local version="$1" range="$2" file=CHANGELOG.md
     local head body links tmp prev
 
     if grep -q "^## \[${version}\]" "$file"; then
-        echo "секция [${version}] в ${file} уже есть" >&2
+        echo "section [${version}] already exists in ${file}" >&2
         return 1
     fi
 
     tmp="$(mktemp -d)"
 
-    # Файл делится на три части: шапка до первого раздела, разделы и блок
-    # ссылок. Новая секция идёт в начало разделов — Keep a Changelog требует
-    # обратного хронологического порядка.
+    # The file splits into three parts: the header before the first section, the
+    # sections, and the links block. The new section goes at the top of the
+    # sections — Keep a Changelog requires reverse chronological order.
     head="${tmp}/head"
     body="${tmp}/body"
     links="${tmp}/links"
@@ -261,8 +274,8 @@ insert_section() {
         printf '## [%s] - %s\n\n' "$version" "$(date +%F)"
         section_body "$range"
         cat "$body"
-        # Строка «Не выпущено» всегда первая в блоке ссылок, новая версия
-        # встаёт сразу за ней.
+        # The "Unreleased" line is always first in the links block, and the new
+        # version goes right after it.
         head -n 1 "$links"
         printf '[%s]: %s/compare/%s...v%s\n' "$version" "$REPO_URL" "$prev" "$version"
         tail -n +2 "$links"
@@ -271,7 +284,7 @@ insert_section() {
     mv "${tmp}/out" "$file"
     rm -rf "$tmp"
 
-    echo "добавлена секция [${version}] в ${file}" >&2
+    echo "added section [${version}] to ${file}" >&2
 }
 
 main() {
@@ -304,7 +317,7 @@ main() {
                 return 0
                 ;;
             *)
-                echo "неизвестный аргумент: $1" >&2
+                echo "unknown argument: $1" >&2
                 usage >&2
                 return 2
                 ;;
@@ -319,7 +332,7 @@ main() {
     if [ -z "$range" ]; then
         local from
         from="$(last_tag)"
-        # Первый релиз в репозитории без тегов — берём историю целиком.
+        # The first release in a repository without tags — take the whole history.
         range="${from:+${from}..}HEAD"
     fi
 

@@ -1,8 +1,9 @@
-//! Фасад доменной логики работы с токенами.
+//! The facade of the token domain logic.
 //!
-//! [`JwtManager`] связывает воедино менеджер ключей ([`KeyManager`]), хранилище
-//! `jti` ([`JtiStore`]) и низкоуровневые типы токена из [`crate::models::jwt`],
-//! предоставляя обработчикам два высокоуровневых метода: генерацию и проверку.
+//! [`JwtManager`] ties together the key manager ([`KeyManager`]), the `jti`
+//! store ([`JtiStore`]) and the low-level token types from
+//! [`crate::models::jwt`], giving the handlers two high-level methods:
+//! generation and verification.
 
 use crate::key::KeyManager;
 use crate::models::jwt::{
@@ -16,15 +17,15 @@ use std::env;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// Время жизни refresh-токена по умолчанию (`REFRESH_TOKEN_TTL_SECONDS`).
+/// Default lifetime of a refresh token (`REFRESH_TOKEN_TTL_SECONDS`).
 ///
-/// Тридцать суток — обычный горизонт «не просить вход заново». Ротация при
-/// каждом обмене делает длинный срок безопаснее, чем он выглядит: украденный
-/// токен работает лишь до первого обмена настоящим клиентом, после чего семья
-/// гасится детектором.
+/// Thirty days is the usual horizon for "do not ask me to sign in again".
+/// Rotation on every exchange makes such a long window safer than it looks: a
+/// stolen token works only until the real client next exchanges it, after which
+/// the detector kills the family.
 const DEFAULT_REFRESH_TTL_SECONDS: u64 = 2_592_000;
 
-/// Читает `u64` из переменной окружения, откатываясь на `default`.
+/// Reads a `u64` from an environment variable, falling back to `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -32,27 +33,27 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Без состояния: набор ассоциированных операций над токенами.
+/// Stateless: a set of associated operations on tokens.
 pub struct JwtManager;
 
 impl JwtManager {
-    /// Генерирует и подписывает новый JWT.
+    /// Generates and signs a new JWT.
     ///
-    /// # Аргументы
-    /// - `issuer` — значение claim `iss` (берётся из заголовка `Host`);
-    /// - `subject` — значение claim `sub`;
-    /// - `audience` — список получателей (`aud`); не должен быть пустым;
-    /// - `ttl` — необязательное кастомное время жизни токена (секунды); при
-    ///   `None` берётся `TOKEN_EXPIRATION_SECONDS`;
-    /// - `key_manager` — источник приватного ключа и его `kid`;
-    /// - `store` — хранилище `jti` (Redis), куда пишется идентификатор токена.
+    /// # Arguments
+    /// - `issuer` — the value of the `iss` claim (taken from the `Host` header);
+    /// - `subject` — the value of the `sub` claim;
+    /// - `audience` — the list of recipients (`aud`); must not be empty;
+    /// - `ttl` — an optional custom token lifetime (seconds); `None` means
+    ///   `TOKEN_EXPIRATION_SECONDS`;
+    /// - `key_manager` — the source of the private key and its `kid`;
+    /// - `store` — the `jti` store (Redis) the token identifier is written to.
     ///
-    /// Возвращает сериализованный токен в формате `header.payload.signature`.
+    /// Returns the serialised token in the `header.payload.signature` form.
     ///
     /// # Errors
-    /// Возвращает [`JwtError`], если не удалось получить приватный ключ
-    /// ([`JwtError::KeyError`]), сформировать claims (например, пустой `audience`)
-    /// или сохранить/проверить состояние в хранилище.
+    /// Returns a [`JwtError`] when the private key could not be obtained
+    /// ([`JwtError::KeyError`]), the claims could not be built (an empty
+    /// `audience`, for example) or the state could not be stored or checked.
     pub async fn generate_token<T: JtiStore>(
         issuer: &str,
         subject: &str,
@@ -76,10 +77,10 @@ impl JwtManager {
         token.to_string()
     }
 
-    /// Выпускает access-токен вместе с refresh-токеном новой семьи.
+    /// Issues an access token together with a refresh token of a new family.
     ///
-    /// Возвращает пару `(access, refresh)`. `refresh` — непрозрачная случайная
-    /// строка; всё, что нужно для обмена, лежит в хранилище.
+    /// Returns the `(access, refresh)` pair. `refresh` is an opaque random
+    /// string; everything needed for an exchange lives in the store.
     pub async fn generate_token_pair<T: JtiStore>(
         issuer: &str,
         subject: &str,
@@ -108,21 +109,22 @@ impl JwtManager {
         Ok((access, refresh))
     }
 
-    /// Обменивает refresh-токен на новую пару access + refresh.
+    /// Exchanges a refresh token for a new access + refresh pair.
     ///
-    /// Ротация: старый refresh помечается использованным и больше не сработает,
-    /// на его место выдаётся новый — из той же семьи.
+    /// Rotation: the old refresh token is marked used and never works again, and
+    /// a new one from the same family takes its place.
     ///
-    /// **Детектор повторного использования.** Предъявление уже использованного
-    /// refresh означает, что токен утёк: настоящий клиент свой экземпляр уже
-    /// обменял. Отличить вора от жертвы невозможно, поэтому гасим всю семью —
-    /// и выданные по ней access-токены, и остальные refresh. Расплата за ложное
-    /// срабатывание (клиент потерял ответ и повторил запрос) — повторный вход,
-    /// что дешевле, чем оставить вору рабочую цепочку.
+    /// **Reuse detector.** Presenting an already-used refresh token means the
+    /// token has leaked: the real client has exchanged its copy already. There
+    /// is no way to tell the thief from the victim, so we kill the whole
+    /// family — the access tokens issued through it and the remaining refresh
+    /// tokens. The price of a false positive (a client lost the response and
+    /// retried) is one more sign-in, which is cheaper than leaving the thief a
+    /// working chain.
     ///
     /// # Errors
-    /// - [`JwtError::NotValid`] — токен неизвестен, истёк или уже использован;
-    /// - [`JwtError::StoreError`] — сбой хранилища.
+    /// - [`JwtError::NotValid`] — the token is unknown, expired or already used;
+    /// - [`JwtError::StoreError`] — a store failure.
     pub async fn refresh_token_pair<T: JtiStore>(
         refresh_token: &str,
         issuer: &str,
@@ -134,8 +136,8 @@ impl JwtManager {
             JwtError::StoreError
         })?
         else {
-            // Вина клиента: токен неизвестен или уже истёк.
-            debug!("Refresh: токен неизвестен");
+            // The client's fault: the token is unknown or has already expired.
+            debug!("Refresh: unknown token");
             return Err(JwtError::NotValid);
         };
 
@@ -145,8 +147,8 @@ impl JwtManager {
         })?;
 
         if !marked {
-            // Повторное использование — сигнал кражи, а не ошибка клиента.
-            warn!("Refresh: повторное использование токена, гашу семью");
+            // Reuse is a sign of theft, not a client error.
+            warn!("Refresh: token reused, killing the family");
             store
                 .revoke_group(&family_group(&record.family))
                 .await
@@ -157,11 +159,11 @@ impl JwtManager {
             return Err(JwtError::NotValid);
         }
 
-        // Пользовательские claims при обмене НЕ переносятся: мы их не храним в
-        // записи refresh-токена. Сохранять их означало бы продлевать роли и
-        // scope, выданные когда-то давно, без нового решения о правах. Клиенту,
-        // которому нужны claims в обновлённом токене, следует выпускать пару
-        // заново через `POST /tokens`.
+        // Custom claims are NOT carried over on an exchange: we do not store
+        // them in the refresh record. Keeping them would extend roles and scopes
+        // granted long ago without a fresh decision about permissions. A client
+        // that needs claims in the renewed token should issue a new pair through
+        // `POST /tokens`.
         let access = Self::generate_token(
             issuer,
             &record.subject,
@@ -180,11 +182,11 @@ impl JwtManager {
         Ok((access, refresh))
     }
 
-    /// Регистрирует выпущенный access-токен в группе семьи.
+    /// Registers an issued access token in the family group.
     ///
-    /// Без этого детектор повторного использования погасил бы только
-    /// refresh-цепочку, а уже выданные access-токены продолжали бы работать до
-    /// своего `exp` — то есть у вора оставалось бы рабочее окно.
+    /// Without this the reuse detector would kill only the refresh chain, while
+    /// the access tokens already issued would keep working until their `exp` —
+    /// that is, the thief would retain a working window.
     async fn register_access_in_family<T: JtiStore>(
         access: &str,
         family: &str,
@@ -201,16 +203,16 @@ impl JwtManager {
             .add_to_group(&family_group(family), &claims.jti, claims.exp as i64)
             .await
             .map_err(|e| {
-                error!("Refresh Store (индекс семьи): {}", e);
+                error!("Refresh Store (family index): {}", e);
                 JwtError::StoreError
             })
     }
 
-    /// Выпускает refresh-токен и регистрирует его в семье.
+    /// Issues a refresh token and registers it in the family.
     ///
-    /// Регистрация в группе семьи — то, благодаря чему один `revoke_group`
-    /// гасит всю цепочку: там лежат и `jti` access-токенов, и ключи
-    /// refresh-записей.
+    /// Registration in the family group is what lets a single `revoke_group`
+    /// kill the whole chain: it holds both the `jti` values of the access tokens
+    /// and the keys of the refresh records.
     async fn issue_refresh<T: JtiStore>(
         subject: &str,
         audience: &[String],
@@ -237,22 +239,22 @@ impl JwtManager {
             .add_to_group(&family_group(family), &refresh_key(&id), expires_at)
             .await
             .map_err(|e| {
-                error!("Refresh Store (индекс семьи): {}", e);
+                error!("Refresh Store (family index): {}", e);
                 JwtError::StoreError
             })?;
 
         Ok(id)
     }
 
-    /// Проверяет токен и возвращает его claims при успехе.
+    /// Verifies a token and returns its claims on success.
     ///
-    /// Делегирует разбор и валидацию [`JsonWebToken::from_string`]: проверяются
-    /// подпись, `iss`, вхождение `audience` в `aud`, временные границы и наличие
-    /// `jti` в хранилище.
+    /// Parsing and validation are delegated to [`JsonWebToken::from_string`]:
+    /// the signature, `iss`, the presence of `audience` in `aud`, the time
+    /// bounds and the presence of the `jti` in the store are all checked.
     ///
     /// # Errors
-    /// Возвращает [`JwtError`] при любой неуспешной проверке (плохая подпись,
-    /// истёкший/отозванный токен, несовпадение issuer/audience и т.п.).
+    /// Returns a [`JwtError`] for any failed check (a bad signature, an expired
+    /// or revoked token, an issuer/audience mismatch and so on).
     pub async fn verify_token<T: JtiStore>(
         token: &str,
         issuer: &str,
@@ -269,11 +271,11 @@ impl JwtManager {
 
 #[cfg(test)]
 mod tests {
-    //! Тесты фасада, дополняющие интеграционные тесты HTTP-слоя.
+    //! Facade tests complementing the integration tests of the HTTP layer.
     //!
-    //! Здесь проверяются ветки, до которых через HTTP не дотянуться: сбой
-    //! хранилища на конкретном шаге обмена. Ключи не нужны — все эти ветки
-    //! отрабатывают до обращения к JWKS.
+    //! What is checked here are the branches unreachable over HTTP: a store
+    //! failure at a particular step of an exchange. No keys are needed — all
+    //! these branches run before the JWKS is contacted.
 
     use super::*;
     use crate::models::jwt::JtiError;
@@ -281,13 +283,13 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
-    /// Хранилище, у которого известен один refresh-токен, а всё остальное падает.
+    /// A store that knows one refresh token and fails at everything else.
     ///
-    /// Позволяет довести обмен до нужного шага и уронить именно его.
+    /// It lets an exchange reach the desired step and fail exactly there.
     struct StoreWithRefresh {
         records: Mutex<HashMap<String, RefreshRecord>>,
         used: Mutex<Vec<String>>,
-        /// Ронять ли `mark_refresh_used` (имитация сбоя хранилища на пометке).
+        /// Whether to fail `mark_refresh_used` (simulating a store failure on the mark).
         fail_mark: bool,
     }
 
@@ -380,14 +382,15 @@ mod tests {
 
         let result = JwtManager::refresh_token_pair("unknown", "issuer", &keys, store).await;
 
-        // Именно NotValid, а не StoreError: это вина клиента, и наружу уйдёт 401.
+        // NotValid rather than StoreError: this is the client's fault and 401 goes out.
         assert!(matches!(result, Err(JwtError::NotValid)));
     }
 
     #[actix_web::test]
     async fn refresh_reports_store_failure_separately() {
-        // Токен найден, но пометка использования не прошла — это сбой хранилища,
-        // а не невалидный токен. Разница видна снаружи: 500 против 401.
+        // The token was found but the used mark did not go through — that is a
+        // store failure, not an invalid token. The difference shows from the
+        // outside: 500 against 401.
         let store = Data::new(StoreWithRefresh::new("known", true));
         let keys = KeyManager::new("EdDSA".to_string());
 
@@ -398,12 +401,12 @@ mod tests {
 
     #[test]
     fn refresh_ttl_falls_back_to_default() {
-        // Значение по умолчанию берётся, когда переменная не задана; кривое
-        // значение тоже откатывается на дефолт, а не роняет выпуск.
+        // The default is taken when the variable is unset; a malformed value
+        // also falls back to the default rather than breaking issuing.
         std::env::remove_var("JWT_TEST_TTL");
         assert_eq!(env_u64("JWT_TEST_TTL", 42), 42);
 
-        std::env::set_var("JWT_TEST_TTL", "не-число");
+        std::env::set_var("JWT_TEST_TTL", "not-a-number");
         assert_eq!(env_u64("JWT_TEST_TTL", 42), 42);
 
         std::env::set_var("JWT_TEST_TTL", "100");

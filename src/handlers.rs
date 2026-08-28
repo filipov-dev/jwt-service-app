@@ -1,26 +1,27 @@
-//! HTTP-обработчики публичного API.
+//! The HTTP handlers of the public API.
 //!
-//! Модуль содержит эндпоинты:
-//! - `POST /tokens` — выпуск токена ([`create_token`]);
-//! - `POST /tokens/verify` — проверка токена ([`verify_token`]);
-//! - `DELETE /tokens/{jti}` — отзыв токена ([`revoke_token`]);
-//! - `POST /tokens/refresh` — обмен refresh-токена ([`refresh_token`]);
-//! - `DELETE /subjects/{sub}/tokens` — массовый отзыв токенов субъекта
+//! The module holds the endpoints:
+//! - `POST /tokens` — issuing a token ([`create_token`]);
+//! - `POST /tokens/verify` — verifying a token ([`verify_token`]);
+//! - `DELETE /tokens/{jti}` — revoking a token ([`revoke_token`]);
+//! - `POST /tokens/refresh` — exchanging a refresh token ([`refresh_token`]);
+//! - `DELETE /subjects/{sub}/tokens` — bulk revocation of a subject's tokens
 //!   ([`revoke_subject_tokens`]);
-//! - `GET /livez`, `GET /readyz` — пробы ([`livez`], [`readyz`]);
-//! - `GET /metrics` — метрики Prometheus ([`metrics`]).
+//! - `GET /livez`, `GET /readyz` — the probes ([`livez`], [`readyz`]);
+//! - `GET /metrics` — the Prometheus metrics ([`metrics`]).
 //!
-//! Обработчики, работающие с хранилищем `jti`, обобщены по трейту
-//! [`JtiStore`] и о конкретном бэкенде (Redis) не знают: тип хранилища
-//! подставляется при регистрации роутов в `main.rs`, а тесты передают
-//! in-memory-мок. Поэтому роуты собираются вручную (`web::resource(...)`), а не
-//! атрибут-макросами actix — те не умеют обобщённые обработчики.
+//! The handlers that work with the `jti` store are generic over the [`JtiStore`]
+//! trait and know nothing about the concrete backend (Redis): the store type is
+//! supplied when the routes are registered in `main.rs`, and the tests pass an
+//! in-memory mock. That is why the routes are assembled by hand
+//! (`web::resource(...)`) rather than with the actix attribute macros — those
+//! cannot handle generic handlers.
 //!
-//! Обработчики намеренно тонкие: вся доменная логика вынесена в
-//! [`crate::jwt::JwtManager`] и модели. Значение claim `iss` (issuer) берётся
-//! из HTTP-заголовка `Host` входящего запроса, а не из конфигурации; список
-//! допустимых значений при этом ограничивается аллоулистом (см.
-//! [`crate::issuer`]).
+//! The handlers are deliberately thin: all the domain logic lives in
+//! [`crate::jwt::JwtManager`] and the models. The value of the `iss` claim (the
+//! issuer) comes from the `Host` HTTP header of the incoming request rather than
+//! from the configuration; the set of acceptable values is constrained by the
+//! allowlist (see [`crate::issuer`]).
 
 use actix_web::{get, web, HttpResponse};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -35,10 +36,11 @@ use crate::models::{
     TokenResponse, TokenVerifyRequest,
 };
 
-/// Достаёт заголовок `Host` — значение будущего claim `iss`.
+/// Extracts the `Host` header — the value of the future `iss` claim.
 ///
-/// Общая часть всех ручек, работающих с issuer: выпуск, обмен refresh и
-/// проверка. Отсутствующий или не-ASCII заголовок — ошибка клиента (`400`).
+/// The common part of every endpoint that deals with the issuer: issuing, the
+/// refresh exchange and verification. A missing or non-ASCII header is a client
+/// error (`400`).
 fn host_header(req: &actix_web::HttpRequest) -> Result<&str, Error> {
     req.headers()
         .get("Host")
@@ -47,17 +49,18 @@ fn host_header(req: &actix_web::HttpRequest) -> Result<&str, Error> {
         .map_err(|_| Error::Validation("Invalid Host header".into()))
 }
 
-/// Достаёт `Host` для ручек **выпуска** токена и сверяет его с аллоулистом
-/// issuer'ов (`TOKEN_ISSUER_ALLOWLIST`, см. [`crate::issuer`]).
+/// Extracts the `Host` for the token **issuing** endpoints and checks it against
+/// the issuer allowlist (`TOKEN_ISSUER_ALLOWLIST`, see [`crate::issuer`]).
 ///
-/// Отказ явный (`403`): выпуск дёргает доверенный internal-клиент, от которого
-/// конфигурацию инстанса скрывать незачем, а неотличимый отказ отлаживали бы
-/// вслепую. Пустой аллоулист ничего не запрещает — поведение прежнее.
+/// The refusal is explicit (`403`): issuing is called by a trusted internal
+/// client, from which there is no reason to hide the configuration of the
+/// instance, and an indistinguishable refusal would have to be debugged blind.
+/// An empty allowlist forbids nothing — the previous behaviour.
 fn issuer_for_issuance(req: &actix_web::HttpRequest) -> Result<&str, Error> {
     let host = host_header(req)?;
     if !crate::issuer::is_allowed(host) {
         warn!(
-            "Отказ в выпуске: issuer '{}' отсутствует в {}",
+            "Issuance refused: issuer '{}' is not in {}",
             host,
             crate::issuer::ALLOWLIST_VAR
         );
@@ -74,31 +77,31 @@ fn issuer_for_issuance(req: &actix_web::HttpRequest) -> Result<&str, Error> {
     responses(
         (status = 200, body = TokenResponse),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 403, body = ErrorResponse, description = "`Host` вне `TOKEN_ISSUER_ALLOWLIST` (если задан)"),
+        (status = 401, body = ErrorResponse, description = "Level 3: the TOTP code is missing or invalid"),
+        (status = 403, body = ErrorResponse, description = "`Host` is outside `TOKEN_ISSUER_ALLOWLIST` (when it is set)"),
         (status = 422, body = ErrorResponse),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 429, body = ErrorResponse, description = "The global cap of the endpoint was exceeded (when enabled)"),
         (status = 500, body = ErrorResponse)
     )
 )]
-/// Выпускает новый JWT.
+/// Issues a new JWT.
 ///
-/// Тело запроса — [`TokenRequest`] с `sub` (subject), `aud` (audience) и
-/// необязательным `ttl` (кастомное время жизни в секундах). Issuer (`iss`)
-/// подставляется из заголовка `Host`. При выпуске генерируется `jti` и
-/// сохраняется в Redis с TTL, равным времени жизни токена.
+/// The request body is a [`TokenRequest`] with `sub` (the subject), `aud` (the
+/// audience) and an optional `ttl` (a custom lifetime in seconds). The issuer
+/// (`iss`) is taken from the `Host` header. On issue a `jti` is generated and
+/// stored in Redis with a TTL equal to the token lifetime.
 ///
-/// # Ответы
-/// - `200 OK` — [`TokenResponse`] с подписанным токеном;
-/// - `422 Unprocessable Entity` — некорректные входные данные (например, пустой
-///   `aud`, невалидный `TOKEN_EXPIRATION_SECONDS` или `ttl` вне допустимых
-///   границ);
-/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`;
-/// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
-/// - `500 Internal Server Error` — прочие ошибки (недоступность JWKS и т.п.).
+/// # Responses
+/// - `200 OK` — a [`TokenResponse`] with the signed token;
+/// - `422 Unprocessable Entity` — invalid input (an empty `aud`, an invalid
+///   `TOKEN_EXPIRATION_SECONDS` or a `ttl` outside the allowed bounds, for
+///   example);
+/// - `400 Bad Request` — the `Host` header is missing or invalid;
+/// - `403 Forbidden` — `Host` is not in `TOKEN_ISSUER_ALLOWLIST` (when it is set);
+/// - `500 Internal Server Error` — other errors (an unavailable JWKS and so on).
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]) — см. примечание о шве в начале
-/// модуля.
+/// Generic over the `jti` store ([`JtiStore`]) — see the note about the seam at
+/// the top of the module.
 pub async fn create_token<S: JtiStore + 'static>(
     req: web::Json<TokenRequest>,
     store: web::Data<S>,
@@ -134,8 +137,9 @@ pub async fn create_token<S: JtiStore + 'static>(
     };
 
     match issued {
-        // Имя `refresh` намеренно не совпадает с полем: обработчик обмена ниже
-        // называется `refresh_token`, и одноимённая переменная затеняла бы его.
+        // The name `refresh` deliberately differs from the field: the exchange
+        // handler below is called `refresh_token`, and a variable of the same
+        // name would shadow it.
         Ok((token, refresh)) => {
             crate::metrics::record_token_issued();
             Ok(HttpResponse::Ok().json(TokenResponse {
@@ -144,17 +148,17 @@ pub async fn create_token<S: JtiStore + 'static>(
             }))
         }
         Err(e) => {
-            // Уровень по вине: некорректный запрос клиента (422) — DEBUG,
-            // отказ зависимости/внутренний сбой (500) — ERROR.
+            // The level follows the fault: an invalid client request (422) is
+            // DEBUG, a dependency failure or internal error (500) is ERROR.
             match e {
                 JwtError::UnprocessableEntity => {
-                    debug!("Некорректные параметры запроса токена: {}", e);
+                    debug!("Invalid token request parameters: {}", e);
                     Err(Error::Unprocessable(
                         "Invalid token request parameters".into(),
                     ))
                 }
                 _ => {
-                    error!("Не удалось выпустить токен: {}", e);
+                    error!("Failed to issue a token: {}", e);
                     Err(Error::Internal(e.to_string()))
                 }
             }
@@ -170,25 +174,26 @@ pub async fn create_token<S: JtiStore + 'static>(
     responses(
         (status = 200),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 2: нет proxy-secret, либо токен невалиден/истёк"),
-        (status = 429, body = ErrorResponse, description = "Превышен per-IP лимит запросов")
+        (status = 401, body = ErrorResponse, description = "Level 2: no proxy secret, or the token is invalid or expired"),
+        (status = 429, body = ErrorResponse, description = "The per-IP request limit was exceeded")
     )
 )]
-/// Проверяет валидность JWT.
+/// Verifies a JWT.
 ///
-/// Тело запроса — [`TokenVerifyRequest`] с самим `token` и ожидаемым
-/// `audience`. Проверяются подпись (по публичному ключу из JWKS, найденному по
-/// `kid`), совпадение `iss` с заголовком `Host` (и его допустимость по
-/// аллоулисту issuer'ов), вхождение `audience` в `aud`,
-/// временные границы (`nbf`/`iat`/`exp`) и наличие `jti` в Redis (не отозван).
+/// The request body is a [`TokenVerifyRequest`] with the `token` itself and the
+/// expected `audience`. What is checked: the signature (against the public key
+/// from the JWKS found by `kid`), that `iss` matches the `Host` header (and that
+/// it is acceptable per the issuer allowlist), that `audience` is in `aud`, the
+/// time bounds (`nbf`/`iat`/`exp`) and the presence of the `jti` in Redis (not
+/// revoked).
 ///
-/// # Ответы
-/// - `200 OK` — токен валиден, в теле возвращаются его claims;
-/// - `401 Unauthorized` — любая ошибка проверки (намеренно без деталей), в том
-///   числе `Host` вне `TOKEN_ISSUER_ALLOWLIST`;
-/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
+/// # Responses
+/// - `200 OK` — the token is valid and its claims are returned in the body;
+/// - `401 Unauthorized` — any verification failure (deliberately without
+///   details), including a `Host` outside `TOKEN_ISSUER_ALLOWLIST`;
+/// - `400 Bad Request` — the `Host` header is missing or invalid.
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+/// Generic over the `jti` store ([`JtiStore`]).
 pub async fn verify_token<S: JtiStore + 'static>(
     request: web::Json<TokenVerifyRequest>,
     store: web::Data<S>,
@@ -197,12 +202,13 @@ pub async fn verify_token<S: JtiStore + 'static>(
 ) -> Result<HttpResponse, Error> {
     let host_header = host_header(&host)?;
 
-    // Проверка — публичная ручка: причину отказа наружу не раскрываем, ответ
-    // тот же, что и на протухший токен. Issuer вне аллоулиста означает, что
-    // токен выпущен не этим контуром, даже если подпись сделана общим ключом.
+    // Verification is a public endpoint: we do not reveal the reason for a
+    // refusal, and the response is the same as for an expired token. An issuer
+    // outside the allowlist means the token was issued by a different
+    // installation, even if the signature was made with the shared key.
     if !crate::issuer::is_allowed(host_header) {
         debug!(
-            "Проверка токена отклонена: issuer '{}' отсутствует в {}",
+            "Token verification refused: issuer '{}' is not in {}",
             host_header,
             crate::issuer::ALLOWLIST_VAR
         );
@@ -218,13 +224,13 @@ pub async fn verify_token<S: JtiStore + 'static>(
         }
         Err(e) => {
             crate::metrics::record_token_verified(false);
-            // Детали проверки наружу намеренно не раскрываем, чтобы не давать
-            // подсказок атакующему — единый ответ на любую причину.
+            // The details of the check are deliberately not revealed, so as not
+            // to give an attacker any hints — one response for every reason.
             //
-            // Уровень DEBUG: протухший/отозванный/подделанный токен — штатное
-            // событие публичной ручки, а не сбой сервиса. Иначе любой такой
-            // запрос поднимал бы ERROR-алерты в проде.
-            debug!("Проверка токена не удалась: {}", e);
+            // DEBUG level: an expired, revoked or forged token is a normal event
+            // for a public endpoint rather than a service failure. Otherwise
+            // every such request would raise ERROR alerts in production.
+            debug!("Token verification failed: {}", e);
             Err(Error::Unauthorized("Invalid or expired token".into()))
         }
     }
@@ -235,26 +241,27 @@ pub async fn verify_token<S: JtiStore + 'static>(
     path = "/tokens/{jti}",
     security(("totp" = [])),
     responses(
-        (status = 204, description = "Токен отозван. Идемпотентно: несуществующий `jti` — тоже 204"),
-        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
-        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
+        (status = 204, description = "The token was revoked. Idempotent: a `jti` that does not exist also gives 204"),
+        (status = 401, body = ErrorResponse, description = "Level 3: the TOTP code is missing or invalid"),
+        (status = 429, body = ErrorResponse, description = "The global cap of the endpoint was exceeded (when enabled)"),
+        (status = 500, body = ErrorResponse, description = "The store is unavailable — the revocation was NOT performed")
     )
 )]
-/// Отзывает токен по его идентификатору `jti`.
+/// Revokes a token by its `jti` identifier.
 ///
-/// Удаляет запись `jti` из Redis; после этого проверка соответствующего токена
-/// в [`verify_token`] будет неуспешной.
+/// It deletes the `jti` record from Redis; after that, verifying the
+/// corresponding token in [`verify_token`] fails.
 ///
-/// # Ответы
-/// - `204 No Content` — токен отозван. **Идемпотентно**: несуществующий `jti`
-///   тоже даёт `204`, потому что желаемое состояние достигнуто — такого токена
-///   нет;
-/// - `500 Internal Server Error` — хранилище недоступно, отзыв **не выполнен**.
-///   Отличать этот случай от успеха обязательно: вызывающий отзывает
-///   скомпрометированный токен и должен узнать, что попытка не удалась.
+/// # Responses
+/// - `204 No Content` — the token was revoked. **Idempotent**: a `jti` that does
+///   not exist also gives `204`, because the desired state has been reached —
+///   there is no such token;
+/// - `500 Internal Server Error` — the store is unavailable and the revocation
+///   was **not** performed. Telling this case apart from success is mandatory:
+///   the caller is revoking a compromised token and must learn that the attempt
+///   failed.
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+/// Generic over the `jti` store ([`JtiStore`]).
 pub async fn revoke_token<S: JtiStore + 'static>(
     jti: web::Path<String>,
     store: web::Data<S>,
@@ -262,17 +269,17 @@ pub async fn revoke_token<S: JtiStore + 'static>(
     match store.delete_jti(&jti).await {
         Ok(_) => {
             crate::metrics::record_token_revoked();
-            info!("Токен отозван");
+            info!("Token revoked");
             Ok(HttpResponse::NoContent().finish())
         }
         Err(e) => {
-            // Отказ хранилища — наша вина, ERROR.
+            // A store failure is our fault, ERROR.
             //
-            // Раньше ошибка проглатывалась и наружу всё равно уходил `204`:
-            // вызывающий считал скомпрометированный токен отозванным и не
-            // повторял попытку, хотя токен оставался активным. Молчаливый
-            // «успех» здесь опаснее честной ошибки.
-            error!("Не удалось отозвать токен: {}", e);
+            // The error used to be swallowed and a `204` went out anyway: the
+            // caller considered a compromised token revoked and did not retry,
+            // while the token stayed active. A silent "success" here is more
+            // dangerous than an honest error.
+            error!("Failed to revoke the token: {}", e);
             Err(Error::Internal("Failed to revoke token".into()))
         }
     }
@@ -281,28 +288,29 @@ pub async fn revoke_token<S: JtiStore + 'static>(
 #[utoipa::path(
     delete,
     path = "/subjects/{sub}/tokens",
-    params(("sub" = String, Path, description = "Субъект (claim `sub`), чьи токены отзываются")),
+    params(("sub" = String, Path, description = "The subject (the `sub` claim) whose tokens are revoked")),
     security(("totp" = [])),
     responses(
         (status = 200, body = RevokeGroupResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 3: отсутствует/некорректен TOTP-код"),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
-        (status = 500, body = ErrorResponse, description = "Хранилище недоступно — отзыв НЕ выполнен")
+        (status = 401, body = ErrorResponse, description = "Level 3: the TOTP code is missing or invalid"),
+        (status = 429, body = ErrorResponse, description = "The global cap of the endpoint was exceeded (when enabled)"),
+        (status = 500, body = ErrorResponse, description = "The store is unavailable — the revocation was NOT performed")
     )
 )]
-/// Отзывает все активные токены субъекта.
+/// Revokes every active token of a subject.
 ///
-/// Нужно при компрометации: гасить токены по одному через
-/// `DELETE /tokens/{jti}` вызывающий не может — он не знает их `jti`.
+/// Needed on compromise: the caller cannot kill the tokens one by one through
+/// `DELETE /tokens/{jti}` — it does not know their `jti` values.
 ///
-/// # Ответы
-/// - `200 OK` — [`RevokeGroupResponse`] с числом отозванных токенов (уже
-///   истёкшие не считаются, они и так невалидны);
-/// - `500 Internal Server Error` — хранилище недоступно. В отличие от
-///   `DELETE /tokens/{jti}`, ошибка **не** проглатывается: молчаливый «успех»
-///   при неудавшемся отзыве скомпрометированных токенов опаснее честной ошибки.
+/// # Responses
+/// - `200 OK` — a [`RevokeGroupResponse`] with the number of revoked tokens
+///   (already expired ones do not count, they are invalid anyway);
+/// - `500 Internal Server Error` — the store is unavailable. Unlike
+///   `DELETE /tokens/{jti}`, the error is **not** swallowed: a silent "success"
+///   for a failed revocation of compromised tokens is more dangerous than an
+///   honest error.
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+/// Generic over the `jti` store ([`JtiStore`]).
 pub async fn revoke_subject_tokens<S: JtiStore + 'static>(
     sub: web::Path<String>,
     store: web::Data<S>,
@@ -312,12 +320,12 @@ pub async fn revoke_subject_tokens<S: JtiStore + 'static>(
             for _ in 0..revoked {
                 crate::metrics::record_token_revoked();
             }
-            info!(revoked, "Отозваны все токены субъекта");
+            info!(revoked, "Every token of the subject was revoked");
             Ok(HttpResponse::Ok().json(RevokeGroupResponse { revoked }))
         }
         Err(e) => {
-            // Отказ хранилища — наша вина, ERROR.
-            error!("Не удалось отозвать токены субъекта: {}", e);
+            // A store failure is our fault, ERROR.
+            error!("Failed to revoke the subject's tokens: {}", e);
             Err(Error::Internal("Failed to revoke subject tokens".into()))
         }
     }
@@ -331,31 +339,31 @@ pub async fn revoke_subject_tokens<S: JtiStore + 'static>(
     responses(
         (status = 200, body = TokenResponse),
         (status = 400, body = ErrorResponse),
-        (status = 401, body = ErrorResponse, description = "Уровень 3: нет TOTP-кода, либо refresh-токен неизвестен/использован"),
-        (status = 429, body = ErrorResponse, description = "Превышен глобальный cap эндпоинта (если включён)"),
+        (status = 401, body = ErrorResponse, description = "Level 3: no TOTP code, or the refresh token is unknown or already used"),
+        (status = 429, body = ErrorResponse, description = "The global cap of the endpoint was exceeded (when enabled)"),
         (status = 500, body = ErrorResponse)
     )
 )]
-/// Обменивает refresh-токен на новую пару access + refresh.
+/// Exchanges a refresh token for a new access + refresh pair.
 ///
-/// Старый refresh после обмена не работает: выдаётся новый, из той же семьи.
-/// Предъявление уже использованного токена означает утечку — тогда гасится вся
-/// семья, включая выданные по ней access-токены (см.
-/// [`JwtManager::refresh_token_pair`]).
+/// The old refresh token stops working after the exchange: a new one from the
+/// same family is issued. Presenting an already-used token means a leak — the
+/// whole family is then killed, the access tokens issued through it included
+/// (see [`crate::jwt::JwtManager::refresh`]).
 ///
-/// Уровень доступа 3 (TOTP), как и у `POST /tokens`: обмен — это выпуск токена,
-/// просто основанием служит предъявленный refresh, а не запрос доверенного
-/// бэкенда. Ручку дёргает тот же internal-клиент, что выпускает токены; конечное
-/// приложение с сервисом напрямую не общается.
+/// Access level 3 (TOTP), like `POST /tokens`: an exchange is issuing a token,
+/// it just rests on a presented refresh token rather than on a request from a
+/// trusted backend. The endpoint is called by the same internal client that
+/// issues tokens; the end application never talks to the service directly.
 ///
-/// # Ответы
-/// - `200 OK` — [`TokenResponse`] с новыми `token` и `refresh_token`;
-/// - `401 Unauthorized` — токен неизвестен, истёк или уже использован (детали
-///   наружу не раскрываются, как и при проверке токена);
-/// - `403 Forbidden` — `Host` не входит в `TOKEN_ISSUER_ALLOWLIST` (если задан);
-/// - `400 Bad Request` — отсутствует/некорректен заголовок `Host`.
+/// # Responses
+/// - `200 OK` — a [`TokenResponse`] with a new `token` and `refresh_token`;
+/// - `401 Unauthorized` — the token is unknown, expired or already used (the
+///   details are not revealed, as with token verification);
+/// - `403 Forbidden` — `Host` is not in `TOKEN_ISSUER_ALLOWLIST` (when it is set);
+/// - `400 Bad Request` — the `Host` header is missing or invalid.
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]).
+/// Generic over the `jti` store ([`JtiStore`]).
 pub async fn refresh_token<S: JtiStore + 'static>(
     request: web::Json<RefreshRequest>,
     store: web::Data<S>,
@@ -373,13 +381,14 @@ pub async fn refresh_token<S: JtiStore + 'static>(
             }))
         }
         Err(JwtError::NotValid) => {
-            // Причину не раскрываем: неизвестный, истёкший и переигранный токен
-            // снаружи неразличимы — как и при проверке access-токена.
-            debug!("Обмен refresh-токена не удался");
+            // The reason is not revealed: an unknown, an expired and a replayed
+            // token are indistinguishable from the outside — as with the
+            // verification of an access token.
+            debug!("The refresh token exchange failed");
             Err(Error::Unauthorized("Invalid refresh token".into()))
         }
         Err(e) => {
-            error!("Не удалось обменять refresh-токен: {}", e);
+            error!("Failed to exchange the refresh token: {}", e);
             Err(Error::Internal(e.to_string()))
         }
     }
@@ -389,22 +398,24 @@ pub async fn refresh_token<S: JtiStore + 'static>(
     get,
     path = "/metrics",
     responses(
-        (status = 200, description = "Метрики в текстовом формате Prometheus", content_type = "text/plain")
+        (status = 200, description = "The metrics in the Prometheus text format", content_type = "text/plain")
     )
 )]
-/// Отдаёт метрики в формате экспозиции Prometheus.
+/// Serves the metrics in the Prometheus exposition format.
 ///
-/// Уровень доступа 4: статический Bearer-токен (`AUTH_METRICS_TOKEN`) — его
-/// нативно умеют слать Prometheus (`authorization: {credentials_file}`), Zabbix
-/// `agent2` и OTel Collector, через который метрики забирает Monium.
+/// Access level 4: a static bearer token (`AUTH_METRICS_TOKEN`) — one that
+/// Prometheus (`authorization: {credentials_file}`), Zabbix `agent2` and the
+/// OTel Collector through which Monium scrapes the metrics can all send
+/// natively.
 ///
-/// Токен — не замена сетевой изоляции: ручку всё равно не стоит публиковать
-/// наружу, метрики раскрывают операционную картину (объём трафика, доли отказов,
-/// латентности зависимостей).
+/// The token is not a substitute for network isolation: the endpoint still
+/// should not be exposed publicly, as metrics reveal the operational picture
+/// (traffic volume, failure ratios, dependency latencies).
 ///
-/// Роут регистрируется в `main.rs` (не через атрибут-макрос), потому что ручка
-/// оборачивается auth-middleware уровня 4 и публикуется **условно**: без
-/// `AUTH_METRICS_TOKEN` её нет вовсе и путь отдаёт `404`.
+/// The route is registered in `main.rs` (not through an attribute macro),
+/// because the endpoint is wrapped in the level 4 auth middleware and published
+/// **conditionally**: without `AUTH_METRICS_TOKEN` it does not exist at all and
+/// the path returns `404`.
 pub async fn metrics(handle: web::Data<PrometheusHandle>) -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
@@ -415,13 +426,13 @@ pub async fn metrics(handle: web::Data<PrometheusHandle>) -> HttpResponse {
     get,
     path = "/livez",
     responses(
-        (status = 200, description = "Процесс жив")
+        (status = 200, description = "The process is alive")
     )
 )]
-/// Liveness-проба: подтверждает, что процесс жив.
+/// Liveness probe: it confirms that the process is alive.
 ///
-/// Всегда возвращает `200 OK` без тела. Зависимости не проверяются — для этого
-/// служит [`readyz`]. Предназначен для liveness-проверки оркестратора.
+/// It always returns `200 OK` with no body. Dependencies are not checked — that
+/// is what [`readyz`] is for. Intended for the orchestrator's liveness check.
 #[get("/livez")]
 pub async fn livez() -> HttpResponse {
     HttpResponse::Ok().finish()
@@ -431,31 +442,31 @@ pub async fn livez() -> HttpResponse {
     get,
     path = "/readyz",
     responses(
-        (status = 200, body = ReadinessResponse, description = "Сервис готов обслуживать запросы (`ok` либо `degraded`)"),
-        (status = 503, body = ReadinessResponse, description = "Обслуживать запросы нельзя: недоступен Redis либо у сервиса ключей нет ни ответа, ни пригодного снимка")
+        (status = 200, body = ReadinessResponse, description = "The service is ready to serve requests (`ok` or `degraded`)"),
+        (status = 503, body = ReadinessResponse, description = "Requests cannot be served: Redis is unavailable, or the key service has neither answered nor left a usable snapshot")
     )
 )]
-/// Readiness-проба: может ли под обслуживать запросы.
+/// Readiness probe: whether the pod can serve requests.
 ///
-/// Пингует хранилище `jti` и запрашивает JWKS у `jwks-service-app`
-/// (`GET /.well-known/jwks.json`). Возвращает `200 OK`, если обслуживать можем,
-/// иначе `503 Service Unavailable`. В обоих случаях тело —
-/// [`ReadinessResponse`] с детализацией по каждой зависимости.
+/// It pings the `jti` store and requests the JWKS from `jwks-service-app`
+/// (`GET /.well-known/jwks.json`). It returns `200 OK` when we can serve and
+/// `503 Service Unavailable` otherwise. In both cases the body is a
+/// [`ReadinessResponse`] with a breakdown per dependency.
 ///
-/// **Проба спрашивает не «жива ли зависимость», а «сможем ли мы ответить».**
-/// Разница только в сервисе ключей: пока в памяти лежит пригодный снимок JWKS,
-/// верификация работает и без него (см. [`crate::jwk`]), поэтому выводить под из
-/// балансировки не за что — иначе stale-кеш не спасал бы ровно в той аварии,
-/// ради которой сделан: readiness погасил бы поды за десяток секунд, и трафик до
-/// снимка в памяти просто не дошёл бы. Состояние при этом честно показывается
-/// как `degraded`, а когда снимок перестанет быть пригодным — под уйдёт из
-/// балансировки сам.
+/// **The probe asks not "is the dependency alive" but "can we answer".** The
+/// difference concerns only the key service: while a usable JWKS snapshot is in
+/// memory, verification works without it (see [`crate::jwk`]), so there is no
+/// reason to take the pod out of the load balancer — otherwise the stale cache
+/// would not help in exactly the outage it was built for: readiness would kill
+/// the pods within ten seconds and traffic would never reach the snapshot in
+/// memory. That state is honestly reported as `degraded`, and once the snapshot
+/// stops being usable the pod leaves the load balancer on its own.
 ///
-/// Хранилище такой поблажки не имеет: без него не проверить `jti`, то есть
-/// отозванный токен стал бы валидным — это не деградация, а дыра.
+/// The store gets no such leniency: without it the `jti` cannot be checked, so a
+/// revoked token would become valid — that is not degradation but a hole.
 ///
-/// Обобщён по хранилищу `jti` ([`JtiStore`]): проба ходит в него через
-/// [`JtiStore::ping`], а не в конкретный бэкенд.
+/// Generic over the `jti` store ([`JtiStore`]): the probe reaches it through
+/// [`JtiStore::ping`] rather than a concrete backend.
 pub async fn readyz<S: JtiStore + 'static>(
     store: web::Data<S>,
     keys: web::Data<KeyManager>,
@@ -463,7 +474,7 @@ pub async fn readyz<S: JtiStore + 'static>(
     let store_ok = store.ping().await.is_ok();
 
     let jwks_live = keys.check_jwks().await.is_ok();
-    // Сервис ключей не ответил, но снимок в памяти ещё обслуживает верификацию.
+    // The key service did not answer, but the snapshot in memory still serves verification.
     let jwks_stale = !jwks_live && keys.has_servable_jwks_snapshot();
     let jwks_ok = jwks_live || jwks_stale;
 
@@ -476,9 +487,9 @@ pub async fn readyz<S: JtiStore + 'static>(
             (true, false) => "ok",
         }
         .into(),
-        // Поле ответа так и называется `redis` — это публичный контракт пробы,
-        // на который завязаны дашборды и алерты; переименование сломало бы их
-        // ради косметики.
+        // The response field really is called `redis` — that is the public
+        // contract of the probe, which dashboards and alerts depend on; renaming
+        // it would break them for the sake of cosmetics.
         redis: store_ok,
         jwks: jwks_ok,
         jwks_stale,
@@ -493,26 +504,30 @@ pub async fn readyz<S: JtiStore + 'static>(
 
 #[cfg(test)]
 mod tests {
-    //! Тесты HTTP-слоя: health/readiness и полный жизненный цикл токенов.
+    //! HTTP layer tests: health/readiness and the full token life cycle.
     //!
-    //! `livez` не зависит от окружения. Для `readyz` зависимости (Redis и
-    //! `jwks-service-app`) направляются на заведомо недоступные адреса, чтобы
-    //! детерминированно проверить ветку `503` без реальной инфраструктуры.
+    //! `livez` does not depend on the environment. For `readyz` the dependencies
+    //! (Redis and `jwks-service-app`) are pointed at deliberately unreachable
+    //! addresses so that the `503` branch is checked deterministically without
+    //! real infrastructure.
     //!
-    //! Эндпоинты токенов проверяются через `actix_web::test`: хранилище `jti`
-    //! подменяется in-memory-моком [`MockStore`] (Redis не нужен), а сервис ключей
-    //! `jwks-service-app` поднимается как HTTP-мок ([`wiremock`]) — так тесты
-    //! проходят в CI без реальной инфраструктуры. Часть проверок конструирует токены
-    //! напрямую (истёкший, с чужой подписью), чего нельзя добиться через публичный API.
+    //! The token endpoints are exercised through `actix_web::test`: the `jti`
+    //! store is replaced by the in-memory [`MockStore`] (no Redis needed) and
+    //! the key service `jwks-service-app` is brought up as an HTTP mock
+    //! ([`wiremock`]) — that way the tests run in CI without real
+    //! infrastructure. Some checks construct tokens directly (expired, signed by
+    //! someone else), which cannot be achieved through the public API.
     //!
-    //! Обработчики обобщены по хранилищу, поэтому в тестах регистрируются те же
-    //! функции, что и в проде ([`create_token`] и др.), — просто с [`MockStore`]
-    //! вместо Redis. Отдельных «тестовых» реализаций нет.
+    //! The handlers are generic over the store, so the tests register the same
+    //! functions as production ([`create_token`] and the rest) — just with
+    //! [`MockStore`] instead of Redis. There are no separate "test"
+    //! implementations.
 
-    // `env_guard` намеренно держит std-`MutexGuard` через `.await`: `#[actix_web::test]`
-    // запускает каждый тест на отдельном однопоточном рантайме, задача с потока не
-    // мигрирует и одна на рантайм — так лок сериализует тесты по общим переменным
-    // окружения без риска дедлока. Async-Mutex здесь избыточен.
+    // `env_guard` deliberately holds a std `MutexGuard` across `.await`:
+    // `#[actix_web::test]` runs every test on its own single-threaded runtime,
+    // the task does not migrate between threads and there is one per runtime — so
+    // the lock serialises the tests over the shared environment variables without
+    // a risk of deadlock. An async Mutex would be overkill here.
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
@@ -534,27 +549,29 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Тесты токенов правят процесс-глобальные переменные окружения
-    /// (`JWKS_SERVICE_URL`, `TOKEN_ALGORITHM`, ...) и адрес JWKS-мока, поэтому
-    /// выполняются строго последовательно. `readyz` тоже трогает `JWKS_SERVICE_URL`,
-    /// так что берёт тот же лок. Восстанавливаемся после «отравления» (`into_inner`),
-    /// чтобы паника одного теста не роняла остальные.
+    /// The token tests modify process-global environment variables
+    /// (`JWKS_SERVICE_URL`, `TOKEN_ALGORITHM`, ...) and the address of the JWKS
+    /// mock, so they run strictly sequentially. `readyz` touches
+    /// `JWKS_SERVICE_URL` too and therefore takes the same lock. We recover from
+    /// poisoning (`into_inner`) so that a panic in one test does not take the
+    /// rest down.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// In-memory реализация [`JtiStore`] для тестов HTTP-слоя.
+    /// An in-memory implementation of [`JtiStore`] for the HTTP layer tests.
     ///
-    /// Группы ведутся по-настоящему (`group -> набор jti`), иначе тесты
-    /// массового отзыва проверяли бы только код ответа, но не сам отзыв.
+    /// The groups are maintained for real (`group -> set of jti`), or the bulk
+    /// revocation tests would only be checking the response code rather than the
+    /// revocation itself.
     struct MockStore {
         jtis: PlMutex<HashSet<String>>,
         groups: PlMutex<HashMap<String, HashSet<String>>>,
-        /// Записи refresh-токенов и признак использования.
+        /// The refresh token records and the used flag.
         refreshes: PlMutex<HashMap<String, (RefreshRecord, bool)>>,
-        /// Отпечатки уже предъявленных TOTP-кодов.
+        /// The fingerprints of the TOTP codes already presented.
         used_codes: PlMutex<HashSet<String>>,
     }
 
@@ -608,8 +625,8 @@ mod tests {
             let mut refreshes = self.refreshes.lock();
             let mut jtis = self.jtis.lock();
 
-            // В группе семьи лежат и `jti`, и ключи refresh-записей — гасим и то,
-            // и другое, как это делает `DEL` в Redis.
+            // The family group holds both `jti` values and the keys of refresh
+            // records — we kill both, exactly as `DEL` does in Redis.
             let revoked = members
                 .iter()
                 .filter(|member| {
@@ -647,7 +664,7 @@ mod tests {
             let mut refreshes = self.refreshes.lock();
 
             match refreshes.get_mut(id) {
-                // Уже использован — повторное предъявление.
+                // Already used — a repeat presentation.
                 Some((_, true)) => Ok(false),
                 Some((_, used)) => {
                     *used = true;
@@ -658,16 +675,17 @@ mod tests {
         }
 
         async fn claim_totp_code(&self, hash: &str, _ttl: u64) -> Result<bool, JtiError> {
-            // `insert` возвращает false, если элемент уже был — это и есть повтор.
+            // `insert` returns false when the element was already there — that is the replay.
             Ok(self.used_codes.lock().insert(hash.to_string()))
         }
     }
 
-    /// [`JtiStore`], у которого любая операция падает: имитирует недоступное
-    /// хранилище.
+    /// A [`JtiStore`] where every operation fails: it simulates an unavailable
+    /// store.
     ///
-    /// Нужен там, где проверяется не результат операции, а честность ответа при
-    /// сбое: `MockStore` всегда успешен и такую ветку не покрывает.
+    /// Needed where what is checked is not the result of an operation but the
+    /// honesty of the response on failure: `MockStore` always succeeds and does
+    /// not cover that branch.
     struct UnavailableStore;
 
     impl JtiStore for UnavailableStore {
@@ -722,17 +740,18 @@ mod tests {
         }
     }
 
-    /// Тестовый ключ Ed25519 и его JWK-представление.
+    /// A test Ed25519 key and its JWK representation.
     ///
-    /// `EdDSA` выбран потому, что подпись/проверка идут без явного дайджеста —
-    /// ровно как в [`JsonWebToken::to_string`] / `from_string`, что гарантирует
-    /// round-trip (см. также юнит-тесты в `models/jwt.rs`).
+    /// `EdDSA` was chosen because signing and verification go without an
+    /// explicit digest — exactly as in [`JsonWebToken::to_string`] /
+    /// `from_string`, which guarantees the round trip (see also the unit tests
+    /// in `models/jwt.rs`).
     struct TestKey {
         pkey: PKey<Private>,
         kid: String,
-        /// Приватный ключ в base64url(PKCS#8 DER) — формат поля `private_key` JWK.
+        /// The private key as base64url(PKCS#8 DER) — the format of the JWK `private_key` field.
         private_b64: String,
-        /// Сырой публичный ключ в base64url — компонент `x` JWK для OKP.
+        /// The raw public key as base64url — the `x` component of an OKP JWK.
         x_b64: String,
     }
 
@@ -748,8 +767,9 @@ mod tests {
         }
     }
 
-    /// Поднимает HTTP-мок `jwks-service-app`, отдающий приватный ключ при выпуске
-    /// (`POST /jwks`) и публичный — при проверке (`GET /.well-known/jwks.json`).
+    /// Brings up an HTTP mock of `jwks-service-app` that serves the private key
+    /// on issue (`POST /jwks`) and the public one on verification
+    /// (`GET /.well-known/jwks.json`).
     async fn start_jwks_mock(key: &TestKey) -> MockServer {
         let server = MockServer::start().await;
 
@@ -777,8 +797,8 @@ mod tests {
         server
     }
 
-    /// Настраивает окружение под тестовый JWKS-мок с алгоритмом `EdDSA` и
-    /// дефолтными границами TTL. Требует удержания [`env_guard`].
+    /// Points the environment at the test JWKS mock with the `EdDSA` algorithm
+    /// and the default TTL bounds. Requires [`env_guard`] to be held.
     fn set_jwks_env(server: &MockServer) {
         env::set_var("JWKS_SERVICE_URL", server.uri());
         env::set_var("TOKEN_ALGORITHM", "EdDSA");
@@ -789,11 +809,11 @@ mod tests {
         env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
-    /// Собирает тестовое приложение с эндпоинтами токенов поверх [`MockStore`].
+    /// Assembles a test application with the token endpoints over [`MockStore`].
     ///
-    /// Оформлено макросом, чтобы не выписывать громоздкий тип
-    /// `App<impl ServiceFactory<...>>`. `KeyManager` конструируется здесь и читает
-    /// `JWKS_SERVICE_URL` — вызывать после [`set_jwks_env`].
+    /// It is a macro so that the unwieldy `App<impl ServiceFactory<...>>` type
+    /// does not have to be spelled out. `KeyManager` is constructed here and
+    /// reads `JWKS_SERVICE_URL` — call it after [`set_jwks_env`].
     macro_rules! token_app {
         ($store:expr) => {{
             let keys = web::Data::new(KeyManager::new("EdDSA".to_string()));
@@ -814,10 +834,11 @@ mod tests {
         }};
     }
 
-    /// Выпускает токен на субъект `$sub` через тестовое приложение.
+    /// Issues a token for the subject `$sub` through the test application.
     ///
-    /// Макрос, а не функция: тип приложения из `init_service` не выписывается
-    /// без вороха дженериков (та же причина, что у `token_app!`).
+    /// A macro rather than a function: the application type from `init_service`
+    /// cannot be written out without a pile of generics (the same reason as for
+    /// `token_app!`).
     macro_rules! issue_token {
         ($app:expr, $sub:expr) => {{
             let req = test::TestRequest::post()
@@ -832,11 +853,11 @@ mod tests {
         }};
     }
 
-    /// Достаёт `jti` из сегмента claims сериализованного токена.
+    /// Extracts the `jti` from the claims segment of a serialised token.
     fn jti_of(token: &str) -> String {
-        let claims_segment = token.split('.').nth(1).expect("нет сегмента claims");
+        let claims_segment = token.split('.').nth(1).expect("no claims segment");
         TokenClaims::from_base64(claims_segment.to_string())
-            .expect("claims не декодируются")
+            .expect("the claims do not decode")
             .jti
     }
 
@@ -850,9 +871,9 @@ mod tests {
 
     #[actix_web::test]
     async fn metrics_route_absent_gives_404() {
-        // Без токена роут не регистрируется (см. `main.rs`) — путь должен вести
-        // себя как любой несуществующий: 404, а не 401. Так наружу не виден даже
-        // факт существования ручки.
+        // Without a token the route is not registered (see `main.rs`) — the path
+        // must behave like any non-existent one: 404, not 401. That way its very
+        // existence is invisible from the outside.
         let app = test::init_service(App::new().service(livez)).await;
 
         for req in [
@@ -869,8 +890,8 @@ mod tests {
 
     #[actix_web::test]
     async fn metrics_returns_prometheus_exposition() {
-        // Локальный recorder: глобальный ставится один раз на процесс и в тестах
-        // недоступен (см. `metrics.rs`).
+        // A local recorder: the global one is installed once per process and is
+        // unavailable in tests (see `metrics.rs`).
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         ::metrics::with_local_recorder(&recorder, || {
@@ -904,9 +925,10 @@ mod tests {
     async fn readyz_reports_ready_over_arbitrary_store() {
         let _guard = env_guard();
 
-        // Проба ходит в хранилище через трейт, а не в Redis: с любым исправным
-        // `JtiStore` и живым сервисом ключей под готов. Это и есть проверка шва —
-        // раньше `readyz` был прибит к `RedisClient` и такой тест был невозможен.
+        // The probe reaches the store through the trait rather than Redis: with
+        // any working `JtiStore` and a live key service the pod is ready. That is
+        // the seam check — `readyz` used to be nailed to `RedisClient` and such a
+        // test was impossible.
         let key = make_key("kid-ready-ok");
         let server = start_jwks_mock(&key).await;
         set_jwks_env(&server);
@@ -936,9 +958,9 @@ mod tests {
     async fn readyz_reports_503_when_store_ping_fails() {
         let _guard = env_guard();
 
-        // Сервис ключей жив, падает только хранилище: без него не проверить
-        // `jti`, то есть отозванный токен стал бы валидным — это не деградация,
-        // а причина уйти из балансировки.
+        // The key service is alive and only the store fails: without it the `jti`
+        // cannot be checked, so a revoked token would become valid — that is not
+        // degradation but a reason to leave the load balancer.
         let key = make_key("kid-ready-nostore");
         let server = start_jwks_mock(&key).await;
         set_jwks_env(&server);
@@ -967,8 +989,8 @@ mod tests {
     async fn readyz_reports_503_when_dependencies_unavailable() {
         let _guard = env_guard();
 
-        // Порт 1 гарантированно недоступен — и Redis, и JWKS быстро падают с
-        // «connection refused» независимо от окружения.
+        // Port 1 is guaranteed to be unreachable — both Redis and the JWKS fail
+        // fast with "connection refused" regardless of the environment.
         env::set_var("REDIS_URL", "redis://127.0.0.1:1");
         env::set_var("JWKS_SERVICE_URL", "http://127.0.0.1:1");
 
@@ -1000,8 +1022,8 @@ mod tests {
         let key = make_key("kid-ready");
         let server = MockServer::start().await;
 
-        // Сервис ключей отвечает ровно один раз — им прогревается кеш, — и
-        // дальше лежит.
+        // The key service answers exactly once — that warms the cache up — and is
+        // down from then on.
         let jwks = json!({ "keys": [ {
             "kty": "OKP", "alg": "EdDSA", "kid": key.kid, "crv": "Ed25519",
             "x": key.x_b64, "y": null, "n": null, "e": null,
@@ -1026,8 +1048,8 @@ mod tests {
         let redis = RedisClient::new().unwrap();
         let keys = KeyManager::new("EdDSA".to_string());
 
-        // Снимок попадает в память при верификации, а не пробой: `check_jwks`
-        // намеренно ходит в сеть мимо кеша.
+        // The snapshot lands in memory during verification rather than through
+        // the probe: `check_jwks` deliberately goes to the network past the cache.
         assert!(keys.get_public_key(&key.kid).await.is_ok());
 
         let app = test::init_service(
@@ -1041,9 +1063,9 @@ mod tests {
         let req = test::TestRequest::get().uri("/readyz").to_request();
         let resp = test::call_service(&app, req).await;
 
-        // Redis в этом тесте недоступен, поэтому под всё равно не готов — но по
-        // сервису ключей готовность держится на снимке, и видно, что она
-        // держится именно на нём.
+        // Redis is unavailable in this test, so the pod is not ready anyway — but
+        // as far as the key service goes, readiness rests on the snapshot, and it
+        // is visible that it rests on exactly that.
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let body: ReadinessResponse = test::read_body_json(resp).await;
@@ -1052,9 +1074,9 @@ mod tests {
         assert!(!body.redis);
     }
 
-    // --- Эндпоинты токенов ---
+    // --- The token endpoints ---
 
-    /// Сквозной сценарий: выпуск → verify(ok) → revoke → verify(fail).
+    /// The end-to-end scenario: issue → verify(ok) → revoke → verify(fail).
     #[actix_web::test]
     async fn token_lifecycle_issue_verify_revoke_verify() {
         let _guard = env_guard();
@@ -1065,7 +1087,7 @@ mod tests {
         let store = web::Data::new(MockStore::new());
         let app = test::init_service(token_app!(store.clone())).await;
 
-        // Выпуск.
+        // Issue.
         let req = test::TestRequest::post()
             .uri("/tokens")
             .insert_header(("Host", "example.com"))
@@ -1076,7 +1098,7 @@ mod tests {
         let issued: TokenResponse = test::read_body_json(resp).await;
         let jti = jti_of(&issued.token);
 
-        // Проверка выпущенного токена — успех.
+        // Verifying the issued token — success.
         let req = test::TestRequest::post()
             .uri("/tokens/verify")
             .insert_header(("Host", "example.com"))
@@ -1085,14 +1107,14 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Отзыв.
+        // Revocation.
         let req = test::TestRequest::delete()
             .uri(&format!("/tokens/{}", jti))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // Повторная проверка того же токена — теперь отказ (jti отозван).
+        // Verifying the same token again — now a refusal (the jti is revoked).
         let req = test::TestRequest::post()
             .uri("/tokens/verify")
             .insert_header(("Host", "example.com"))
@@ -1102,7 +1124,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// `ttl` ниже нижней границы (дефолт — 1 секунда) → 422.
+    /// A `ttl` below the lower bound (1 second by default) → 422.
     #[actix_web::test]
     async fn create_token_rejects_ttl_below_min() {
         let _guard = env_guard();
@@ -1122,7 +1144,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// `ttl` выше верхней границы (дефолт — 86400 секунд) → 422.
+    /// A `ttl` above the upper bound (86400 seconds by default) → 422.
     #[actix_web::test]
     async fn create_token_rejects_ttl_above_max() {
         let _guard = env_guard();
@@ -1142,7 +1164,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// Пустой `aud` → 422.
+    /// An empty `aud` → 422.
     #[actix_web::test]
     async fn create_token_rejects_empty_audience() {
         let _guard = env_guard();
@@ -1162,7 +1184,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// Отсутствует заголовок `Host` → 400 (проверяется до обращения к JWKS).
+    /// A missing `Host` header → 400 (checked before the JWKS is contacted).
     #[actix_web::test]
     async fn create_token_missing_host_returns_400() {
         let store = web::Data::new(MockStore::new());
@@ -1176,7 +1198,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Невалидный (не-ASCII) заголовок `Host` → 400.
+    /// An invalid (non-ASCII) `Host` header → 400.
     #[actix_web::test]
     async fn create_token_invalid_host_returns_400() {
         let store = web::Data::new(MockStore::new());
@@ -1184,7 +1206,7 @@ mod tests {
 
         let req = test::TestRequest::post()
             .uri("/tokens")
-            // 0xFF — не декодируется в ASCII, `to_str()` вернёт ошибку.
+            // 0xFF does not decode as ASCII, so `to_str()` returns an error.
             .insert_header(("Host", HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap()))
             .set_json(json!({ "sub": "u", "aud": ["api1"] }))
             .to_request();
@@ -1192,11 +1214,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Аллоулист issuer'ов: `Host` вне списка не выпускает токен (403), а
-    /// перечисленный — выпускает.
+    /// The issuer allowlist: a `Host` outside the list does not issue a token
+    /// (403) while a listed one does.
     ///
-    /// Это и есть закрываемая дыра: инстанс `a.example.com`, разделяющий ключи
-    /// с `b.example.com`, не должен подписывать токены с чужим `iss`.
+    /// This is the hole being closed: an instance `a.example.com` that shares
+    /// keys with `b.example.com` must not sign tokens with someone else's `iss`.
     #[actix_web::test]
     async fn create_token_rejects_issuer_outside_allowlist() {
         let _guard = env_guard();
@@ -1227,7 +1249,7 @@ mod tests {
         env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
-    /// Пустой аллоулист — прежнее поведение: любой `Host` выпускает токен.
+    /// An empty allowlist is the previous behaviour: any `Host` issues a token.
     #[actix_web::test]
     async fn create_token_allows_any_issuer_without_allowlist() {
         let _guard = env_guard();
@@ -1247,8 +1269,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Проверка токена с `Host` вне аллоулиста → 401, как и любой другой отказ
-    /// верификации: причину публичная ручка наружу не раскрывает.
+    /// Verifying a token with a `Host` outside the allowlist → 401, like any
+    /// other verification refusal: a public endpoint does not reveal the reason.
     #[actix_web::test]
     async fn verify_rejects_issuer_outside_allowlist() {
         let _guard = env_guard();
@@ -1259,10 +1281,10 @@ mod tests {
         let store = web::Data::new(MockStore::new());
         let app = test::init_service(token_app!(store)).await;
 
-        // Токен выпущен, пока ограничений не было...
+        // The token was issued while there were no constraints...
         let token = issue_token!(&app, "user1");
 
-        // ...а после включения аллоулиста его issuer стал чужим.
+        // ...and after the allowlist was enabled its issuer became foreign.
         env::set_var(crate::issuer::ALLOWLIST_VAR, "other.example.com");
         let req = test::TestRequest::post()
             .uri("/tokens/verify")
@@ -1275,8 +1297,8 @@ mod tests {
         env::remove_var(crate::issuer::ALLOWLIST_VAR);
     }
 
-    /// Проверка истёкшего токена → 401. `jti` в хранилище присутствует, чтобы
-    /// единственной причиной отказа был `exp` в прошлом.
+    /// Verifying an expired token → 401. The `jti` is present in the store so
+    /// that the only reason for the refusal is an `exp` in the past.
     #[actix_web::test]
     async fn verify_rejects_expired_token() {
         let _guard = env_guard();
@@ -1313,8 +1335,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Проверка токена с чужой подписью → 401. Токен подписан ключом атакующего,
-    /// но с тем же `kid`; публичный ключ из JWKS его не подтверждает.
+    /// Verifying a token with a foreign signature → 401. The token is signed
+    /// with the attacker's key but carries the same `kid`; the public key from
+    /// the JWKS does not confirm it.
     #[actix_web::test]
     async fn verify_rejects_forged_signature() {
         let _guard = env_guard();
@@ -1352,7 +1375,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Проверка синтаксически битого токена → 401 (без обращения к JWKS).
+    /// Verifying a syntactically corrupt token → 401 (without contacting the JWKS).
     #[actix_web::test]
     async fn verify_rejects_malformed_token() {
         let store = web::Data::new(MockStore::new());
@@ -1367,7 +1390,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Отзыв несуществующего `jti` идемпотентен → всегда 204.
+    /// Revoking a `jti` that does not exist is idempotent → always 204.
     #[actix_web::test]
     async fn revoke_unknown_jti_returns_204() {
         let store = web::Data::new(MockStore::new());
@@ -1382,9 +1405,9 @@ mod tests {
 
     #[actix_web::test]
     async fn revoke_reports_store_failure_instead_of_204() {
-        // Хранилище недоступно — отзыв не выполнен, и клиент обязан это узнать.
-        // Прежнее поведение (всегда `204`) означало, что вызывающий считал
-        // скомпрометированный токен погашенным и не повторял попытку.
+        // The store is unavailable — the revocation was not performed and the
+        // client must learn that. The previous behaviour (always `204`) meant
+        // the caller considered a compromised token killed and did not retry.
         let store = web::Data::new(UnavailableStore);
         let app = test::init_service(App::new().app_data(store).route(
             "/tokens/{jti}",
@@ -1410,7 +1433,7 @@ mod tests {
         let store = web::Data::new(MockStore::new());
         let app = test::init_service(token_app!(store.clone())).await;
 
-        // Три токена на одного субъекта и один — на другого.
+        // Three tokens for one subject and one for another.
         let mut tokens = Vec::new();
         for _ in 0..3 {
             tokens.push(issue_token!(&app, "victim"));
@@ -1426,11 +1449,11 @@ mod tests {
         let body: RevokeGroupResponse = test::read_body_json(resp).await;
         assert_eq!(body.revoked, 3);
 
-        // Токены субъекта больше не проходят проверку...
+        // The subject's tokens no longer pass verification...
         for token in &tokens {
             assert!(!store.check_jti(&jti_of(token)).await.unwrap());
         }
-        // ...а чужой не задет.
+        // ...while the other one is untouched.
         assert!(store.check_jti(&jti_of(&bystander)).await.unwrap());
     }
 
@@ -1449,13 +1472,13 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
 
-        // Нечего отзывать — это не ошибка.
+        // There is nothing to revoke — that is not an error.
         assert_eq!(resp.status(), StatusCode::OK);
         let body: RevokeGroupResponse = test::read_body_json(resp).await;
         assert_eq!(body.revoked, 0);
     }
 
-    /// Выпускает пару access + refresh через тестовое приложение.
+    /// Issues an access + refresh pair through the test application.
     macro_rules! issue_pair {
         ($app:expr, $sub:expr) => {{
             let req = test::TestRequest::post()
@@ -1466,12 +1489,12 @@ mod tests {
             let resp = test::call_service($app, req).await;
             assert_eq!(resp.status(), StatusCode::OK);
             let issued: TokenResponse = test::read_body_json(resp).await;
-            let refresh = issued.refresh_token.clone().expect("нет refresh-токена");
+            let refresh = issued.refresh_token.clone().expect("no refresh token");
             (issued.token, refresh)
         }};
     }
 
-    /// Обменивает refresh-токен, возвращая ответ целиком.
+    /// Exchanges a refresh token, returning the whole response.
     macro_rules! exchange {
         ($app:expr, $refresh:expr) => {{
             let req = test::TestRequest::post()
@@ -1501,7 +1524,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Контракт прежних клиентов не изменился: поля в ответе нет.
+        // The contract of existing clients has not changed: the field is absent from the response.
         let issued: TokenResponse = test::read_body_json(resp).await;
         assert!(issued.refresh_token.is_none());
     }
@@ -1518,14 +1541,14 @@ mod tests {
 
         let (_access, refresh) = issue_pair!(&app, "user1");
 
-        // Обмен выдаёт новую пару...
+        // The exchange hands out a new pair...
         let resp = exchange!(&app, &refresh);
         assert_eq!(resp.status(), StatusCode::OK);
         let refreshed: TokenResponse = test::read_body_json(resp).await;
-        let new_refresh = refreshed.refresh_token.expect("нет нового refresh-токена");
+        let new_refresh = refreshed.refresh_token.expect("no new refresh token");
         assert_ne!(new_refresh, refresh);
 
-        // ...а новый access-токен валиден.
+        // ...and the new access token is valid.
         let req = test::TestRequest::post()
             .uri("/tokens/verify")
             .insert_header(("Host", "example.com"))
@@ -1546,21 +1569,21 @@ mod tests {
 
         let (first_access, refresh) = issue_pair!(&app, "user1");
 
-        // Законный обмен.
+        // A legitimate exchange.
         let resp = exchange!(&app, &refresh);
         assert_eq!(resp.status(), StatusCode::OK);
         let refreshed: TokenResponse = test::read_body_json(resp).await;
-        let new_refresh = refreshed.refresh_token.expect("нет нового refresh-токена");
+        let new_refresh = refreshed.refresh_token.expect("no new refresh token");
 
-        // Повторное предъявление старого токена — сигнал кражи.
+        // Presenting the old token again is a sign of theft.
         let resp = exchange!(&app, &refresh);
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // Гасится вся семья: и выданные access-токены...
+        // The whole family is killed: the issued access tokens...
         assert!(!store.check_jti(&jti_of(&first_access)).await.unwrap());
         assert!(!store.check_jti(&jti_of(&refreshed.token)).await.unwrap());
 
-        // ...и refresh, выданный в законном обмене.
+        // ...and the refresh token handed out in the legitimate exchange.
         let resp = exchange!(&app, &new_refresh);
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1579,8 +1602,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Обмен refresh-токена — тот же выпуск, поэтому `Host` вне аллоулиста
-    /// отвергается так же явно (403), как и `POST /tokens`.
+    /// A refresh token exchange is issuing, so a `Host` outside the allowlist is
+    /// rejected just as explicitly (403) as for `POST /tokens`.
     #[actix_web::test]
     async fn refresh_rejects_issuer_outside_allowlist() {
         let _guard = env_guard();
@@ -1593,7 +1616,7 @@ mod tests {
 
         let (_access, refresh) = issue_pair!(&app, "user1");
 
-        // Макрос обмена ходит с `Host: example.com` — теперь он вне списка.
+        // The exchange macro sends `Host: example.com` — now outside the list.
         env::set_var(crate::issuer::ALLOWLIST_VAR, "other.example.com");
         let resp = exchange!(&app, &refresh);
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1626,9 +1649,10 @@ mod tests {
 
         let issued: TokenResponse = test::read_body_json(resp).await;
 
-        // Разбираем payload и проверяем, что claims лежат рядом с
-        // зарегистрированными — потребитель токена ищет `role`, не `extra.role`.
-        let payload = issued.token.split('.').nth(1).expect("нет сегмента claims");
+        // We parse the payload and check that the claims sit alongside the
+        // registered ones — the consumer of the token looks for `role`, not
+        // `extra.role`.
+        let payload = issued.token.split('.').nth(1).expect("no claims segment");
         let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
         let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
 
@@ -1647,7 +1671,7 @@ mod tests {
         let store = web::Data::new(MockStore::new());
         let app = test::init_service(token_app!(store)).await;
 
-        // Подмена `exp` позволила бы обойти границы TTL — ручка обязана отказать.
+        // Substituting `exp` would bypass the TTL bounds — the endpoint must refuse.
         let req = test::TestRequest::post()
             .uri("/tokens")
             .insert_header(("Host", "example.com"))
@@ -1672,14 +1696,14 @@ mod tests {
         let store = web::Data::new(MockStore::new());
         let app = test::init_service(token_app!(store)).await;
 
-        // Контракт прежних клиентов: без поля `claims` payload остаётся ровно
-        // таким, каким был до появления этой возможности.
+        // The contract of existing clients: without a `claims` field the payload
+        // stays exactly as it was before this feature appeared.
         let token = issue_token!(&app, "user1");
-        let payload = token.split('.').nth(1).expect("нет сегмента claims");
+        let payload = token.split('.').nth(1).expect("no claims segment");
         let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url");
         let value: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON");
 
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 7, "лишние поля в payload: {keys:?}");
+        assert_eq!(keys.len(), 7, "extra fields in the payload: {keys:?}");
     }
 }

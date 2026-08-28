@@ -1,32 +1,33 @@
-# AWS ALB / API Gateway — уровень 2 (proxy-secret)
+# AWS ALB / API Gateway — level 2 (the proxy secret)
 
-У ALB нет встроенной перезаписи заголовков, поэтому секрет инжектится там, где
-это возможно, и клиентская версия ОБЯЗАТЕЛЬНО отбрасывается.
+An ALB has no built-in header rewriting, so the secret is injected wherever that
+is possible and the client-supplied version MUST be dropped.
 
-## Вариант A — Application Load Balancer + правило листенера
-ALB умеет фиксированные заголовки ограниченно; на практике секрет ставят на
-уровне цели (target) или через фронтящий Lambda@Edge/CloudFront. Минимум:
-- Включите на ALB отбрасывание клиентского заголовка нельзя напрямую — поэтому
-  **не полагайтесь только на ALB**; ставьте секрет и чистку на CloudFront (см.
-  `cloudflare.md`-аналог) или в API Gateway ниже.
+## Option A — Application Load Balancer plus a listener rule
+An ALB supports fixed headers only to a limited degree; in practice the secret is
+set at the target level or through a CloudFront/Lambda@Edge front. At a minimum:
+- dropping the client-supplied header cannot be enabled on the ALB directly — so
+  **do not rely on the ALB alone**; set the secret and do the stripping on
+  CloudFront (see the `cloudflare.md` equivalent) or in API Gateway below.
 
-## Вариант B — API Gateway (HTTP API) + parameter mapping
-Parameter mapping для интеграции:
+## Option B — API Gateway (HTTP API) plus parameter mapping
+The parameter mapping for the integration:
 
 ```
-# (1) Удаляем клиентскую версию (overwrite пустым эквивалент удалению на бэкенд).
+# (1) Delete the client-supplied version (an overwrite is equivalent to a delete
+#     as far as the backend is concerned).
 overwrite:header.X-Proxy-Secret = ${stageVariables.ProxySecret}
 ```
 
-Где `ProxySecret` — stage variable, значение которой берётся из AWS Secrets
-Manager / SSM Parameter Store при деплое (через CloudFormation/Terraform),
-а НЕ хранится в открытом виде.
+Here `ProxySecret` is a stage variable whose value comes from AWS Secrets Manager
+/ SSM Parameter Store at deploy time (through CloudFormation/Terraform) and is
+NOT stored in the clear.
 
-`overwrite:header.*` заменяет значение целиком, поэтому клиентская версия
-заголовка гарантированно затирается секретом. Никогда не используйте
-`append:header.X-Proxy-Secret` — это оставит клиентское значение.
+`overwrite:header.*` replaces the value entirely, so the client-supplied version
+of the header is guaranteed to be overwritten by the secret. Never use
+`append:header.X-Proxy-Secret` — that leaves the client value in place.
 
-## Вариант C — REST API + Integration Request
-В маппинге интеграции задайте
+## Option C — REST API plus Integration Request
+In the integration mapping set
 `integration.request.header.X-Proxy-Secret = stageVariables.ProxySecret`.
-Значение из stage variable перезаписывает любой клиентский заголовок.
+The value from the stage variable overwrites any client-supplied header.

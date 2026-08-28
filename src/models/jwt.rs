@@ -1,16 +1,16 @@
-//! Низкоуровневое представление JWT: claims, заголовки, сборка и разбор токена.
+//! The low-level representation of a JWT: claims, headers, assembly and parsing.
 //!
-//! Ключевые типы:
-//! - [`TokenClaims`] — полезная нагрузка (`iss`, `sub`, `aud`, `exp`, ...);
-//! - [`TokenHeaders`] — заголовок JOSE (`alg`, `kid`, `typ`, опциональный `jku`);
-//! - [`JsonWebToken`] — обёртка над заголовком, claims и ключом; параметризована
-//!   типом ключа: `JsonWebToken<Private>` умеет подписывать
-//!   ([`JsonWebToken::to_string`]), `JsonWebToken<Public>` — разбирать и
-//!   проверять ([`JsonWebToken::from_string`]);
-//! - [`JtiStore`] — трейт хранилища идентификаторов токенов (реализуется
-//!   [`crate::redis::RedisClient`]).
+//! The key types:
+//! - [`TokenClaims`] — the payload (`iss`, `sub`, `aud`, `exp`, ...);
+//! - [`TokenHeaders`] — the JOSE header (`alg`, `kid`, `typ`, an optional `jku`);
+//! - [`JsonWebToken`] — a wrapper over the header, the claims and the key;
+//!   parameterised by the key type: `JsonWebToken<Private>` can sign
+//!   ([`JsonWebToken::to_string`]) and `JsonWebToken<Public>` can parse and
+//!   verify ([`JsonWebToken::from_string`]);
+//! - [`JtiStore`] — the trait of the token identifier store (implemented in
+//!   `redis.rs`).
 //!
-//! Кодирование сегментов — base64url без паддинга, как того требует JWS.
+//! The segments are encoded as base64url without padding, as JWS requires.
 
 use crate::key::{KeyManager, SUPPORTED_ALGORITHMS};
 use actix_web::web::Data;
@@ -28,8 +28,8 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// Читает `u64` из переменной окружения, откатываясь на `default` при её
-/// отсутствии или неразборчивом значении.
+/// Reads a `u64` from an environment variable, falling back to `default` when it
+/// is missing or unparsable.
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -45,107 +45,111 @@ pub enum JtiError {
     WrongOperation,
 }
 
-/// Хранилище идентификаторов токенов (`jti`).
+/// The token identifier (`jti`) store.
 ///
-/// Абстрагирует бэкенд (в проекте — Redis) от доменной логики. Наличие `jti` в
-/// хранилище означает, что токен «активен»: при выпуске `jti` записывается с
-/// TTL, при отзыве — удаляется, при проверке — проверяется на существование.
+/// It abstracts the backend (Redis in this project) away from the domain logic.
+/// The presence of a `jti` in the store means the token is "active": on issue
+/// the `jti` is written with a TTL, on revocation it is deleted, and on
+/// verification its existence is checked.
 ///
-/// Трейт покрывает **всё**, что HTTP-слою нужно от хранилища, включая
-/// readiness-пробу ([`JtiStore::ping`]): иначе `/readyz` ходил бы в конкретный
-/// бэкенд напрямую, и шов протекал бы ровно в том месте, где его удобнее всего
-/// не заметить.
+/// The trait covers **everything** the HTTP layer needs from the store, the
+/// readiness probe included ([`JtiStore::ping`]): otherwise `/readyz` would talk
+/// to a concrete backend directly and the seam would leak in exactly the place
+/// where it is easiest to miss.
 ///
-/// `where Self: Sized` здесь не нужен: `async fn` в трейте и так делает трейт
-/// не объектно-безопасным, а хранилище всюду берётся по статическому типу
-/// (`web::Data<S>`), не через `dyn`.
+/// `where Self: Sized` is not needed here: an `async fn` in a trait already
+/// makes the trait non-object-safe, and the store is always taken by static type
+/// (`web::Data<S>`), never through `dyn`.
 pub trait JtiStore {
-    /// Проверяет доступность хранилища (readiness-проба `GET /readyz`).
+    /// Checks that the store is available (the `GET /readyz` readiness probe).
     ///
-    /// Ошибка означает «обслуживать запросы нельзя»: без хранилища не проверить
-    /// `jti`, то есть отозванный токен стал бы валидным.
+    /// An error means "we cannot serve requests": without the store the `jti`
+    /// cannot be checked, so a revoked token would become valid.
     async fn ping(&self) -> Result<(), JtiError>;
-    /// Сохраняет `jti` со временем жизни `ttl` (в секундах).
+    /// Stores a `jti` with a lifetime of `ttl` (in seconds).
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError>;
-    /// Возвращает `true`, если `jti` присутствует (токен не отозван и не истёк).
+    /// Returns `true` when the `jti` is present (the token is neither revoked nor expired).
     async fn check_jti(&self, jti: &str) -> Result<bool, JtiError>;
-    /// Удаляет `jti` (отзыв токена). Идемпотентна.
+    /// Deletes the `jti` (revoking a token). Idempotent.
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError>;
-    /// Привязывает `jti` к группе; `expires_at` — unix-время истечения токена.
+    /// Binds a `jti` to a group; `expires_at` is the Unix time the token expires.
     ///
-    /// Группа нужна, чтобы гасить токены пачкой. Ключ группы формирует
-    /// вызывающий (см. [`subject_group`]) — само хранилище о его смысле не знает.
+    /// The group exists so that tokens can be killed in batches. The group key
+    /// is formed by the caller (see [`subject_group`]) — the store itself knows
+    /// nothing about its meaning.
     async fn add_to_group(&self, group: &str, jti: &str, expires_at: i64) -> Result<(), JtiError>;
-    /// Отзывает все токены группы и саму группу. Возвращает число отозванных.
+    /// Revokes every token of a group and the group itself. Returns the number revoked.
     ///
-    /// Идемпотентна: для несуществующей группы возвращает `0`.
+    /// Idempotent: for a group that does not exist it returns `0`.
     async fn revoke_group(&self, group: &str) -> Result<u64, JtiError>;
-    /// Сохраняет запись refresh-токена со временем жизни `ttl` (в секундах).
+    /// Stores a refresh token record with a lifetime of `ttl` (in seconds).
     async fn store_refresh(
         &self,
         id: &str,
         record: &RefreshRecord,
         ttl: u64,
     ) -> Result<(), JtiError>;
-    /// Читает запись refresh-токена. `None` — записи нет (истекла или отозвана).
+    /// Reads a refresh token record. `None` means there is no record (it expired or was revoked).
     async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError>;
-    /// Помечает refresh-токен использованным.
+    /// Marks a refresh token as used.
     ///
-    /// Возвращает `true`, если пометка проставлена именно этим вызовом, и
-    /// `false`, если токен уже был использован раньше. Операция обязана быть
-    /// **атомарной**: на ней держится и детектор повторного использования, и
-    /// защита от гонки двух одновременных обменов одним токеном.
+    /// Returns `true` when the mark was set by this very call and `false` when
+    /// the token had already been used. The operation must be **atomic**: both
+    /// the reuse detector and the protection against a race between two
+    /// simultaneous exchanges of one token rest on it.
     async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError>;
-    /// Резервирует одноразовый TOTP-код на время `ttl` (в секундах).
+    /// Reserves a one-time TOTP code for `ttl` (in seconds).
     ///
-    /// Возвращает `true`, если код зарезервирован именно этим вызовом, и
-    /// `false`, если он уже предъявлялся — то есть это повтор.
+    /// Returns `true` when the code was reserved by this very call and `false`
+    /// when it had been presented already — that is, this is a replay.
     ///
-    /// Как и [`JtiStore::mark_refresh_used`], операция обязана быть **атомарной**
-    /// (`SET NX`): на ней держится защита от переигрывания кода.
+    /// Like [`JtiStore::mark_refresh_used`], the operation must be **atomic**
+    /// (`SET NX`): replay protection rests on it.
     async fn claim_totp_code(&self, hash: &str, ttl: u64) -> Result<bool, JtiError>;
 }
 
-/// Ключ зарезервированного TOTP-кода в хранилище.
+/// The store key of a reserved TOTP code.
 pub fn totp_code_key(hash: &str) -> String {
     format!("totp:used:{hash}")
 }
 
-/// Ключ группы токенов, выпущенных на субъект.
+/// The key of the group of tokens issued for a subject.
 ///
-/// Вынесено в функцию не ради красоты: тот же механизм групп переиспользует
-/// отзыв семьи refresh-токенов ([`family_group`]), поэтому хранилище оперирует
-/// абстрактным ключом, а смысл группы задаёт вызывающий. Префикс отделяет группы
-/// от плоских ключей-`jti`.
+/// Extracted into a function for a reason: the same group mechanism is reused by
+/// the revocation of a refresh token family ([`family_group`]), so the store
+/// operates on an abstract key while the caller supplies the meaning of the
+/// group. The prefix separates groups from flat `jti` keys.
 pub fn subject_group(subject: &str) -> String {
     format!("group:sub:{subject}")
 }
 
-/// Ключ группы одной семьи refresh-токенов.
+/// The key of the group of one refresh token family.
 ///
-/// В группу попадают и `jti` выданных access-токенов, и ключи самих
-/// refresh-записей — поэтому один `revoke_group` гасит всю цепочку целиком.
+/// The group holds both the `jti` values of the issued access tokens and the
+/// keys of the refresh records themselves — which is why a single `revoke_group`
+/// kills the whole chain.
 pub fn family_group(family: &str) -> String {
     format!("group:family:{family}")
 }
 
-/// Ключ записи refresh-токена в хранилище.
+/// The store key of a refresh token record.
 pub fn refresh_key(id: &str) -> String {
     format!("refresh:{id}")
 }
 
-/// Запись refresh-токена: всё, что нужно, чтобы выпустить по нему новый access.
+/// A refresh token record: everything needed to issue a new access token from it.
 ///
-/// Сам refresh-токен — непрозрачная случайная строка, а не JWT: его никто не
-/// разбирает и не проверяет по подписи, он лишь ключ к этой записи. Значит и
-/// утёкший токен бесполезен без хранилища, а отзыв мгновенен.
+/// The refresh token itself is an opaque random string rather than a JWT: nobody
+/// parses it or checks its signature, it is merely a key to this record. That
+/// also means a leaked token is useless without the store and revocation is
+/// instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshRecord {
-    /// Субъект, которому выдан токен.
+    /// The subject the token was issued to.
     pub subject: String,
-    /// Аудитория, с которой выпускаются access-токены цепочки.
+    /// The audience the access tokens of the chain are issued with.
     pub audience: Vec<String>,
-    /// Идентификатор семьи — общий для всей цепочки ротации.
+    /// The family identifier — shared by the whole rotation chain.
     pub family: String,
 }
 
@@ -167,54 +171,56 @@ pub enum JwtError {
     Serialization,
 }
 
-/// Полезная нагрузка токена (registered claims по RFC 7519).
+/// The token payload (the registered claims of RFC 7519).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
-    /// Issuer — издатель токена (из заголовка `Host`).
+    /// Issuer — who issued the token (from the `Host` header).
     pub iss: String,
-    /// Subject — субъект, о котором выдан токен.
+    /// Subject — whom the token was issued about.
     pub sub: String,
-    /// Audience — список получателей.
+    /// Audience — the list of recipients.
     pub aud: Vec<String>,
-    /// Expiration — момент истечения (Unix-время, секунды).
+    /// Expiration — the moment it expires (Unix time, seconds).
     pub exp: usize,
-    /// Issued At — момент выпуска.
+    /// Issued At — the moment of issue.
     pub iat: usize,
-    /// Not Before — момент, с которого токен действителен.
+    /// Not Before — the moment from which the token is valid.
     pub nbf: usize,
-    /// JWT ID — уникальный идентификатор (UUID v4), ключ в [`JtiStore`].
+    /// JWT ID — the unique identifier (a UUID v4), the key in [`JtiStore`].
     pub jti: String,
-    /// Произвольные claims, переданные клиентом (роли, scope, tenant и т.п.).
+    /// Arbitrary claims supplied by the client (roles, scope, tenant and so on).
     ///
-    /// `flatten` — потому что в JWT они должны лежать **рядом** с
-    /// зарегистрированными, а не во вложенном объекте: потребитель токена ищет
-    /// `role`, а не `extra.role`.
+    /// `flatten` because in a JWT they must sit **alongside** the registered
+    /// ones rather than in a nested object: the consumer of the token looks for
+    /// `role`, not `extra.role`.
     ///
-    /// Служебные имена сюда попасть не могут — их отбрасывает
-    /// [`validate_custom_claims`], иначе клиент подменил бы `exp` или `iss`.
+    /// Reserved names cannot get in here — [`validate_custom_claims`] rejects
+    /// them, or a client could substitute `exp` or `iss`.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
 }
 
-/// Имена claims, которые формирует сервис. Переопределять их клиенту нельзя.
+/// The claim names the service forms itself. A client may not override them.
 ///
-/// Подмена `exp` позволила бы обойти границы `TOKEN_TTL_MIN/MAX_SECONDS`, а
-/// подмена `iss` или `sub` — выпустить токен от чужого имени.
+/// Substituting `exp` would allow bypassing the `TOKEN_TTL_MIN/MAX_SECONDS`
+/// bounds, and substituting `iss` or `sub` would allow issuing a token under
+/// someone else's name.
 pub const RESERVED_CLAIMS: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "jti"];
 
-/// Проверяет набор пользовательских claims перед выпуском токена.
+/// Validates the set of custom claims before a token is issued.
 ///
 /// # Errors
-/// [`JwtError::UnprocessableEntity`], если claims:
-/// - переопределяют служебное имя (см. [`RESERVED_CLAIMS`]);
-/// - превышают лимит по числу ключей (`TOKEN_CLAIMS_MAX_COUNT`);
-/// - превышают лимит по объёму в байтах (`TOKEN_CLAIMS_MAX_BYTES`).
+/// [`JwtError::UnprocessableEntity`] when the claims:
+/// - override a reserved name (see [`RESERVED_CLAIMS`]);
+/// - exceed the limit on the number of keys (`TOKEN_CLAIMS_MAX_COUNT`);
+/// - exceed the size limit in bytes (`TOKEN_CLAIMS_MAX_BYTES`).
 ///
-/// Лимиты нужны не из вредности: токен ездит в заголовках HTTP, и раздутый
-/// payload ломает прокси с их ограничением на размер заголовка.
+/// The limits are not there out of spite: a token travels in HTTP headers, and a
+/// bloated payload breaks proxies with their header size limits.
 ///
-/// Содержимое claims **не логируется** — там бывают персональные данные; в лог
-/// уходит только имя конфликтующего ключа либо сам факт превышения лимита.
+/// The contents of the claims are **never logged** — they may contain personal
+/// data; only the name of the conflicting key or the fact that a limit was
+/// exceeded reaches the log.
 pub fn validate_custom_claims(claims: &Map<String, Value>) -> Result<(), JwtError> {
     if claims.is_empty() {
         return Ok(());
@@ -222,18 +228,14 @@ pub fn validate_custom_claims(claims: &Map<String, Value>) -> Result<(), JwtErro
 
     let max_count = env_u64("TOKEN_CLAIMS_MAX_COUNT", 32) as usize;
     if claims.len() > max_count {
-        debug!(
-            "Слишком много пользовательских claims: {} > {}",
-            claims.len(),
-            max_count
-        );
+        debug!("Too many custom claims: {} > {}", claims.len(), max_count);
         return Err(JwtError::UnprocessableEntity);
     }
 
     for name in claims.keys() {
         if RESERVED_CLAIMS.contains(&name.as_str()) {
-            // Имя ключа логировать безопасно, значение — нет.
-            debug!("Попытка переопределить служебный claim: {}", name);
+            // Logging the key name is safe, the value is not.
+            debug!("Attempt to override a reserved claim: {}", name);
             return Err(JwtError::UnprocessableEntity);
         }
     }
@@ -245,7 +247,7 @@ pub fn validate_custom_claims(claims: &Map<String, Value>) -> Result<(), JwtErro
 
     if size > max_bytes {
         debug!(
-            "Пользовательские claims слишком объёмные: {} > {} байт",
+            "Custom claims are too large: {} > {} bytes",
             size, max_bytes
         );
         return Err(JwtError::UnprocessableEntity);
@@ -255,27 +257,29 @@ pub fn validate_custom_claims(claims: &Map<String, Value>) -> Result<(), JwtErro
 }
 
 impl TokenClaims {
-    /// Формирует новый набор claims и регистрирует `jti` в хранилище.
+    /// Forms a new set of claims and registers the `jti` in the store.
     ///
-    /// Время жизни определяется аргументом `ttl` (секунды): если он задан,
-    /// используется он (после проверки границ), иначе — `TOKEN_EXPIRATION_SECONDS`
-    /// (по умолчанию `3600`). На его основе вычисляются `exp` и TTL записи в
-    /// хранилище — они всегда совпадают. `jti` генерируется как UUID v4.
+    /// The lifetime is decided by the `ttl` argument (seconds): when it is set,
+    /// it is used (after a bounds check), otherwise `TOKEN_EXPIRATION_SECONDS`
+    /// (`3600` by default). `exp` and the TTL of the store record are computed
+    /// from it and always match. The `jti` is generated as a UUID v4.
     ///
-    /// Границы кастомного `ttl` задаются `TOKEN_TTL_MIN_SECONDS` (по умолчанию
-    /// `1`) и `TOKEN_TTL_MAX_SECONDS` (по умолчанию `86400`).
+    /// The bounds of a custom `ttl` come from `TOKEN_TTL_MIN_SECONDS` (`1` by
+    /// default) and `TOKEN_TTL_MAX_SECONDS` (`86400` by default).
     ///
     /// # Errors
-    /// - [`JwtError::UnprocessableEntity`] — пустой `audience`, невалидное
-    ///   значение `TOKEN_EXPIRATION_SECONDS` или кастомный `ttl` вне границ
+    /// - [`JwtError::UnprocessableEntity`] — an empty `audience`, an invalid
+    ///   `TOKEN_EXPIRATION_SECONDS` value or a custom `ttl` outside
     ///   `[TOKEN_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS]`;
-    /// - [`JwtError::StoreError`] — не удалось записать `jti` в хранилище либо
-    ///   сформированные claims не прошли самопроверку [`TokenClaims::is_verify`].
+    /// - [`JwtError::StoreError`] — the `jti` could not be written to the store,
+    ///   or the resulting claims failed their own [`TokenClaims::is_verify`]
+    ///   check.
     ///
-    /// # Замечание
-    /// Выпуск устроен по принципу fail-fast: если `jti` не удалось сохранить в
-    /// хранилище, токен **не** отдаётся ([`JwtError::StoreError`]) — это гарантирует
-    /// консистентность с последующей проверкой (`is_verify` требует наличия `jti`).
+    /// # Note
+    /// Issuing is fail-fast: when the `jti` could not be stored, the token is
+    /// **not** handed out ([`JwtError::StoreError`]) — that is what guarantees
+    /// consistency with the later verification (`is_verify` requires the `jti`
+    /// to be present).
     pub async fn create_new<T: JtiStore>(
         issuer: &str,
         subject: &str,
@@ -284,8 +288,8 @@ impl TokenClaims {
         extra: Map<String, Value>,
         store: Data<T>,
     ) -> Result<Self, JwtError> {
-        // Проверяем до всякой работы: смысла ходить в хранилище за `jti`, если
-        // claims всё равно отвергнем, нет.
+        // Checked before any work: there is no point going to the store for a
+        // `jti` if the claims will be rejected anyway.
         validate_custom_claims(&extra)?;
 
         let expiration_seconds = match ttl {
@@ -294,7 +298,7 @@ impl TokenClaims {
                 let max = env_u64("TOKEN_TTL_MAX_SECONDS", 86400);
 
                 if requested < min || requested > max {
-                    // Вина клиента (отдаём 422) — не повод для ERROR в проде.
+                    // The client's fault (we return 422) — no reason for an ERROR in production.
                     debug!(
                         "Requested ttl {} out of bounds [{}, {}]",
                         requested, min, max
@@ -310,8 +314,8 @@ impl TokenClaims {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    // Некорректная конфигурация сервиса — деградация, не отказ
-                    // зависимости.
+                    // Invalid service configuration — degradation, not a
+                    // dependency failure.
                     warn!("TOKEN_EXPIRATION_SECONDS: {}", e);
                     return Err(JwtError::UnprocessableEntity);
                 }
@@ -327,9 +331,9 @@ impl TokenClaims {
 
         let jti = Uuid::new_v4().to_string();
 
-        // Fail-fast: если `jti` не записался в хранилище, токен выпускать нельзя —
-        // иначе его последующая проверка провалится (jti отсутствует → считается
-        // отозванным). Пробрасываем ошибку наверх, обработчик вернёт 500.
+        // Fail-fast: when the `jti` was not written to the store the token must
+        // not be issued — its later verification would fail (a missing jti means
+        // revoked). We propagate the error and the handler returns 500.
         store
             .store_jti(&jti, expiration_seconds)
             .await
@@ -338,14 +342,15 @@ impl TokenClaims {
                 JwtError::StoreError
             })?;
 
-        // Индекс для массового отзыва — тоже fail-fast, и по той же причине, что
-        // и сам `jti`: токен, не попавший в индекс, переживёт отзыв всех токенов
-        // субъекта. Тихо выпустить такой токен опаснее, чем не выпустить вовсе.
+        // The index for bulk revocation is fail-fast too, for the same reason as
+        // the `jti` itself: a token that did not reach the index would survive a
+        // revocation of all of the subject's tokens. Issuing such a token
+        // silently is more dangerous than not issuing one at all.
         store
             .add_to_group(&subject_group(subject), &jti, exp.timestamp())
             .await
             .map_err(|e| {
-                error!("JTI Store (индекс субъекта): {}", e);
+                error!("JTI Store (subject index): {}", e);
                 JwtError::StoreError
             })?;
 
@@ -367,18 +372,18 @@ impl TokenClaims {
         Ok(jwt)
     }
 
-    /// Декодирует claims из base64url-сегмента токена.
+    /// Decodes claims from a base64url token segment.
     ///
     /// # Errors
-    /// [`JwtError::Broken`] — сегмент не является корректным base64url, не
-    /// декодируется в UTF-8 или не парсится как JSON claims.
+    /// [`JwtError::Broken`] — the segment is not valid base64url, does not
+    /// decode as UTF-8 or does not parse as JSON claims.
     pub fn from_base64(str: String) -> Result<Self, JwtError> {
-        // Битый токен присылает клиент — это DEBUG, а не ERROR: в проде такие
-        // события нормальны и не должны поднимать алерты.
+        // A corrupt token comes from the client — that is DEBUG, not ERROR: in
+        // production such events are normal and must not raise alerts.
         let bytes = match BASE64_URL_SAFE_NO_PAD.decode(str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                debug!("Claims: base64url не декодируется: {}", e);
+                debug!("Claims: base64url does not decode: {}", e);
                 return Err(JwtError::Broken);
             }
         };
@@ -386,7 +391,7 @@ impl TokenClaims {
         let json = match String::from_utf8(bytes) {
             Ok(string) => string,
             Err(e) => {
-                debug!("Claims: не UTF-8: {}", e);
+                debug!("Claims: not UTF-8: {}", e);
                 return Err(JwtError::Broken);
             }
         };
@@ -394,21 +399,20 @@ impl TokenClaims {
         match serde_json::from_str(&json) {
             Ok(jwt) => Ok(jwt),
             Err(e) => {
-                debug!("Claims: не разбирается как JSON: {}", e);
+                debug!("Claims: does not parse as JSON: {}", e);
                 Err(JwtError::Broken)
             }
         }
     }
 
-    /// Проверяет claims относительно ожидаемых `issuer`/`audience` и текущего
-    /// времени, а также наличие `jti` в хранилище.
+    /// Validates the claims against the expected `issuer`/`audience` and the
+    /// current time, and checks that the `jti` is in the store.
     ///
-    /// Возвращает `true`, только если совпал `iss`, `audience` входит в `aud`,
-    /// выполнены временные границы (`nbf <= now`, `iat <= now`, `exp > now`) и
-    /// `jti` найден в [`JtiStore`].
+    /// Returns `true` only when `iss` matched, `audience` is in `aud`, the time
+    /// bounds hold (`nbf <= now`, `iat <= now`, `exp > now`) and the `jti` was
+    /// found in the [`JtiStore`].
     ///
-    /// Ошибка обращения к хранилищу логируется и трактуется как «не валиден»
-    /// (возвращается `false`).
+    /// A store error is logged and treated as "not valid" (`false` is returned).
     pub async fn is_verify<T: JtiStore>(
         &self,
         issuer: &str,
@@ -436,11 +440,11 @@ impl TokenClaims {
         }
     }
 
-    /// Сериализует claims в JSON-строку.
+    /// Serialises the claims into a JSON string.
     ///
     /// # Errors
-    /// [`JwtError::Serialization`] — сериализация не удалась (практически
-    /// недостижимо для этого типа).
+    /// [`JwtError::Serialization`] — serialisation failed (practically
+    /// unreachable for this type).
     pub fn to_json(&self) -> Result<String, JwtError> {
         serde_json::to_string(self).map_err(|e| {
             error!("{}", e);
@@ -448,34 +452,34 @@ impl TokenClaims {
         })
     }
 
-    /// Кодирует claims в base64url-сегмент (JSON → base64url без паддинга).
+    /// Encodes the claims into a base64url segment (JSON → base64url without padding).
     ///
     /// # Errors
-    /// [`JwtError::Serialization`] — не удалось сериализовать claims в JSON.
+    /// [`JwtError::Serialization`] — the claims could not be serialised to JSON.
     pub fn to_base64(&self) -> Result<String, JwtError> {
         Ok(BASE64_URL_SAFE_NO_PAD.encode(self.to_json()?))
     }
 }
 
-/// Заголовок токена (JOSE header).
+/// The token header (the JOSE header).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenHeaders {
-    /// Алгоритм подписи (`RS256`, `ES256`, `EdDSA`, ...).
+    /// The signature algorithm (`RS256`, `ES256`, `EdDSA`, ...).
     alg: String,
-    /// Идентификатор ключа, которым подписан токен.
+    /// The identifier of the key the token is signed with.
     kid: String,
-    /// Тип токена; всегда `"JWT"`.
+    /// The token type; always `"JWT"`.
     typ: String,
-    /// JWK Set URL — не сериализуется, если не задан (`TOKEN_JKU`).
+    /// The JWK Set URL — not serialised when unset (`TOKEN_JKU`).
     #[serde(skip_serializing_if = "Option::is_none")]
     jku: Option<String>,
 }
 
 impl TokenHeaders {
-    /// Создаёт заголовок для нового токена.
+    /// Builds the header for a new token.
     ///
-    /// `alg` берётся из `TOKEN_ALGORITHM` (по умолчанию `RS256`), `jku` —
-    /// из необязательной `TOKEN_JKU`, `kid` передаётся из менеджера ключей.
+    /// `alg` comes from `TOKEN_ALGORITHM` (`RS256` by default), `jku` from the
+    /// optional `TOKEN_JKU`, and `kid` is passed in by the key manager.
     pub fn create_new(kid: String) -> Self {
         let jku = env::var("TOKEN_JKU").ok();
 
@@ -489,44 +493,44 @@ impl TokenHeaders {
         }
     }
 
-    /// Декодирует заголовок из base64url-сегмента токена.
+    /// Decodes the header from a base64url token segment.
     ///
     /// # Errors
-    /// [`JwtError::Broken`] — сегмент не является корректным base64url, не
-    /// декодируется в UTF-8 или не парсится как JSON-заголовок.
+    /// [`JwtError::Broken`] — the segment is not valid base64url, does not
+    /// decode as UTF-8 or does not parse as a JSON header.
     pub fn from_base64(str: String) -> Result<Self, JwtError> {
-        // Как и у claims: битый заголовок — вина клиента, уровень DEBUG.
+        // As with the claims: a corrupt header is the client's fault, DEBUG level.
         let bytes = BASE64_URL_SAFE_NO_PAD.decode(str).map_err(|e| {
-            debug!("Header: base64url не декодируется: {}", e);
+            debug!("Header: base64url does not decode: {}", e);
             JwtError::Broken
         })?;
 
         let json = String::from_utf8(bytes).map_err(|e| {
-            debug!("Header: не UTF-8: {}", e);
+            debug!("Header: not UTF-8: {}", e);
             JwtError::Broken
         })?;
 
         serde_json::from_str(&json).map_err(|e| {
-            debug!("Header: не разбирается как JSON: {}", e);
+            debug!("Header: does not parse as JSON: {}", e);
             JwtError::Broken
         })
     }
 
-    /// Проверяет корректность заголовка при верификации токена.
+    /// Validates the header while verifying a token.
     ///
-    /// Требует, чтобы `alg` был из [`SUPPORTED_ALGORITHMS`], `typ` был `"JWT"`,
-    /// а `jku` совпадал с текущей конфигурацией (`TOKEN_JKU`).
+    /// It requires `alg` to be one of [`SUPPORTED_ALGORITHMS`], `typ` to be
+    /// `"JWT"` and `jku` to match the current configuration (`TOKEN_JKU`).
     pub fn is_verify(&self) -> bool {
         let jku = env::var("TOKEN_JKU").ok();
 
         SUPPORTED_ALGORITHMS.contains(&self.alg.as_str()) && self.jku == jku && self.typ == "JWT"
     }
 
-    /// Сериализует заголовок в JSON-строку.
+    /// Serialises the header into a JSON string.
     ///
     /// # Errors
-    /// [`JwtError::Serialization`] — сериализация не удалась (практически
-    /// недостижимо для этого типа).
+    /// [`JwtError::Serialization`] — serialisation failed (practically
+    /// unreachable for this type).
     pub fn to_json(&self) -> Result<String, JwtError> {
         serde_json::to_string(self).map_err(|e| {
             error!("{}", e);
@@ -534,20 +538,20 @@ impl TokenHeaders {
         })
     }
 
-    /// Кодирует заголовок в base64url-сегмент.
+    /// Encodes the header into a base64url segment.
     ///
     /// # Errors
-    /// [`JwtError::Serialization`] — не удалось сериализовать заголовок в JSON.
+    /// [`JwtError::Serialization`] — the header could not be serialised to JSON.
     pub fn to_base64(&self) -> Result<String, JwtError> {
         Ok(BASE64_URL_SAFE_NO_PAD.encode(self.to_json()?))
     }
 }
 
-/// Токен целиком: заголовок, claims и ключ.
+/// The whole token: the header, the claims and the key.
 ///
-/// Параметр `T` — тип ключа OpenSSL: [`Private`] для выпуска (подпись),
-/// [`Public`] для проверки. Соответствующие операции реализованы в отдельных
-/// `impl`-блоках.
+/// The `T` parameter is the OpenSSL key type: [`Private`] for issuing (signing)
+/// and [`Public`] for verification. The corresponding operations are implemented
+/// in separate `impl` blocks.
 #[derive(Debug, Clone)]
 pub struct JsonWebToken<T> {
     pub headers: TokenHeaders,
@@ -556,7 +560,7 @@ pub struct JsonWebToken<T> {
 }
 
 impl JsonWebToken<Private> {
-    /// Собирает токен из готовых заголовка, claims и приватного ключа.
+    /// Assembles a token from a ready header, claims and a private key.
     pub fn create_new(headers: TokenHeaders, claims: TokenClaims, key: PKey<Private>) -> Self {
         Self {
             headers,
@@ -565,21 +569,23 @@ impl JsonWebToken<Private> {
         }
     }
 
-    /// Сериализует и подписывает токен в форму `header.payload.signature`.
+    /// Serialises and signs the token into the `header.payload.signature` form.
     ///
-    /// Заголовок и claims кодируются в base64url, подпись считается по строке
-    /// `header.payload` приватным ключом и также кодируется в base64url.
+    /// The header and the claims are encoded as base64url, and the signature is
+    /// computed over the `header.payload` string with the private key and
+    /// encoded as base64url too.
     ///
-    /// Дайджест выбирается по `alg` **тем же образом, что и при проверке**
-    /// ([`JsonWebToken::from_string`]): `RS*`/`ES*` подписываются поверх
-    /// соответствующего SHA-2 (256/384/512), `EdDSA` — без явного дайджеста
-    /// (алгоритм задан самим ключом). Схемы подписи и проверки обязаны совпадать,
-    /// иначе выпущенный токен не пройдёт собственную верификацию.
+    /// The digest is chosen by `alg` **exactly as it is during verification**
+    /// ([`JsonWebToken::from_string`]): `RS*`/`ES*` are signed over the
+    /// corresponding SHA-2 (256/384/512) and `EdDSA` without an explicit digest
+    /// (the algorithm is determined by the key itself). The signing and
+    /// verification schemes must match, or an issued token would fail its own
+    /// verification.
     ///
     /// # Errors
-    /// - [`JwtError::Serialization`] — не удалось сериализовать заголовок/claims;
-    /// - [`JwtError::BadSignature`] — не удалось инициализировать `Signer` или
-    ///   вычислить подпись.
+    /// - [`JwtError::Serialization`] — the header or claims could not be serialised;
+    /// - [`JwtError::BadSignature`] — the `Signer` could not be initialised or
+    ///   the signature could not be computed.
     pub fn to_string(&self) -> Result<String, JwtError> {
         let headers = self.headers.to_base64()?;
         let claims = self.claims.to_base64()?;
@@ -608,20 +614,21 @@ impl JsonWebToken<Private> {
 }
 
 impl JsonWebToken<Public> {
-    /// Разбирает строковый токен и полностью его проверяет.
+    /// Parses a token string and verifies it fully.
     ///
-    /// Шаги:
-    /// 1. Разбивает токен на сегменты `header.payload.signature`.
-    /// 2. По `kid` из заголовка получает публичный ключ через
-    ///    [`KeyManager::get_public_key`].
-    /// 3. Выбирает дайджест по `alg` и проверяет подпись над `header.payload`.
-    /// 4. Валидирует заголовок ([`TokenHeaders::is_verify`]) и claims
-    ///    ([`TokenClaims::is_verify`]) относительно `issuer`/`audience`.
+    /// The steps:
+    /// 1. Split the token into the `header.payload.signature` segments.
+    /// 2. Fetch the public key by the `kid` from the header through
+    ///    [`KeyManager`].
+    /// 3. Choose the digest by `alg` and verify the signature over
+    ///    `header.payload`.
+    /// 4. Validate the header ([`TokenHeaders::is_verify`]) and the claims
+    ///    ([`TokenClaims::is_verify`]) against `issuer`/`audience`.
     ///
     /// # Errors
-    /// - [`JwtError::Broken`] — некорректная подпись в base64url;
-    /// - [`JwtError::BadSignature`] — подпись не сошлась или не построился verifier;
-    /// - [`JwtError::NotValid`] — заголовок или claims не прошли проверку.
+    /// - [`JwtError::Broken`] — an invalid base64url signature;
+    /// - [`JwtError::BadSignature`] — the signature did not match or the verifier could not be built;
+    /// - [`JwtError::NotValid`] — the header or the claims failed validation.
     pub async fn from_string<T: JtiStore>(
         token: &str,
         issuer: &str,
@@ -641,9 +648,10 @@ impl JsonWebToken<Public> {
         let key = match key_manager.get_public_key(headers.kid.as_str()).await {
             Ok(key) => key,
             Err(e) => {
-                // Причину (недоступность JWKS и т.п.) уже залогировал `key.rs` на
-                // своём уровне — здесь только исход проверки, без дубля ERROR.
-                debug!("Публичный ключ по kid не получен: {}", e);
+                // The cause (an unavailable JWKS and so on) was already logged by
+                // `key.rs` at its own level — here only the outcome of the check,
+                // without a duplicate ERROR.
+                debug!("Public key by kid not obtained: {}", e);
                 return Err(JwtError::BadSignature);
             }
         };
@@ -651,13 +659,13 @@ impl JsonWebToken<Public> {
         let signature_decoded = match URL_SAFE_NO_PAD.decode(signature_segment) {
             Ok(decoded) => decoded,
             Err(e) => {
-                debug!("Подпись: base64url не декодируется: {}", e);
+                debug!("Signature: base64url does not decode: {}", e);
                 return Err(JwtError::Broken);
             }
         };
 
-        // Verifier заимствует `key`, поэтому держим его в отдельной области —
-        // иначе `key` нельзя было бы переместить в возвращаемый токен.
+        // The verifier borrows `key`, so we keep it in a separate scope —
+        // otherwise `key` could not be moved into the returned token.
         let is_success = {
             let mut verifier = match headers.alg.as_str() {
                 "RS256" | "ES256" => Verifier::new(MessageDigest::sha256(), &key),
@@ -676,8 +684,8 @@ impl JsonWebToken<Public> {
                     format!("{}.{}", headers_segment, claims_segment).as_bytes(),
                 )
                 .map_err(|e| {
-                    // Чаще всего — некорректные байты подписи от клиента.
-                    debug!("Проверка подписи не выполнена: {}", e);
+                    // Most often these are invalid signature bytes from the client.
+                    debug!("Signature verification did not run: {}", e);
                     JwtError::BadSignature
                 })?
         };
@@ -702,13 +710,14 @@ impl JsonWebToken<Public> {
 
 #[cfg(test)]
 mod tests {
-    //! Тесты сборки/разбора JWT и проверки claims.
+    //! Tests of JWT assembly, parsing and claim validation.
     //!
-    //! Хранилище `jti` подменяется in-memory моком [`MockStore`] — Redis и сеть
-    //! не нужны. Полный round-trip проверки токена (`from_string`) требует
-    //! публичного ключа из `jwks-service-app`, поэтому здесь проверяется всё, что
-    //! от сети не зависит: жизненный цикл claims, кодирование сегментов и
-    //! корректность подписи, которую ставит [`JsonWebToken::to_string`].
+    //! The `jti` store is replaced by the in-memory [`MockStore`] — neither
+    //! Redis nor the network is needed. A full round trip of token verification
+    //! (`from_string`) requires a public key from `jwks-service-app`, so what is
+    //! checked here is everything that does not depend on the network: the life
+    //! cycle of the claims, the encoding of the segments and the correctness of
+    //! the signature [`JsonWebToken::to_string`] produces.
 
     use super::*;
     use openssl::ec::{EcGroup, EcKey};
@@ -719,15 +728,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex as StdMutex;
 
-    /// Блокировка окружения: лимиты claims читаются из переменных процесса, а
-    /// тесты бегут параллельно.
+    /// An environment lock: the claim limits are read from process variables
+    /// while the tests run in parallel.
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// In-memory реализация [`JtiStore`] для тестов.
+    /// An in-memory implementation of [`JtiStore`] for the tests.
     struct MockStore {
         jtis: Mutex<HashSet<String>>,
         groups: Mutex<HashMap<String, HashSet<String>>>,
@@ -828,8 +837,8 @@ mod tests {
         }
     }
 
-    /// [`JtiStore`], у которого запись `jti` всегда падает — имитирует
-    /// недоступный Redis для проверки fail-fast при выпуске.
+    /// A [`JtiStore`] whose `jti` write always fails — it simulates an
+    /// unavailable Redis to check fail-fast on issue.
     struct FailingStore;
 
     impl JtiStore for FailingStore {
@@ -884,11 +893,11 @@ mod tests {
         }
     }
 
-    /// [`JtiStore`], у которого падает ТОЛЬКО запись в индекс группы.
+    /// A [`JtiStore`] where ONLY the write into the group index fails.
     ///
-    /// Нужен, чтобы проверить fail-fast отдельно: сам `jti` записался, а индекс
-    /// для массового отзыва — нет. Такой токен пережил бы отзыв всех токенов
-    /// субъекта, поэтому выпускать его нельзя.
+    /// It exists to check fail-fast separately: the `jti` itself was written
+    /// while the index for bulk revocation was not. Such a token would survive a
+    /// revocation of all of the subject's tokens, so it must not be issued.
     struct FailingGroupStore {
         jtis: Mutex<HashSet<String>>,
     }
@@ -955,7 +964,7 @@ mod tests {
         }
     }
 
-    /// Заведомо валидные claims: выпущены «сейчас», живут ещё час.
+    /// Deliberately valid claims: issued "now", alive for another hour.
     fn sample_claims() -> TokenClaims {
         let now = Utc::now().timestamp() as usize;
         TokenClaims {
@@ -970,7 +979,7 @@ mod tests {
         }
     }
 
-    // --- Кодирование/декодирование сегментов ---
+    // --- Encoding and decoding the segments ---
 
     #[test]
     fn claims_base64_roundtrip() {
@@ -988,7 +997,7 @@ mod tests {
 
     #[test]
     fn claims_from_base64_rejects_invalid_base64() {
-        // '!' не входит в алфавит base64url — ошибка декодирования.
+        // '!' is not in the base64url alphabet — a decoding error.
         assert!(matches!(
             TokenClaims::from_base64("!!!not-base64!!!".to_string()),
             Err(JwtError::Broken)
@@ -997,7 +1006,7 @@ mod tests {
 
     #[test]
     fn claims_from_base64_rejects_non_json() {
-        // Валидный base64url, но за ним не JSON claims.
+        // Valid base64url, but what follows is not JSON claims.
         let payload = BASE64_URL_SAFE_NO_PAD.encode("just a string");
         assert!(matches!(
             TokenClaims::from_base64(payload),
@@ -1007,7 +1016,7 @@ mod tests {
 
     #[test]
     fn header_from_base64_rejects_invalid() {
-        // Битый base64url — раньше был бы panic, теперь Err(Broken).
+        // Corrupt base64url — this used to panic, now it is Err(Broken).
         assert!(matches!(
             TokenHeaders::from_base64("!!!not-base64!!!".to_string()),
             Err(JwtError::Broken)
@@ -1016,9 +1025,10 @@ mod tests {
 
     #[actix_web::test]
     async fn from_string_rejects_malformed_token() {
-        // Меньше трёх сегментов — раньше был бы panic на `parts.next().unwrap()`.
-        // Токен отбрасывается на разборе, до обращения к ключам, поэтому
-        // менеджер здесь нужен только для сигнатуры — в сеть он не ходит.
+        // Fewer than three segments — this used to panic on
+        // `parts.next().unwrap()`. The token is rejected during parsing, before
+        // the keys are touched, so the manager is only needed here for the
+        // signature — it never goes to the network.
         let store = Data::new(MockStore::new());
         let keys = KeyManager::new("RS256".to_string());
         let result =
@@ -1033,11 +1043,11 @@ mod tests {
 
         assert_eq!(decoded.kid, "kid-1");
         assert_eq!(decoded.typ, "JWT");
-        // alg по умолчанию RS256 (входит в SUPPORTED_ALGORITHMS), jku не задан.
+        // alg defaults to RS256 (which is in SUPPORTED_ALGORITHMS) and jku is unset.
         assert!(decoded.is_verify());
     }
 
-    // --- Проверка claims (iss/aud/nbf/iat/exp, jti) ---
+    // --- Claim validation (iss/aud/nbf/iat/exp, jti) ---
 
     #[actix_web::test]
     async fn is_verify_accepts_valid_claims() {
@@ -1075,7 +1085,7 @@ mod tests {
         let mut claims = sample_claims();
         claims.iat = now - 7200;
         claims.nbf = now - 7200;
-        claims.exp = now - 3600; // истёк час назад
+        claims.exp = now - 3600; // expired an hour ago
 
         assert!(!claims.is_verify("issuer", "api1", store).await);
     }
@@ -1087,21 +1097,21 @@ mod tests {
 
         let now = Utc::now().timestamp() as usize;
         let mut claims = sample_claims();
-        claims.nbf = now + 3600; // станет валиден только через час
+        claims.nbf = now + 3600; // becomes valid only in an hour
 
         assert!(!claims.is_verify("issuer", "api1", store).await);
     }
 
     #[actix_web::test]
     async fn is_verify_rejects_missing_jti() {
-        // Хранилище пустое: `jti` отозван/протух.
+        // The store is empty: the `jti` was revoked or expired.
         let store = Data::new(MockStore::new());
 
         let claims = sample_claims();
         assert!(!claims.is_verify("issuer", "api1", store).await);
     }
 
-    // --- Выпуск claims (create_new) ---
+    // --- Issuing claims (create_new) ---
 
     #[actix_web::test]
     async fn create_new_builds_valid_claims_and_stores_jti() {
@@ -1125,7 +1135,7 @@ mod tests {
         assert_eq!(claims.iat, claims.nbf);
         assert!(claims.exp > claims.iat);
         assert!(Uuid::parse_str(&claims.jti).is_ok());
-        // jti должен быть зарегистрирован в хранилище.
+        // The jti must be registered in the store.
         assert!(store.check_jti(&claims.jti).await.unwrap());
     }
 
@@ -1155,14 +1165,14 @@ mod tests {
         .unwrap();
         let after = Utc::now().timestamp() as usize;
 
-        // exp = iat + ttl, с поправкой на возможный сдвиг секунды при замере.
+        // exp = iat + ttl, allowing for a possible one-second shift while measuring.
         assert!(claims.exp >= before + 120 && claims.exp <= after + 120);
         assert_eq!(claims.exp, claims.iat + 120);
     }
 
     #[actix_web::test]
     async fn create_new_rejects_ttl_below_min() {
-        // Дефолтная нижняя граница — 1 секунда, значит 0 недопустим.
+        // The default lower bound is 1 second, so 0 is not allowed.
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
@@ -1174,7 +1184,7 @@ mod tests {
 
     #[actix_web::test]
     async fn create_new_rejects_ttl_above_max() {
-        // Дефолтная верхняя граница — 86400 секунд.
+        // The default upper bound is 86400 seconds.
         let store = Data::new(MockStore::new());
         let audience = vec!["api1".to_string()];
 
@@ -1192,7 +1202,7 @@ mod tests {
 
     #[actix_web::test]
     async fn create_new_fails_when_store_unavailable() {
-        // Redis недоступен: запись `jti` падает, токен выпускать нельзя (fail-fast).
+        // Redis is unavailable: the `jti` write fails and the token must not be issued (fail-fast).
         let store = Data::new(FailingStore);
         let audience = vec!["api1".to_string()];
 
@@ -1203,9 +1213,9 @@ mod tests {
 
     #[actix_web::test]
     async fn create_new_fails_when_group_index_unavailable() {
-        // Сам `jti` записался, а индекс субъекта — нет. Такой токен пережил бы
-        // массовый отзыв, поэтому выпускать его нельзя: fail-fast, как и при
-        // недоступной записи `jti`.
+        // The `jti` itself was written but the subject index was not. Such a
+        // token would survive a bulk revocation, so it must not be issued:
+        // fail-fast, exactly as with an unavailable `jti` write.
         let store = Data::new(FailingGroupStore::new());
         let audience = vec!["api1".to_string()];
 
@@ -1216,36 +1226,37 @@ mod tests {
 
     #[test]
     fn subject_group_is_namespaced() {
-        // Префикс отделяет группы от плоских ключей-`jti`, иначе субъект с
-        // именем-UUID мог бы совпасть с чужим идентификатором токена.
+        // The prefix separates groups from flat `jti` keys, or a subject named
+        // like a UUID could collide with someone else's token identifier.
         assert_eq!(subject_group("user1"), "group:sub:user1");
     }
 
-    // --- Подпись токена (JsonWebToken::to_string) ---
+    // --- Token signing (JsonWebToken::to_string) ---
 
     #[test]
     fn to_string_produces_verifiable_signature() {
-        // Ключ Ed25519: подпись/проверка без явного дайджеста — как в `to_string`.
+        // An Ed25519 key: signing and verification without an explicit digest — as in `to_string`.
         let private = PKey::generate_ed25519().unwrap();
         let public =
             PKey::public_key_from_raw_bytes(&private.raw_public_key().unwrap(), Id::ED25519)
                 .unwrap();
 
-        // `alg` задаётся явно, а не через `TokenHeaders::create_new`: тот читает
-        // `TOKEN_ALGORITHM` из окружения, и тест проходил лишь потому, что
-        // соседи успевали выставить там `EdDSA`. В одиночку он падал — ключ
-        // Ed25519 подписывался с дайджестом от дефолтного `RS256`.
+        // `alg` is set explicitly rather than through `TokenHeaders::create_new`:
+        // that one reads `TOKEN_ALGORITHM` from the environment, and the test
+        // used to pass only because the neighbours managed to set `EdDSA` there.
+        // On its own it failed — an Ed25519 key was signed with the digest of the
+        // default `RS256`.
         let headers = headers_with_alg("EdDSA");
         let claims = sample_claims();
         let jwt = JsonWebToken::create_new(headers, claims, private);
 
         let token = jwt.to_string().unwrap();
 
-        // Ровно три сегмента header.payload.signature.
+        // Exactly three segments: header.payload.signature.
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
 
-        // Подпись действительно покрывает "header.payload".
+        // The signature really does cover "header.payload".
         let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let mut verifier = Verifier::new_without_digest(&public).unwrap();
         let signed_data = format!("{}.{}", parts[0], parts[1]);
@@ -1253,15 +1264,15 @@ mod tests {
             .verify_oneshot(&signature, signed_data.as_bytes())
             .unwrap());
 
-        // Сегмент claims декодируется обратно без потерь.
+        // The claims segment decodes back without loss.
         let decoded_claims = TokenClaims::from_base64(parts[1].to_string()).unwrap();
         assert_eq!(decoded_claims.jti, "jti-1");
         assert_eq!(decoded_claims.iss, "issuer");
     }
 
-    // --- Согласованность подписи и проверки для всех алгоритмов (JWT-13) ---
+    // --- Consistency of signing and verification for every algorithm (JWT-13) ---
 
-    /// Генерирует пару (приватный, публичный) ключ, подходящую под `alg`.
+    /// Generates a (private, public) key pair suitable for `alg`.
     fn keypair_for(alg: &str) -> (PKey<Private>, PKey<Public>) {
         match alg {
             "RS256" | "RS384" | "RS512" => {
@@ -1298,12 +1309,13 @@ mod tests {
                 .unwrap();
                 (private, public)
             }
-            other => panic!("нет генератора ключа для alg {other} в тесте"),
+            other => panic!("no key generator for alg {other} in the test"),
         }
     }
 
-    /// Заголовок с явным `alg` — минует зависимость `create_new` от env
-    /// `TOKEN_ALGORITHM` (важно для параллельного прогона тестов).
+    /// A header with an explicit `alg` — it bypasses the dependency of
+    /// `create_new` on the `TOKEN_ALGORITHM` env var (which matters for a
+    /// parallel test run).
     fn headers_with_alg(alg: &str) -> TokenHeaders {
         TokenHeaders {
             alg: alg.to_string(),
@@ -1313,13 +1325,14 @@ mod tests {
         }
     }
 
-    /// Проверяет подпись токена ровно так же, как это делает
-    /// [`JsonWebToken::from_string`]: дайджест выбирается по `alg`. Это тот же
-    /// путь верификации, что и на боевом `POST /tokens/verify`, поэтому успешная
-    /// проверка здесь эквивалентна прохождению round-trip выпуск→проверка.
+    /// Verifies a token signature exactly the way
+    /// [`JsonWebToken::from_string`] does: the digest is chosen by `alg`. That is
+    /// the same verification path as on the production `POST /tokens/verify`, so
+    /// a successful check here is equivalent to passing an issue→verify round
+    /// trip.
     fn verify_signature(token: &str, alg: &str, public: &PKey<Public>) -> bool {
         let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3, "токен должен состоять из трёх сегментов");
+        assert_eq!(parts.len(), 3, "a token must consist of three segments");
 
         let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let signed = format!("{}.{}", parts[0], parts[1]);
@@ -1337,8 +1350,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Round-trip выпуск→проверка для дефолтного `RS256` (регресс на JWT-13:
-    /// раньше подпись ставилась без дайджеста и не проходила собственную проверку).
+    /// An issue→verify round trip for the default `RS256` (a regression test for
+    /// JWT-13: the signature used to be produced without a digest and failed its
+    /// own verification).
     #[test]
     fn sign_verify_roundtrip_rs256() {
         let (private, public) = keypair_for("RS256");
@@ -1348,7 +1362,7 @@ mod tests {
         assert!(verify_signature(&token, "RS256", &public));
     }
 
-    /// Round-trip выпуск→проверка для `ES256` (представитель семейства `ES*`).
+    /// An issue→verify round trip for `ES256` (a representative of the `ES*` family).
     #[test]
     fn sign_verify_roundtrip_es256() {
         let (private, public) = keypair_for("ES256");
@@ -1358,9 +1372,9 @@ mod tests {
         assert!(verify_signature(&token, "ES256", &public));
     }
 
-    /// Round-trip для **всех** алгоритмов из [`SUPPORTED_ALGORITHMS`]: подпись,
-    /// поставленная `to_string`, обязана сходиться с проверкой из `from_string`.
-    /// Именно рассогласование дайджестов было багом JWT-13.
+    /// A round trip for **every** algorithm in [`SUPPORTED_ALGORITHMS`]: the
+    /// signature produced by `to_string` must agree with the verification in
+    /// `from_string`. A digest mismatch was exactly the bug of JWT-13.
     #[test]
     fn sign_verify_roundtrip_all_supported_algorithms() {
         for &alg in SUPPORTED_ALGORITHMS {
@@ -1370,25 +1384,25 @@ mod tests {
 
             assert!(
                 verify_signature(&token, alg, &public),
-                "подпись {alg} не прошла проверку тем же дайджестом (рассогласование sign/verify)"
+                "the {alg} signature failed verification with the same digest (a sign/verify mismatch)"
             );
         }
     }
 
     #[test]
     fn custom_claims_reject_reserved_names() {
-        // Подмена `exp` обошла бы границы TTL, подмена `iss` или `sub` —
-        // позволила бы выпустить токен от чужого имени.
+        // Substituting `exp` would bypass the TTL bounds, and substituting `iss`
+        // or `sub` would allow issuing a token under someone else's name.
         for name in RESERVED_CLAIMS {
             let mut claims = Map::new();
-            claims.insert((*name).to_string(), Value::from("подмена"));
+            claims.insert((*name).to_string(), Value::from("substituted"));
 
             assert!(
                 matches!(
                     validate_custom_claims(&claims),
                     Err(JwtError::UnprocessableEntity)
                 ),
-                "служебный claim {name} обязан отклоняться"
+                "the reserved claim {name} must be rejected"
             );
         }
     }
@@ -1405,7 +1419,7 @@ mod tests {
 
     #[test]
     fn empty_custom_claims_are_allowed() {
-        // Пустой набор — самый частый случай: клиент про claims не знает.
+        // An empty set is the most common case: the client knows nothing about claims.
         assert!(validate_custom_claims(&Map::new()).is_ok());
     }
 
@@ -1433,8 +1447,8 @@ mod tests {
         env::set_var("TOKEN_CLAIMS_MAX_BYTES", "64");
 
         let mut claims = Map::new();
-        // Один ключ, но значение заведомо больше лимита: токен ездит в
-        // заголовках, и раздутый payload ломает прокси.
+        // One key, but a value deliberately larger than the limit: a token
+        // travels in headers and a bloated payload breaks proxies.
         claims.insert("blob".to_string(), Value::from("x".repeat(128)));
 
         assert!(matches!(
@@ -1455,11 +1469,11 @@ mod tests {
 
         let claims = TokenClaims::create_new("issuer", "subject", &audience, None, extra, store)
             .await
-            .expect("claims формируются");
+            .expect("the claims are formed");
 
-        // В сериализованном виде пользовательские claims лежат рядом с
-        // зарегистрированными, а не во вложенном объекте: потребитель ищет
-        // `role`, а не `extra.role`.
+        // In serialised form the custom claims sit alongside the registered ones
+        // rather than in a nested object: the consumer looks for `role`, not
+        // `extra.role`.
         let value = serde_json::to_value(&claims).unwrap();
         assert_eq!(value["role"], "admin");
         assert_eq!(value["sub"], "subject");

@@ -1,36 +1,36 @@
-name: Документация
-description: Ошибка, пробел или непонятное место в документации
+name: Documentation
+description: An error, a gap or an unclear passage in the documentation
 labels: ["documentation"]
 body:
   - type: markdown
     attributes:
       value: |
-        Если ответ на ваш вопрос пришлось искать по коду — это баг
-        документации, а не ваш. Заводите смело.
+        If you had to dig through the code to answer your question, that is a
+        documentation bug, not your fault. File it.
 
   - type: input
     id: where
     attributes:
-      label: Где
-      description: Файл и раздел или ссылка на строку.
-      placeholder: "AGENTS.md → Конфигурация, строка про JWKS_CACHE_STALE_GRACE_SECONDS"
+      label: Where
+      description: The file and section, or a link to the line.
+      placeholder: "AGENTS.md → Configuration, the JWKS_CACHE_STALE_GRACE_SECONDS row"
     validations:
       required: true
 
   - type: textarea
     id: problem
     attributes:
-      label: Что не так
+      label: What is wrong
       description: >-
-        Расходится с поведением сервиса, противоречит другому разделу,
-        неоднозначно читается или отсутствует вовсе.
+        It disagrees with how the service behaves, contradicts another section,
+        reads ambiguously, or is missing entirely.
     validations:
       required: true
 
   - type: textarea
     id: suggestion
     attributes:
-      label: Как правильно
-      description: Формулировка, если она у вас есть. Необязательно.
+      label: What it should say
+      description: The wording, if you have one. Optional.
     validations:
       required: false

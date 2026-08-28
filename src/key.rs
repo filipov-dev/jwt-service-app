@@ -1,13 +1,14 @@
-//! Управление криптографическими ключами.
+//! Cryptographic key management.
 //!
-//! [`KeyManager`] — тонкая обёртка над [`crate::jwk::JwkService`], которая:
-//! - получает приватный ключ для подписи (создавая новый через сервис, если
-//!   текущего нет) и декодирует его из PKCS#8;
-//! - реконструирует публичный ключ OpenSSL из компонентов JWK для проверки
-//!   подписи, поддерживая RSA, EC (P-256/384/521) и EdDSA (Ed25519/Ed448).
+//! [`KeyManager`] is a thin wrapper over [`crate::jwk::JwkService`] that:
+//! - obtains the private key for signing (creating a new one through the service
+//!   when there is none) and decodes it from PKCS#8;
+//! - reconstructs an OpenSSL public key from the JWK components for signature
+//!   verification, supporting RSA, EC (P-256/384/521) and EdDSA
+//!   (Ed25519/Ed448).
 //!
-//! Менеджер кэширует идентификатор текущего ключа (`current_key_id`) под
-//! `RwLock`, чтобы переиспользовать один ключ между запросами.
+//! The manager caches the identifier of the current key (`current_key_id`)
+//! behind an `RwLock` so that one key is reused across requests.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -24,14 +25,14 @@ use tracing::{debug, error};
 use crate::jwk::JwkService;
 use crate::models::{Jwk, JwkData};
 
-/// Алгоритмы подписи, поддерживаемые сервисом.
+/// Signature algorithms supported by the service.
 ///
-/// Используется при проверке заголовка токена ([`crate::models::jwt::TokenHeaders::is_verify`]).
+/// Used when checking the token header ([`crate::models::jwt::TokenHeaders::is_verify`]).
 pub const SUPPORTED_ALGORITHMS: &[&str] = &[
     "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA",
 ];
 
-/// Ошибки работы с ключами.
+/// Errors of key handling.
 #[derive(Error, Debug)]
 pub enum KeyError {
     #[error("Key not found")]
@@ -42,20 +43,21 @@ pub enum KeyError {
     Unsupported,
 }
 
-/// Менеджер ключей: источник приватного ключа для подписи и фабрика публичных
-/// ключей для проверки. Дёшево клонируется (общий `current_key_id` через `Arc`).
+/// The key manager: the source of the private signing key and a factory of
+/// public keys for verification. Cheap to clone (a shared `current_key_id`
+/// through an `Arc`).
 #[derive(Clone)]
 pub struct KeyManager {
-    /// Идентификатор текущего активного ключа; пуст до первого обращения.
+    /// Identifier of the currently active key; empty until the first call.
     current_key_id: Arc<RwLock<String>>,
-    /// Клиент сервиса ключей.
+    /// The key service client.
     service: JwkService,
-    /// Алгоритм подписи (из `TOKEN_ALGORITHM`), с которым создаются новые ключи.
+    /// Signature algorithm (from `TOKEN_ALGORITHM`) used when creating new keys.
     algorithm: String,
 }
 
 impl KeyManager {
-    /// Создаёт менеджер для указанного алгоритма подписи. Ключ ещё не запрошен.
+    /// Creates a manager for the given signature algorithm. No key is requested yet.
     pub fn new(algorithm: String) -> Self {
         Self {
             current_key_id: Arc::new(RwLock::new(String::new())),
@@ -64,33 +66,35 @@ impl KeyManager {
         }
     }
 
-    /// Проверяет доступность сервиса ключей для readiness-проверки (`GET /readyz`).
+    /// Checks that the key service is available, for the readiness probe
+    /// (`GET /readyz`).
     ///
-    /// Делегирует в [`JwkService::health_check`] — запрашивает публичные ключи
-    /// (`GET /.well-known/jwks.json`).
+    /// Delegates to [`JwkService::health_check`] — it requests the public keys.
     ///
     /// # Errors
-    /// [`KeyError::NotFound`] — сервис ключей недоступен или вернул некорректный ответ.
+    /// [`KeyError::NotFound`] — the key service is unavailable or returned an
+    /// invalid response.
     pub async fn check_jwks(&self) -> Result<(), KeyError> {
-        // Причину уже залогировал `jwk.rs` на уровне ERROR — здесь без дубля.
+        // The cause was already logged by `jwk.rs` at ERROR level — no duplicate here.
         self.service.health_check().await.map_err(|e| {
-            debug!("Проверка JWKS не прошла: {}", e);
+            debug!("JWKS check failed: {}", e);
             KeyError::NotFound
         })
     }
 
-    /// Есть ли в памяти снимок JWKS, которым ещё можно обслуживать верификацию.
+    /// Whether memory holds a JWKS snapshot still usable for verification.
     ///
-    /// Ответ на вопрос readiness-пробы «сможем ли мы проверить токен прямо
-    /// сейчас», когда живой запрос к сервису ключей не прошёл: пока снимок
-    /// пригоден, `POST /tokens/verify` работает и выводить под из балансировки
-    /// не за что.
+    /// This answers the readiness probe's question "can we verify a token right
+    /// now" when a live request to the key service failed: while the snapshot is
+    /// usable, `POST /tokens/verify` works and there is no reason to take the
+    /// pod out of the load balancer.
     pub fn has_servable_jwks_snapshot(&self) -> bool {
         self.service.has_servable_snapshot()
     }
 
-    /// Получает данные текущего ключа (с приватной частью), при необходимости
-    /// создавая новый через сервис, и обновляет кэш `current_key_id`.
+    /// Obtains the data of the current key (with its private part), creating a
+    /// new one through the service when needed, and updates the
+    /// `current_key_id` cache.
     async fn get_jwk_data(&self) -> Result<JwkData, KeyError> {
         let key_id = self.current_key_id.read().clone();
 
@@ -101,8 +105,8 @@ impl KeyManager {
         {
             Ok(v) => v,
             Err(e) => {
-                // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
-                debug!("Приватный ключ не получен: {}", e);
+                // No duplicate: the cause was already logged by `jwk.rs` (ERROR).
+                debug!("Private key not obtained: {}", e);
                 return Err(KeyError::NotFound);
             }
         };
@@ -112,18 +116,18 @@ impl KeyManager {
         Ok(jwk)
     }
 
-    /// Получает публичный JWK по `kid` из сервиса ключей.
+    /// Fetches a public JWK by `kid` from the key service.
     ///
-    /// Метод, а не ассоциированная функция: клиент и кеш JWKS живут в
-    /// [`JwkService`] этого менеджера. Раньше здесь создавался новый
-    /// `JwkService` на каждый вызов — то есть новый HTTP-клиент со своим пулом
-    /// соединений и поход в JWKS на каждую верификацию токена.
+    /// A method rather than an associated function: the client and the JWKS
+    /// cache live in this manager's [`JwkService`]. This used to create a new
+    /// `JwkService` on every call — that is, a new HTTP client with its own
+    /// connection pool and a trip to the JWKS on every token verification.
     async fn get_jwk(&self, kid: &str) -> Result<Jwk, KeyError> {
         let jwk = match self.service.public_key(kid).await {
             Ok(v) => v,
             Err(e) => {
-                // Дубль не пишем: причину уже залогировал `jwk.rs` (ERROR).
-                debug!("Публичный ключ по kid не получен: {}", e);
+                // No duplicate: the cause was already logged by `jwk.rs` (ERROR).
+                debug!("Public key by kid not obtained: {}", e);
                 return Err(KeyError::NotFound);
             }
         };
@@ -131,15 +135,15 @@ impl KeyManager {
         Ok(jwk)
     }
 
-    /// Возвращает текущий приватный ключ вместе с его метаданными JWK.
+    /// Returns the current private key together with its JWK metadata.
     ///
-    /// Приватный ключ хранится в сервисе как base64url(PKCS#8) и здесь
-    /// декодируется в [`PKey<Private>`].
+    /// The private key is stored in the service as base64url(PKCS#8) and is
+    /// decoded here into a [`PKey<Private>`].
     ///
     /// # Errors
-    /// - [`KeyError::NotFound`] — не удалось получить/создать ключ;
-    /// - [`KeyError::InvalidKey`] — приватный ключ не декодируется из base64url
-    ///   или не парсится как PKCS#8.
+    /// - [`KeyError::NotFound`] — the key could not be obtained or created;
+    /// - [`KeyError::InvalidKey`] — the private key does not decode from
+    ///   base64url or does not parse as PKCS#8.
     pub async fn get_private_key(&self) -> Result<(JwkData, PKey<Private>), KeyError> {
         let jwk = self.get_jwk_data().await?;
 
@@ -162,15 +166,15 @@ impl KeyManager {
         Ok((jwk, private_key))
     }
 
-    /// Получает и реконструирует публичный ключ по `kid`.
+    /// Fetches and reconstructs the public key for a `kid`.
     ///
-    /// По полю `alg` из JWK выбирается способ сборки ключа: RSA — из `n`/`e`,
-    /// EC — из `crv`/`x`/`y`, EdDSA — из сырых байт `x`.
+    /// The `alg` field of the JWK selects how the key is assembled: RSA from
+    /// `n`/`e`, EC from `crv`/`x`/`y`, EdDSA from the raw bytes of `x`.
     ///
     /// # Errors
-    /// - [`KeyError::NotFound`] — ключ с таким `kid` не найден;
-    /// - [`KeyError::Unsupported`] — алгоритм/кривая не поддерживается;
-    /// - [`KeyError::InvalidKey`] — компоненты ключа некорректны.
+    /// - [`KeyError::NotFound`] — no key with that `kid` was found;
+    /// - [`KeyError::Unsupported`] — the algorithm or curve is not supported;
+    /// - [`KeyError::InvalidKey`] — the key components are invalid.
     pub async fn get_public_key(&self, kid: &str) -> Result<PKey<Public>, KeyError> {
         let jwk = self.get_jwk(kid).await?;
 
@@ -182,7 +186,7 @@ impl KeyManager {
         }
     }
 
-    /// Собирает RSA-публичный ключ из компонентов `n` (модуль) и `e` (экспонента).
+    /// Assembles an RSA public key from the components `n` (modulus) and `e` (exponent).
     fn get_public_key_from_rs(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
         let jwk_n = Self::get_big_num_from_option_string(jwk.n)?;
         let jwk_e = Self::get_big_num_from_option_string(jwk.e)?;
@@ -204,13 +208,13 @@ impl KeyManager {
         }
     }
 
-    /// Собирает EC-публичный ключ из аффинных координат `x`/`y` на кривой,
-    /// выбранной по `alg` (P-256/P-384/P-521).
+    /// Assembles an EC public key from the affine coordinates `x`/`y` on the
+    /// curve selected by `alg` (P-256/P-384/P-521).
     ///
     /// # Errors
-    /// - [`KeyError::Unsupported`] — `alg` не соответствует поддерживаемой кривой;
-    /// - [`KeyError::InvalidKey`] — компоненты `x`/`y` некорректны или OpenSSL не
-    ///   смог собрать ключ из них.
+    /// - [`KeyError::Unsupported`] — `alg` does not map to a supported curve;
+    /// - [`KeyError::InvalidKey`] — the `x`/`y` components are invalid or
+    ///   OpenSSL could not assemble a key from them.
     fn get_public_key_from_es(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
         let curve = match jwk.alg.as_str() {
             "ES256" => Nid::X9_62_PRIME256V1,
@@ -256,14 +260,14 @@ impl KeyManager {
         }
     }
 
-    /// Собирает EdDSA-публичный ключ (Ed25519/Ed448) из сырых байт `x`.
+    /// Assembles an EdDSA public key (Ed25519/Ed448) from the raw bytes of `x`.
     ///
-    /// Кривая определяется полем `crv`.
+    /// The curve is determined by the `crv` field.
     ///
     /// # Errors
-    /// - [`KeyError::InvalidKey`] — `x` отсутствует или не декодируется как
+    /// - [`KeyError::InvalidKey`] — `x` is missing or does not decode as
     ///   base64url;
-    /// - [`KeyError::Unsupported`] — `crv` не является Ed25519/Ed448.
+    /// - [`KeyError::Unsupported`] — `crv` is neither Ed25519 nor Ed448.
     fn get_public_key_from_dsa(jwk: Jwk) -> Result<PKey<Public>, KeyError> {
         let encoded_x = jwk.x.ok_or(KeyError::InvalidKey)?;
         let jwk_x = URL_SAFE_NO_PAD.decode(encoded_x).map_err(|e| {
@@ -289,11 +293,11 @@ impl KeyManager {
         }
     }
 
-    /// Декодирует base64url-строку в [`BigNum`] (для компонентов RSA/EC).
+    /// Decodes a base64url string into a [`BigNum`] (for the RSA/EC components).
     ///
     /// # Errors
-    /// [`KeyError::InvalidKey`] — `str` равен `None`, не является корректным
-    /// base64url или не парсится как [`BigNum`].
+    /// [`KeyError::InvalidKey`] — `str` is `None`, is not valid base64url or
+    /// does not parse as a [`BigNum`].
     fn get_big_num_from_option_string(str: Option<String>) -> Result<BigNum, KeyError> {
         let encoded = str.ok_or(KeyError::InvalidKey)?;
         let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
@@ -313,12 +317,13 @@ impl KeyManager {
 
 #[cfg(test)]
 mod tests {
-    //! Тесты реконструкции публичных ключей из компонентов JWK.
+    //! Tests for reconstructing public keys from JWK components.
     //!
-    //! Стратегия: генерируем настоящий ключ через OpenSSL, раскладываем его на
-    //! компоненты JWK (base64url), скармливаем реконструктору и убеждаемся, что
-    //! получившийся публичный ключ совпадает с исходным (`public_eq`). Сеть и
-    //! `jwks-service-app` не задействуются — проверяется только чистая крипто-логика.
+    //! The strategy: generate a real key through OpenSSL, decompose it into JWK
+    //! components (base64url), feed it to the reconstructor and check that the
+    //! resulting public key matches the original (`public_eq`). Neither the
+    //! network nor `jwks-service-app` is involved — only the pure crypto logic
+    //! is exercised.
 
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -329,12 +334,12 @@ mod tests {
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
 
-    /// base64url без паддинга — формат, в котором компоненты приходят в JWK.
+    /// base64url without padding — the form the components arrive in inside a JWK.
     fn b64(bytes: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    /// Пустой JWK с заданным алгоритмом; поля-компоненты заполняются в тесте.
+    /// An empty JWK with the given algorithm; the component fields are filled in by the test.
     fn jwk(alg: &str) -> Jwk {
         Jwk {
             kty: String::new(),
@@ -404,7 +409,7 @@ mod tests {
 
     #[test]
     fn es_rejects_unsupported_curve() {
-        // Неизвестный `alg` для EC — кривая не выбирается, ждём `Unsupported`.
+        // An unknown `alg` for EC — no curve is selected, we expect `Unsupported`.
         let jwk = jwk("ES999");
         let result = KeyManager::get_public_key_from_es(jwk);
         assert!(matches!(result, Err(KeyError::Unsupported)));
@@ -412,7 +417,7 @@ mod tests {
 
     #[test]
     fn es_rejects_missing_coordinates() {
-        // `x`/`y` отсутствуют — раньше был бы panic на `.unwrap()`, теперь InvalidKey.
+        // `x`/`y` are missing — this used to panic on `.unwrap()`, now InvalidKey.
         let jwk = jwk("ES256");
         let result = KeyManager::get_public_key_from_es(jwk);
         assert!(matches!(result, Err(KeyError::InvalidKey)));
@@ -420,7 +425,7 @@ mod tests {
 
     #[test]
     fn es_rejects_invalid_base64_coordinate() {
-        // `x` невалиден как base64url — ждём InvalidKey вместо паники.
+        // `x` is not valid base64url — we expect InvalidKey rather than a panic.
         let mut jwk = jwk("ES256");
         jwk.x = Some("!!!not-base64!!!".to_string());
         jwk.y = Some(b64(&[1, 2, 3]));
@@ -431,7 +436,7 @@ mod tests {
 
     #[test]
     fn dsa_rejects_missing_x() {
-        // `x` отсутствует — раньше был бы panic на `jwk.x.unwrap()`, теперь InvalidKey.
+        // `x` is missing — this used to panic on `jwk.x.unwrap()`, now InvalidKey.
         let mut jwk = jwk("EdDSA");
         jwk.crv = Some("Ed25519".to_string());
         jwk.x = None;
@@ -442,7 +447,7 @@ mod tests {
 
     #[test]
     fn dsa_rejects_missing_crv() {
-        // `x` присутствует и валиден, но `crv` не задан — ждём `InvalidKey`.
+        // `x` is present and valid but `crv` is unset — we expect `InvalidKey`.
         let raw = PKey::generate_ed25519().unwrap().raw_public_key().unwrap();
         let mut jwk = jwk("EdDSA");
         jwk.x = Some(b64(&raw));
@@ -465,7 +470,7 @@ mod tests {
 
     #[test]
     fn ed448_id_is_recognised() {
-        // Проверяем ветку Ed448 в маппинге `crv` -> `Id` (реконструкция ключа).
+        // We exercise the Ed448 branch of the `crv` -> `Id` mapping (key reconstruction).
         let original = PKey::generate_ed448().unwrap();
         let raw = original.raw_public_key().unwrap();
 

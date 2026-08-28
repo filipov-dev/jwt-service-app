@@ -1,843 +1,927 @@
 # AGENTS.md
 
-Инструкции для AI-агентов и разработчиков, работающих с этим репозиторием.
+Instructions for AI agents and developers working with this repository.
 
-> Приватные заметки (доступы, процессы, предпочтения) — в `AGENTS_INTERNAL.md`;
-> он в `.gitignore` и в репозиторий не коммитится.
+> Private notes (accesses, processes, preferences) live in `AGENTS_INTERNAL.md`;
+> that file is in `.gitignore` and is never committed.
 
-## Обзор проекта
+## Project overview
 
-`jwt-service-app` — HTTP-сервис на Rust (actix-web) для выпуска, проверки и
-отзыва JWT. Сервис **не хранит ключи сам**: за генерацию и хранение ключей
-отвечает внешний `jwks-service-app`, к которому обращаются по HTTP. Отозванные/
-активные токены отслеживаются по `jti` в Redis.
+`jwt-service-app` is an HTTP service in Rust (actix-web) for issuing, verifying
+and revoking JWTs. The service **does not store keys itself**: generating and
+storing them is the job of the external `jwks-service-app`, reached over HTTP.
+Revoked and active tokens are tracked by `jti` in Redis.
 
-- Язык: Rust, edition 2021.
-- Веб-фреймворк: actix-web 4.
-- Крипта: `openssl` (подпись/проверка), поддержка RS256/384/512, ES256/384/512, EdDSA.
-- Хранилище `jti`: Redis (`redis` crate, multiplexed async connection).
-- OpenAPI: `utoipa`, спека отдаётся на `/api-docs/openapi.json` и лежит в
-  репозитории — [`docs/openapi.json`](docs/openapi.json).
-- Лицензия: Apache-2.0 — [`LICENSE`](LICENSE), поле `license` в `Cargo.toml`,
-  метка `org.opencontainers.image.licenses` в прод-образе и `info.license` в
-  OpenAPI-спеке. Апстрим-зависимости — permissive (MIT / Apache-2.0);
-  copyleft-крейты не тянем, потому что образы раздаются публично (см. комментарий
-  к `governor` в `Cargo.toml`).
-- Политика безопасности: [`SECURITY.md`](SECURITY.md) — приватный канал для
-  сообщений об уязвимостях, сроки ответа и раскрытия, поддерживаемые версии.
-- Документы для внешнего участника: [`README.md`](README.md) — витрина проекта
-  (что сервис делает и чего не делает, быстрый старт, карта документации),
-  [`CONTRIBUTING.md`](CONTRIBUTING.md) — сборка, команды, соглашения по коду и
-  коммитам, чеклист PR, [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor
-  Covenant 2.1, контакт `andrey@filipov.dev`. Шаблоны issue и PR —
-  в [`.github/`](.github) (см. «Гигиена публичного репозитория»).
+- Language: Rust, edition 2021.
+- Web framework: actix-web 4.
+- Crypto: `openssl` (signing and verification), supporting RS256/384/512,
+  ES256/384/512, EdDSA.
+- `jti` storage: Redis (the `redis` crate, multiplexed async connection).
+- OpenAPI: `utoipa`; the spec is served at `/api-docs/openapi.json` and
+  committed to the repository — [`docs/openapi.json`](docs/openapi.json).
+- License: Apache-2.0 — [`LICENSE`](LICENSE), the `license` field in
+  `Cargo.toml`, the `org.opencontainers.image.licenses` label on the production
+  image and `info.license` in the OpenAPI spec. Upstream dependencies are
+  permissive (MIT / Apache-2.0); copyleft crates are kept out because the images
+  are distributed publicly (see the comment next to `governor` in `Cargo.toml`).
+- Security policy: [`SECURITY.md`](SECURITY.md) — the private channel for
+  vulnerability reports, response and disclosure timelines, supported versions.
+- Documents for an external contributor: [`README.md`](README.md) is the shop
+  window (what the service does and does not do, quick start, the documentation
+  map), [`CONTRIBUTING.md`](CONTRIBUTING.md) covers building, commands, code and
+  commit conventions and the pull request checklist,
+  [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) is Contributor Covenant 2.1 with
+  `andrey@filipov.dev` as the contact. Issue and pull request templates live in
+  [`.github/`](.github) (see "Public repository hygiene").
+- **Language: this repository is English.** See "Repository language" under
+  "Conventions and pitfalls" — the rule covers code, comments, documentation,
+  commit messages and pull request texts, and CI enforces it.
 
-## Архитектура
+## Architecture
 
-Поток данных при выпуске токена (`POST /tokens`):
+The data flow when a token is issued (`POST /tokens`):
 
-1. `handlers::create_token` читает заголовок `Host` (становится `iss`) и сверяет
-   его с аллоулистом issuer'ов (`src/issuer.rs`).
-2. `JwtManager::generate_token` запрашивает приватный ключ у `KeyManager`.
-3. `KeyManager` через `JwkService` (`src/jwk.rs`) ходит в `jwks-service-app`:
-   получает существующий ключ по id или создаёт новый.
-4. `TokenClaims::create_new` формирует claims, сохраняет `jti` в Redis с TTL.
-5. `JsonWebToken::create_new` подписывает `header.claims` приватным ключом.
+1. `handlers::create_token` reads the `Host` header (it becomes `iss`) and
+   checks it against the issuer allowlist (`src/issuer.rs`).
+2. `JwtManager::generate_token` asks `KeyManager` for a private key.
+3. `KeyManager`, through `JwkService` (`src/jwk.rs`), talks to
+   `jwks-service-app`: it fetches an existing key by id or creates a new one.
+4. `TokenClaims::create_new` builds the claims and stores the `jti` in Redis
+   with a TTL.
+5. `JsonWebToken::create_new` signs `header.claims` with the private key.
 
-Проверка (`POST /tokens/verify`) — обратный путь: `JsonWebToken::from_string`
-достаёт публичный ключ по `kid` из JWKS, проверяет подпись и claims
-(`iss`, `aud`, `nbf`/`iat`/`exp`, наличие `jti` в Redis).
+Verification (`POST /tokens/verify`) is the same path in reverse:
+`JsonWebToken::from_string` fetches the public key by `kid` from the JWKS and
+checks the signature and the claims (`iss`, `aud`, `nbf`/`iat`/`exp`, presence
+of the `jti` in Redis).
 
-Отзыв (`DELETE /tokens/{jti}`) удаляет `jti` из Redis. Идемпотентен: отзыв
-несуществующего `jti` — тоже `204`. Недоступность хранилища отдаётся как `500`,
-а не маскируется успехом.
+Revocation (`DELETE /tokens/{jti}`) deletes the `jti` from Redis. It is
+idempotent: revoking a `jti` that does not exist is also `204`. An unavailable
+store surfaces as `500` rather than being masked as success.
 
-Продление (`POST /tokens/refresh`) обменивает refresh-токен на новую пару
-access + refresh. Refresh-токен — непрозрачная строка, а не JWT: он лишь ключ к
-записи в Redis, поэтому утёкший токен бесполезен без хранилища, а отзыв мгновенен.
+Renewal (`POST /tokens/refresh`) exchanges a refresh token for a new
+access + refresh pair. The refresh token is an opaque string, not a JWT: it is
+merely a key into a Redis record, so a leaked token is useless without the store
+and revocation is instant.
 
-Массовый отзыв (`DELETE /subjects/{sub}/tokens`) гасит все токены субъекта. При
-выпуске `jti` попадает не только в плоский ключ, но и в ZSET-группу
-`group:sub:{sub}` со score = временем истечения; отзыв подрезает протухшие записи
-по score, удаляет оставшиеся `jti` пачкой и саму группу.
+Bulk revocation (`DELETE /subjects/{sub}/tokens`) kills every token of a
+subject. When a token is issued its `jti` goes not only into a flat key but also
+into the ZSET group `group:sub:{sub}` with the expiry time as the score;
+revocation trims expired entries by score, deletes the remaining `jti` values in
+one batch and then the group itself.
 
-### Уровни доступа (auth-middleware)
+### Access levels (auth middleware)
 
-Все эндпоинты закрыты единым middleware ([`auth.rs`](src/auth.rs)); уровень
-задаётся при регистрации роута в `main.rs`, разница между уровнями — только в
-валидаторе. Невалидный/отсутствующий кред → `401` (скупой ответ без деталей).
+Every endpoint is behind a single middleware ([`auth.rs`](src/auth.rs)); the
+level is chosen when the route is registered in `main.rs`, and the only
+difference between levels is the validator. An invalid or missing credential
+gives `401` (a terse response with no details).
 
-| Уровень | Эндпоинты | Валидатор |
-|--------:|-----------|-----------|
-| **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет (пропускает всё) |
-| **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от прокси, сравнение constant-time |
+| Level | Endpoints | Validator |
+|------:|-----------|-----------|
+| **1 — open** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | none (lets everything through) |
+| **2 — proxy secret** | `POST /tokens/verify` | a static secret header from the proxy, constant-time compare |
 | **3 — TOTP** | `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | TOTP (RFC 6238), internal app-to-app |
-| **4 — Bearer-токен** | `GET /metrics` (только если задан токен) | статический токен в `Authorization: Bearer`, сравнение constant-time |
+| **4 — bearer token** | `GET /metrics` (only when a token is configured) | a static token in `Authorization: Bearer`, constant-time compare |
 
-- **Уровень 2** — заголовок `X-Proxy-Secret` (имя настраивается), который ставит
-  **только** обратный прокси. Сравнение с `AUTH_PROXY_SECRET` — constant-time
-  (`openssl::memcmp`). **Прокси ОБЯЗАН затирать клиентскую версию этого
-  заголовка** перед установкой своей — иначе секрет подставят снаружи и уровень
-  будет обойдён. Готовые конфиги для 10 прокси — в [`docs/proxy/`](docs/proxy/README.md).
-- **Уровень 3** — TOTP-код в заголовке `X-TOTP-Code`. Секрет(ы) — base32 из env.
-  Поддержана **ротация**: одновременно активны до двух секретов
-  (`AUTH_TOTP_SECRET` + `AUTH_TOTP_SECRET_NEXT`) на время перекладки. Крипта
-  (HMAC) — через `openssl`. Клиентские примеры на 30 языков —
-  в [`docs/clients/`](docs/clients/README.md).
-- **Уровень 4** — статический Bearer-токен (`AUTH_METRICS_TOKEN`) в заголовке
-  `Authorization: Bearer <токен>`; имя схемы регистронезависимо (RFC 7235),
-  сравнение токена constant-time. Отдельный уровень, а не переиспользование 2/3:
-  TOTP системам мониторинга не по силам (одноразовые коды они не считают), а
-  `X-Proxy-Secret` по контракту затирается прокси. Bearer нативно поддержан
-  Prometheus (`authorization: {credentials_file}`), Zabbix `agent2` и OTel
-  Collector, через который метрики забирает Monium.
-- **Защиты основных ручек обязательны.** Секреты уровней 2 и 3
-  (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) — обязательны: без них
-  `AuthConfig::from_env` возвращает ошибку и сервис **не стартует** (fail-fast на
-  старте, как и с прочей критичной конфигурацией). Отключить эти уровни нельзя.
-- **Уровень 4 — исключение, он опционален.** Метрики вспомогательны, и из-за их
-  конфигурации не должен лежать весь сервис выдачи токенов. Без
-  `AUTH_METRICS_TOKEN` сервис стартует (с предупреждением в лог), а роут
-  `/metrics` **не регистрируется вовсе** — путь отдаёт штатный `404`.
-  `401` намеренно не отдаём: так наружу не виден даже факт существования ручки.
-  Отсутствие токена при этом **никогда не означает открытый доступ** —
-  `MetricsValidator` в таком состоянии отклоняет любой запрос.
-- **Replay (уровень 3):** TOTP-код сам по себе переигрываем в пределах окна
-  действия. Закрывается флагом `AUTH_TOTP_REPLAY_PROTECTION`: отпечаток кода
-  резервируется в Redis через `SET NX` с TTL = окну, повтор получает `401`.
-  - **По умолчанию выключено** — включение добавляет auth-слою зависимость от
-    Redis, которой у него нет, и молча менять поведение работающих деплоев
-    неправильно. В проде включать явно.
-  - **В Redis кладётся не код, а его HMAC** на первом активном секрете: «голый»
-    хеш от 6–8 цифр перебирается мгновенно и не скрыл бы ничего.
-  - **Fail-open при недоступном Redis.** Обе ручки уровня 3 и так ходят в Redis
-    (выпуск падает на `store_jti`, отзыв — сам по себе команда Redis), поэтому
-    переигранный код при лежащем хранилище всё равно ничего не добьётся, а
-    fail-closed добавил бы ещё одну причину отказа сервиса.
+- **Level 2** is the `X-Proxy-Secret` header (the name is configurable), set
+  **only** by the reverse proxy. The comparison against `AUTH_PROXY_SECRET` is
+  constant-time (`openssl::memcmp`). **The proxy MUST strip the client-supplied
+  version of that header** before setting its own — otherwise the secret can be
+  injected from the outside and the level is bypassed. Ready-made configurations
+  for 10 proxies are in [`docs/proxy/`](docs/proxy/README.md).
+- **Level 3** is a TOTP code in the `X-TOTP-Code` header. The secrets are base32
+  values from the environment. **Rotation is supported**: up to two secrets
+  (`AUTH_TOTP_SECRET` + `AUTH_TOTP_SECRET_NEXT`) are active at once while the
+  swap is in progress. The crypto (HMAC) goes through `openssl`. Client examples
+  in 30 languages are in [`docs/clients/`](docs/clients/README.md).
+- **Level 4** is a static bearer token (`AUTH_METRICS_TOKEN`) in the
+  `Authorization: Bearer <token>` header; the scheme name is case-insensitive
+  (RFC 7235) and the token comparison is constant-time. It is a separate level
+  rather than a reuse of 2 or 3: monitoring systems cannot do TOTP (they do not
+  compute one-time codes), and `X-Proxy-Secret` is stripped by the proxy by
+  contract. Bearer is natively supported by Prometheus
+  (`authorization: {credentials_file}`), by Zabbix `agent2` and by the OTel
+  Collector through which Monium scrapes the metrics.
+- **Protection of the main endpoints is mandatory.** The level 2 and level 3
+  secrets (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) are required: without them
+  `AuthConfig::from_env` returns an error and the service **does not start**
+  (fail-fast at startup, as with the rest of the critical configuration). These
+  levels cannot be turned off.
+- **Level 4 is the exception — it is optional.** Metrics are auxiliary, and the
+  whole token service should not go down over their configuration. Without
+  `AUTH_METRICS_TOKEN` the service starts (with a warning in the log) and the
+  `/metrics` route is **not registered at all** — the path returns a plain
+  `404`. Returning `401` is deliberately avoided: that way the very existence of
+  the endpoint is invisible from the outside. A missing token **never means open
+  access** — in that state `MetricsValidator` rejects every request.
+- **Replay (level 3):** a TOTP code is by itself replayable within its validity
+  window. That is closed by the `AUTH_TOTP_REPLAY_PROTECTION` flag: a fingerprint
+  of the code is reserved in Redis with `SET NX` and a TTL equal to the window,
+  and a repeat gets `401`.
+  - **Off by default** — turning it on adds a Redis dependency to the auth layer
+    that it otherwise does not have, and silently changing the behaviour of
+    running deployments would be wrong. Enable it explicitly in production.
+  - **What goes into Redis is not the code but its HMAC** under the first active
+    secret: a bare hash of 6–8 digits is brute-forced instantly and would hide
+    nothing.
+  - **Fails open when Redis is unavailable.** Both level 3 endpoints go to Redis
+    anyway (issuing fails at `store_jti`, revocation is a Redis command in
+    itself), so a replayed code achieves nothing while the store is down, and
+    failing closed would add one more reason for the service to refuse requests.
 
-### Rate limiting (ограничение частоты)
+### Rate limiting
 
-Отдельный middleware ([`rate_limit.rs`](src/rate_limit.rs)) поверх token-bucket
-(GCRA) из crate `governor`. Тип лимита согласован с уровнями доступа — кто бьёт в
-ручку, тот и определяет модель. Превышение → `429 Too Many Requests` (скупое тело,
-заголовок `Retry-After` в секундах).
+A separate middleware ([`rate_limit.rs`](src/rate_limit.rs)) on top of the
+token bucket (GCRA) from the `governor` crate. The kind of limit matches the
+access level — whoever hits the endpoint determines the model. Exceeding it
+gives `429 Too Many Requests` (a terse body and a `Retry-After` header in
+seconds).
 
-| Ручка | Тип лимита | Порядок относительно auth |
-|-------|-----------|---------------------------|
-| `POST /tokens/verify` (уровень 2) | **per-IP** (ключ — IP клиента) | **снаружи** auth — флуд отсекается до проверки proxy-secret |
-| `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` (уровень 3) | **опц. глобальный cap** на эндпоинт (не per-IP) | **внутри** auth — потолок расходуют только запросы, прошедшие TOTP |
+| Endpoint | Kind of limit | Order relative to auth |
+|----------|---------------|------------------------|
+| `POST /tokens/verify` (level 2) | **per-IP** (keyed by client IP) | **outside** auth — a flood is cut off before the proxy secret is checked |
+| `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` (level 3) | **optional global cap** per endpoint (not per-IP) | **inside** auth — only requests that passed TOTP consume the cap |
 
-- **Почему так.** На публичной `/tokens/verify` клиентов много и они разные →
-  per-IP. Internal-ручки бьёт один-два доверенных клиента с одного адреса → per-IP
-  бессмыслен; вместо него опциональный общий потолок как defense-in-depth (лимит
-  blast radius при утечке TOTP-секрета) и backpressure для JWKS/Redis от
-  зациклившегося клиента. Cap стоит **внутри** auth намеренно: будь он снаружи,
-  неаутентифицированный флуд исчерпал бы общий потолок и заблокировал настоящего
-  internal-клиента.
-- **IP за прокси.** Peer-адрес за обратным прокси — это адрес прокси, поэтому
-  реальный IP берётся из `X-Forwarded-For`. Заголовок подделываем клиентом, поэтому
-  ему доверяют **только если peer входит в `RATE_LIMIT_TRUSTED_PROXIES`** (IP/CIDR).
-  Разбор XFF — справа налево (первый недоверенный адрес = клиент, корректно для
-  цепочки прокси). **Если список доверенных прокси пуст — XFF игнорируется**, ключом
-  служит peer-адрес (безопасный дефолт: снаружи IP не подделать, но за прокси все
-  клиенты делят один лимит — обязательно задайте список в проде за прокси). IPv6
-  группируется по `/56`.
-- **Не fail-fast.** В отличие от auth-секретов, ошибки конфигурации rate limiting
-  (нераспознанный CIDR, кривой флаг) **не** роняют сервис — деградируем к
-  безопасному режиму с предупреждением в лог. Per-IP лимит включён по умолчанию,
-  глобальный cap — выключен.
+- **Why this way.** The public `/tokens/verify` has many different clients →
+  per-IP. The internal endpoints are hit by one or two trusted clients from a
+  single address → per-IP is meaningless; instead there is an optional global
+  cap as defense in depth (limiting the blast radius of a leaked TOTP secret)
+  and as backpressure for JWKS and Redis against a client stuck in a loop. The
+  cap sits **inside** auth on purpose: were it outside, an unauthenticated flood
+  would drain the shared cap and lock out the real internal client.
+- **The client IP behind a proxy.** The peer address behind a reverse proxy is
+  the address of the proxy, so the real IP comes from `X-Forwarded-For`. That
+  header is forgeable by the client, so it is trusted **only when the peer is
+  listed in `RATE_LIMIT_TRUSTED_PROXIES`** (IP/CIDR). XFF is parsed right to
+  left (the first untrusted address is the client, which is correct for a chain
+  of proxies). **When the trusted-proxy list is empty, XFF is ignored** and the
+  peer address is used as the key (a safe default: an IP cannot be forged from
+  the outside, but behind a proxy every client shares one limit — always set the
+  list in production behind a proxy). IPv6 is grouped by `/56`.
+- **Not fail-fast.** Unlike the auth secrets, configuration errors in rate
+  limiting (an unparsable CIDR, a malformed flag) do **not** bring the service
+  down — it degrades to the safe mode with a warning in the log. The per-IP
+  limit is on by default; the global cap is off.
 
-> **Инструкция по observability** — [`docs/observability.md`](docs/observability.md):
-> карта сигналов и моделей доставки, сводная таблица переменных, готовые конфиги
-> для Prometheus/Zabbix/Monium/GlitchTip, политика уровней логирования.
+> **The observability guide** is
+> [`docs/observability.md`](docs/observability.md): the map of signals and
+> delivery models, the summary table of variables, ready-made configurations for
+> Prometheus/Zabbix/Monium/GlitchTip and the log-level policy.
 
-### Карта модулей (`src/`)
+### Module map (`src/`)
 
-| Файл | Назначение |
-|------|-----------|
-| `main.rs` | Точка входа, конфиг HTTP-сервера, логирование, CORS, роуты (с уровнями доступа), выдача OpenAPI-спеки. |
-| `openapi.rs` | Корневой описатель OpenAPI (`ApiDoc`), security-схемы и выгрузка спеки в `docs/openapi.json` (тест `spec_file_is_up_to_date`). |
-| `server.rs` | Параметры `HttpServer`: число воркеров (по квоте CPU cgroup, а не по числу ядер хоста), таймауты соединений (`client_request_timeout`, keep-alive) и время дренажа при остановке (`shutdown_timeout`). |
-| `auth.rs` | Многоуровневый auth-middleware: уровни доступа, валидаторы proxy-secret, TOTP (RFC 6238) и Bearer-токена метрик. |
-| `logging.rs` | Инициализация `tracing`-subscriber (формат по `LOG_FORMAT`) и per-request middleware `RequestLog`: `request_id` (`X-Request-Id`), структурный span (метод, путь, статус, латентность, `access_level`, IP); отсюда же пишется метрика запроса. |
-| `tracing_otel.rs` | Распределённый трейсинг OpenTelemetry: OTLP-экспорт (вкл. по env), W3C-propagation (`traceparent`) на входе и в исходящих запросах к JWKS. |
-| `sentry_glitchtip.rs` | Интеграция с GlitchTip (Sentry-совместимый): ошибки/паники → Issues, span-ы → Performance, структурные логи → Logs. Включается по DSN. |
-| `metrics.rs` | Метрики Prometheus (фасад `metrics` + `metrics-exporter-prometheus`): recorder, хелперы записи, рендер экспозиции для `GET /metrics`. |
-| `rate_limit.rs` | Rate-limiting middleware (token-bucket из `governor`): per-IP на `/tokens/verify` и опц. глобальный cap на internal-ручках; извлечение IP из `X-Forwarded-For` за доверенным прокси. |
-| `handlers.rs` | HTTP-обработчики эндпоинтов (обобщены по `JtiStore`) + аннотации `utoipa::path`. |
-| `issuer.rs` | Аллоулист issuer'ов (`TOKEN_ISSUER_ALLOWLIST`): какие значения `Host` допустимы в claim `iss`. |
-| `jwt.rs` | `JwtManager` — фасад для генерации и проверки токенов. |
-| `models/jwt.rs` | `TokenClaims`, `TokenHeaders`, `JsonWebToken`, трейт `JtiStore` (включая `ping` для readiness), ошибки. |
-| `models/mod.rs` | DTO запросов/ответов (`ToSchema`) и структуры JWK/JWKS. |
-| `key.rs` | `KeyManager` — получение приватного ключа и реконструкция публичного из JWK. |
-| `jwk.rs` | `JwkService` — HTTP-клиент к `jwks-service-app`. |
-| `redis.rs` | `RedisClient` — реализация трейта `JtiStore` поверх Redis. |
-| `error.rs` | Общий `Error` с `ResponseError` для actix. О бэкенде хранилища не знает: агрегирует `JtiError`, а не `redis::RedisError`. |
+| File | Purpose |
+|------|---------|
+| `main.rs` | Entry point, HTTP server configuration, logging, CORS, routes (with their access levels), serving the OpenAPI spec. |
+| `openapi.rs` | The root OpenAPI descriptor (`ApiDoc`), the security schemes and the export of the spec to `docs/openapi.json` (the `spec_file_is_up_to_date` test). |
+| `server.rs` | `HttpServer` parameters: the worker count (from the cgroup CPU quota, not from the host core count), connection timeouts (`client_request_timeout`, keep-alive) and the drain period on shutdown (`shutdown_timeout`). |
+| `auth.rs` | The multi-level auth middleware: access levels and the validators for the proxy secret, TOTP (RFC 6238) and the metrics bearer token. |
+| `logging.rs` | Initialisation of the `tracing` subscriber (format from `LOG_FORMAT`) and the per-request `RequestLog` middleware: `request_id` (`X-Request-Id`), a structured span (method, path, status, latency, `access_level`, IP); the request metric is written from here too. |
+| `tracing_otel.rs` | Distributed tracing with OpenTelemetry: OTLP export (enabled by env), W3C propagation (`traceparent`) on the way in and on outgoing requests to the JWKS. |
+| `sentry_glitchtip.rs` | The GlitchTip integration (Sentry-compatible): errors and panics → Issues, spans → Performance, structured logs → Logs. Enabled by DSN. |
+| `metrics.rs` | Prometheus metrics (the `metrics` facade plus `metrics-exporter-prometheus`): the recorder, the recording helpers and rendering the exposition for `GET /metrics`. |
+| `rate_limit.rs` | The rate-limiting middleware (token bucket from `governor`): per-IP on `/tokens/verify` and an optional global cap on the internal endpoints; extracting the IP from `X-Forwarded-For` behind a trusted proxy. |
+| `handlers.rs` | The HTTP handlers for the endpoints (generic over `JtiStore`) plus the `utoipa::path` annotations. |
+| `issuer.rs` | The issuer allowlist (`TOKEN_ISSUER_ALLOWLIST`): which `Host` values are acceptable in the `iss` claim. |
+| `jwt.rs` | `JwtManager` — the facade for generating and verifying tokens. |
+| `models/jwt.rs` | `TokenClaims`, `TokenHeaders`, `JsonWebToken`, the `JtiStore` trait (including `ping` for readiness) and the errors. |
+| `models/mod.rs` | Request and response DTOs (`ToSchema`) and the JWK/JWKS structures. |
+| `key.rs` | `KeyManager` — obtaining the private key and reconstructing the public one from a JWK. |
+| `jwk.rs` | `JwkService` — the HTTP client for `jwks-service-app`. |
+| `redis.rs` | `RedisClient` — the `JtiStore` implementation on top of Redis. |
+| `error.rs` | The shared `Error` with `ResponseError` for actix. It knows nothing about the storage backend: it aggregates `JtiError`, not `redis::RedisError`. |
 
-## Команды
+## Commands
 
-Локальная разработка обычно ведётся через Docker Compose (см. ниже), но crate
-собирается и напрямую:
-
-```bash
-cargo build            # сборка
-cargo build --release  # релизная сборка (как в prod-образе)
-cargo run              # запуск (нужны Redis и jwks-service-app)
-cargo clippy           # линт
-cargo fmt              # форматирование
-cargo audit            # проверка уязвимостей в зависимостях
-
-UPDATE_OPENAPI=1 cargo test openapi   # перегенерировать docs/openapi.json
-```
-
-> **Релизная сборка заметно дороже отладочной** — `lto = "fat"` и
-> `codegen-units = 1` в `[profile.release]` (см. «Соглашения и подводные
-> камни»): чистая сборка на 8 ядрах 88 с против 127 с. Для повседневной
-> проверки хватает `cargo build` и `cargo clippy` — они собирают дефолтным
-> профилем и профиля релиза не касаются.
-
-Тулчейн задан в `rust-toolchain.toml` (`channel = "stable"`, компоненты
-`clippy` и `rustfmt`): rustup подхватывает его автоматически, так что канал и
-набор компонентов у всех одинаковые и совпадают с CI.
-
-> **Но канал ≠ версия: `stable` локально может отставать от CI.** Toolchain-файл
-> не обновляет уже установленный stable — rustup молча берёт локальную копию,
-> а CI на каждый прогон ставит свежий, и новые линты появляются там раньше:
-> правка `manual_option_zip` в JWT-31 прошла локально на 1.94 и упала на 1.97.
-> Поэтому перед прогоном линта — `rustup update stable`. Если CI ругается на
-> линт, которого локально нет, сверьте `cargo clippy --version`, а не спорьте с
-> линтом.
-
-Docker-сборки toolchain-файл намеренно обходят: прод-образ пинит компилятор
-через `ENV RUSTUP_TOOLCHAIN` (иначе `cargo chef cook` собрал бы зависимости
-одним компилятором, а `cargo build` — другим, и кеш слоя обнулялся бы каждую
-сборку), dev-образ ставит stable на этапе сборки образа, чтобы rustup не качал
-его при каждом пересоздании контейнера.
-
-`cargo audit` также прогоняется в CI (`.github/workflows/audit.yml`) на каждый
-PR, при пуше в `master` и еженедельно по расписанию: найденная уязвимость
-блокирует пайплайн. Осознанно игнорируемые advisory заносятся в
-`.cargo/audit.toml` с комментарием-причиной.
-
-**Секреты в истории** проверяет `scripts/scan-secrets.sh` — gitleaks и
-trufflehog по всем ссылкам репозитория, включая PR-рефы:
+Local development usually goes through Docker Compose (see below), but the crate
+also builds directly:
 
 ```bash
-scripts/scan-secrets.sh                 # оба сканера
-scripts/scan-secrets.sh --reports out   # с JSON-отчётами в ./out
+cargo build            # build
+cargo build --release  # release build (as in the production image)
+cargo run              # run (needs Redis and jwks-service-app)
+cargo clippy           # lint
+cargo fmt              # formatting
+cargo audit            # check dependencies for vulnerabilities
+
+UPDATE_OPENAPI=1 cargo test openapi   # regenerate docs/openapi.json
 ```
 
-Тот же скрипт крутится в CI (`.github/workflows/secrets.yml`) на каждый PR, при
-пуше в `master` и еженедельно; находка роняет пайплайн, отчёты выкладываются
-артефактом. Скрипт один на локальный прогон и на CI намеренно — иначе наборы
-флагов и allowlist'ы расходятся молча.
+> **A release build costs noticeably more than a debug one** — `lto = "fat"` and
+> `codegen-units = 1` in `[profile.release]` (see "Conventions and pitfalls"): a
+> clean build on 8 cores takes 127 s against 88 s. `cargo build` and
+> `cargo clippy` are enough for everyday checks — they use the default profile
+> and never touch the release one.
 
-Гасить находку — **только по значению**, а не по пути к файлу: allowlist на
-каталог ослепляет сканер на настоящий секрет, закоммиченный туда же. Место для
-записи: `.gitleaks.toml` (gitleaks) или массив `TRUFFLEHOG_ALLOWLIST` в самом
-скрипте, и обязательно с причиной. Отчёт аудита перед публикацией репозитория и
-порядок действий при настоящей находке (сначала отозвать ключ, потом
-переписывать историю) — в
+The toolchain is pinned in `rust-toolchain.toml` (`channel = "stable"`, the
+`clippy` and `rustfmt` components): rustup picks it up automatically, so the
+channel and the component set are identical for everyone and match CI.
+
+> **But a channel is not a version: local `stable` can lag behind CI.** The
+> toolchain file does not update an already installed stable — rustup silently
+> uses the local copy, while CI installs a fresh one on every run, so new lints
+> appear there first: the `manual_option_zip` fix in JWT-31 passed locally on
+> 1.94 and failed on 1.97. So run `rustup update stable` before the linter. If
+> CI complains about a lint you do not have locally, compare
+> `cargo clippy --version` instead of arguing with the lint.
+
+Docker builds bypass the toolchain file on purpose: the production image pins
+the compiler through `ENV RUSTUP_TOOLCHAIN` (otherwise `cargo chef cook` would
+build the dependencies with one compiler and `cargo build` with another, and the
+layer cache would be invalidated on every build), while the dev image installs
+stable at image build time so that rustup does not download it every time the
+container is recreated.
+
+`cargo audit` also runs in CI (`.github/workflows/audit.yml`) on every pull
+request, on pushes to `master` and weekly on a schedule: a vulnerability found
+blocks the pipeline. Advisories that are deliberately ignored go into
+`.cargo/audit.toml` with a comment explaining why.
+
+**Secrets in the history** are checked by `scripts/scan-secrets.sh` — gitleaks
+and trufflehog over every ref of the repository, pull request refs included:
+
+```bash
+scripts/scan-secrets.sh                 # both scanners
+scripts/scan-secrets.sh --reports out   # with JSON reports in ./out
+```
+
+The same script runs in CI (`.github/workflows/secrets.yml`) on every pull
+request, on pushes to `master` and weekly; a finding fails the pipeline and the
+reports are uploaded as an artifact. One script serves both the local run and CI
+deliberately — otherwise the flag sets and the allowlists drift apart silently.
+
+Silence a finding **by value only**, never by path: an allowlist on a directory
+blinds the scanner to a real secret committed into it. The places to write it
+down are `.gitleaks.toml` (gitleaks) or the `TRUFFLEHOG_ALLOWLIST` array inside
+the script, always with a reason. The audit report from before the repository
+was published, and the procedure for a real finding (revoke the key first,
+rewrite the history second), are in
 [`docs/security/secret-audit.md`](docs/security/secret-audit.md).
 
-**Сообщения об уязвимостях принимаются приватно** — политика в
-[`SECURITY.md`](SECURITY.md): основной канал — приватный адвайзори на GitHub,
-резервный — `security@filipov.dev`; подтверждение получения за 72 часа, вердикт
-за 7 дней, скоординированное раскрытие за 90. Поддерживается **только последний
-релиз** — бэкпортов в старые теги нет. Правя раздел «Что уязвимостью не
-считается», сверяйтесь с этим файлом: он перечисляет осознанные решения
-(replay-защита TOTP по умолчанию выключена, `404` вместо `401` на `/metrics`,
-fail-open при недоступном Redis), и разъехавшиеся формулировки превратят
-описанное поведение в «подтверждённую находку».
+**Vulnerability reports are accepted privately** — the policy is in
+[`SECURITY.md`](SECURITY.md): the primary channel is a private advisory on
+GitHub, the fallback is `security@filipov.dev`; acknowledgement within 72 hours,
+a verdict within 7 days, coordinated disclosure within 90. **Only the latest
+release** is supported — nothing is backported to older tags. When editing the
+"What is not considered a vulnerability" section, check it against that file: it
+lists the deliberate decisions (TOTP replay protection off by default, `404`
+instead of `401` on `/metrics`, failing open when Redis is unavailable), and
+wording that drifts apart turns documented behaviour into a "confirmed finding".
 
-> **Private Vulnerability Reporting ещё не включён.** Настройка доступна только
-> публичным репозиториям, а этот пока приватный (см. JWT-52): API отдаёт `404`
-> на `/private-vulnerability-reporting`. Включить сразу после перевода в public —
-> `PUT /repos/filipov-dev/jwt-service-app/private-vulnerability-reporting` или
-> Settings → Advanced Security → Private vulnerability reporting. До этого
-> ссылка на «Report a vulnerability» из `SECURITY.md` не работает, и рабочим
-> каналом остаётся почта.
+> **Private Vulnerability Reporting is not enabled yet.** The setting is only
+> available to public repositories and this one is still private (see JWT-52):
+> the API returns `404` for `/private-vulnerability-reporting`. Enable it right
+> after the switch to public —
+> `PUT /repos/filipov-dev/jwt-service-app/private-vulnerability-reporting` or
+> Settings → Advanced Security → Private vulnerability reporting. Until then the
+> "Report a vulnerability" link from `SECURITY.md` does not work and email
+> remains the working channel.
 
-**CI устроен в расчёте на публичный репозиторий**: `ci.yml`, `audit.yml` и
-`secrets.yml` запускаются на `pull_request`, то есть в том числе на PR с чужого
-форка, и потому не ссылаются на `secrets.` ни разу. Workflow с секретами
-(`docker.yml`, `release.yml`) запускаются только привилегированными событиями —
-пуш тега, публикация релиза, ручной dispatch, пуш в `master`. Разбор модели
-угрозы, таблица триггеров и чеклист для нового workflow —
+**CI is built for a public repository**: `ci.yml`, `audit.yml` and `secrets.yml`
+run on `pull_request`, which includes pull requests from other people's forks,
+and therefore never reference `secrets.` once. The workflows that do use secrets
+(`docker.yml`, `release.yml`) run only on privileged events — a tag push, a
+release publication, a manual dispatch, a push to `master`. The threat model,
+the trigger table and the checklist for a new workflow are in
 [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md).
-**`pull_request_target` в репозитории не используется; не вводите его попутной
-правкой.**
+**`pull_request_target` is not used in this repository; do not introduce it as a
+drive-by change.**
 
-**CI строгий** (`.github/workflows/ci.yml`, на PR и на пуш в `master`):
-`cargo fmt --all -- --check` и `cargo clippy --all-targets -- -D warnings`.
-Любое предупреждение линтера и любое расхождение с `rustfmt` роняют пайплайн,
-поэтому прогоняйте `cargo fmt` перед коммитом, а не после ревью.
+**CI is strict** (`.github/workflows/ci.yml`, on pull requests and on pushes to
+`master`): `cargo fmt --all -- --check` and
+`cargo clippy --all-targets -- -D warnings`. Any lint warning and any deviation
+from `rustfmt` fails the pipeline, so run `cargo fmt` before committing rather
+than after review.
 
-Тесты — инлайн `#[cfg(test)]` модули в исходниках; модулей без тестов нет. Запуск — `cargo test`; в CI
-(`.github/workflows/ci.yml`) прогоняется `cargo test --verbose` на каждый PR и
-пуш. dev-образ включает `cargo-tarpaulin` для покрытия. Добавляете фичу —
-добавляйте тесты рядом, в том же стиле.
+Tests are inline `#[cfg(test)]` modules in the sources; there is no module
+without tests. Run them with `cargo test`; CI (`.github/workflows/ci.yml`) runs
+`cargo test --verbose` on every pull request and push. The dev image ships
+`cargo-tarpaulin` for coverage. Adding a feature means adding tests next to it,
+in the same style.
 
-**Уровни доступа проверяются тестом** (`main.rs`). Регистрация роутов вынесена в
-`configure_api` именно ради этого: раньше привязка ручки к уровню проверялась
-только чтением кода, и так в сервис попал обмен refresh-токена на уровне 2 вместо
-3 при полностью зелёном прогоне. Проверка «без кредов → 401» этого не ловит —
-она проходит для обоих уровней; тест шлёт на internal-ручки запрос с **валидным
-proxy-secret, но без TOTP** и ждёт `401`. Добавляете ручку — добавьте её в
+**Access levels are covered by a test** (`main.rs`). Route registration was
+extracted into `configure_api` precisely for that: the binding of an endpoint to
+a level used to be verified only by reading the code, and that is how the
+refresh token exchange ended up on level 2 instead of level 3 with a fully green
+run. A "no credentials → 401" check does not catch it — it passes for both
+levels; the test sends the internal endpoints a request with a **valid proxy
+secret but no TOTP** and expects `401`. Adding an endpoint means adding it to
 `internal_endpoints()`.
 
-**Тесты не должны зависеть от окружения, оставленного соседями.** `TokenHeaders::create_new`
-читает `TOKEN_ALGORITHM`, поэтому в юнит-тестах берите `headers_with_alg` с явным
-алгоритмом: один такой тест уже проходил лишь в общем прогоне и падал в одиночку.
+**Tests must not depend on environment left behind by their neighbours.**
+`TokenHeaders::create_new` reads `TOKEN_ALGORITHM`, so unit tests should use
+`headers_with_alg` with an explicit algorithm: one such test used to pass only
+in the full run and failed on its own.
 
 ### Docker Compose (dev)
 
-`deployments/dev/docker-compose.yml` поднимает весь стенд: сам сервис, Redis,
-Redis Commander, Postgres, `jwks-service-app`, Swagger UI. Контейнер `app`
-запускается с `tail -f /dev/null` — предполагается hot-reload через
-`cargo watch` внутри контейнера (dev-образ ставит `cargo-watch`).
+`deployments/dev/docker-compose.yml` brings up the whole stand: the service
+itself, Redis, Redis Commander, Postgres, `jwks-service-app` and Swagger UI. The
+`app` container starts with `tail -f /dev/null` — the assumption is hot reload
+through `cargo watch` inside the container (the dev image installs
+`cargo-watch`).
 
-> **Осторожно с именем проекта.** Compose берёт имя проекта из имени папки, то
-> есть `dev`, — а папка `deployments/dev` есть у многих сервисов сразу. Запуск
-> `docker compose up` из такой папки может подхватить контейнеры чужого стенда
-> как свои и пересоздать их. Если рядом крутятся другие проекты, задавайте имя
-> явно: `docker compose -p jwt-dev up`.
+> **Careful with the project name.** Compose takes the project name from the
+> directory name, which is `dev` — and plenty of services have a
+> `deployments/dev` directory. Running `docker compose up` from such a directory
+> may adopt another stand's containers as its own and recreate them. If other
+> projects are running nearby, set the name explicitly:
+> `docker compose -p jwt-dev up`.
 
-### Прод-деплой
+### Production deployment
 
-`deployments/prod/` — оба варианта запуска, оба рассчитаны и на свой стенд, и на
-внешних потребителей публичного образа:
+`deployments/prod/` holds both ways to run it, and both are meant for our own
+stand as much as for external consumers of the public image:
+- `docker-compose.yml` — the service and Redis, with the secrets coming from
+  `.env` (the sample is `.env.example`; `.env` itself is in `.gitignore`);
+- `k8s/` — Deployment, Service, PodDisruptionBudget, NetworkPolicy and a sample
+  Secret, applied with `kubectl apply -k deployments/prod/k8s/`.
 
-- `docker-compose.yml` — сервис и Redis, секреты из `.env` (образец —
-  `.env.example`, сам `.env` в `.gitignore`);
-- `k8s/` — Deployment, Service, PodDisruptionBudget, NetworkPolicy и образец
-  Secret, применяются через `kubectl apply -k deployments/prod/k8s/`.
+> **`deployments/prod/README.md` is the Docker Hub description of the image.**
+> `docker.yml` pushes it there in the `dockerhub-description` step. That is why
+> every link in it is absolute (relative paths do not resolve on Docker Hub) and
+> why the text is written for someone who came for the image, not for the
+> sources.
 
-> **`deployments/prod/README.md` — это описание образа на Docker Hub.**
-> `docker.yml` пушит его туда шагом `dockerhub-description`. Поэтому ссылки в
-> нём только абсолютные (относительные пути на Docker Hub не разрешаются), а
-> текст написан для того, кто пришёл за образом, а не за исходниками.
+What matters when editing the manifests:
 
-Что важно при правке манифестов:
+- **The runtime image has neither `curl` nor `wget`** — only the runtime
+  libraries and `bash`. That is why the Compose healthcheck makes its HTTP
+  request through `/dev/tcp`; do not rewrite it to use `curl`, it will not
+  appear there. In Kubernetes this is unnecessary: `httpGet` probes are executed
+  by the kubelet outside the container.
+- **Liveness goes to `/livez`, readiness to `/readyz`.** `/livez` never touches
+  the dependencies; a liveness probe on `/readyz` would restart pods whenever
+  Redis was unavailable, that is, finish the service off with restarts at
+  exactly the moment of the outage.
+- **`RATE_LIMIT_TRUSTED_PROXIES` must be filled in**, with different values in
+  each case: in Compose it is the docker network subnet (pinned explicitly in
+  the manifest so that the proxy address is predictable), in Kubernetes it is
+  the pod network of the ingress controller. Empty means the per-IP limit is
+  keyed by the proxy address and every client shares a single limit.
+- **`SERVER_WORKERS` is set explicitly in Kubernetes (`2`), and that is not
+  tuning.** The CPU limit is deliberately absent, which means the cgroup has no
+  quota and auto-detection hits the ceiling; by fixing the worker count we make
+  the memory limit comparable to it. Change one and recompute the other. In
+  Compose the variable is empty (auto): a quota appears there as soon as `cpus`
+  is set.
+- **The port is not published to the outside.** Level 2 rests on a header set by
+  the proxy; direct access to the container bypasses it. For the same reason the
+  Kubernetes Service is a `ClusterIP`, and `networkpolicy.yaml` closes the
+  remaining gap: a `ClusterIP` is invisible from outside the cluster but
+  reachable inside it by any pod of any namespace, which means a cluster
+  neighbour can bypass level 2. The policy allows two sources — the ingress
+  controller pods and the namespace of the metrics scraper; the names there are
+  cluster-specific and are edited per stand. **NetworkPolicy is enforced by the
+  CNI**: a plugin without support for it accepts the manifest silently and does
+  nothing, so after applying it, verify that an unrelated pod cannot reach port
+  8080.
+- **The shutdown drain and the grace period are one setting spread over two
+  files.** `SERVER_SHUTDOWN_TIMEOUT_SECONDS` (25 s) must be strictly less than
+  `terminationGracePeriodSeconds` in Kubernetes (30 s) and `stop_grace_period`
+  in Compose (30 s): otherwise SIGKILL arrives exactly as the drain runs out,
+  leaving no time for the last request or for flushing telemetry (which is sent
+  after `run()` returns). Change one and recompute the other. The actix default
+  (30 s) would have coincided with the grace period, which is why the timeout is
+  set explicitly.
+- **`replicas: 3`, the PDB and `topologySpreadConstraints` are one construct,
+  not three independent settings.** Spreading across nodes stops the scheduler
+  from packing every replica onto one node (a drain would then take the whole
+  service down), and `minAvailable: 2` in `pdb.yaml` forces a drain to release
+  pods one at a time. Change the replica count and recompute `minAvailable`:
+  with `replicas: 2` the same budget blocks any voluntary eviction outright. A
+  hard spread across nodes (`DoNotSchedule`) needs at least three nodes; on a
+  smaller cluster the replicas hang in `Pending` and `ScheduleAnyway` is what is
+  needed there.
+- In `kustomization.yaml` labels are set through `labels`, not `commonLabels`:
+  the latter also writes them into the Deployment's `spec.selector`, and a
+  selector is immutable after creation, so the update would fail.
 
-- **В runtime-образе нет ни `curl`, ни `wget`** — только рантайм-библиотеки и
-  `bash`. Healthcheck в compose поэтому делает HTTP-запрос через `/dev/tcp`;
-  не переписывайте его на `curl`, он там не появится. В k8s это не нужно:
-  `httpGet`-пробы выполняет kubelet снаружи контейнера.
-- **liveness — на `/livez`, readiness — на `/readyz`.** `/livez` не ходит в
-  зависимости; liveness на `/readyz` перезапускал бы поды при недоступном
-  Redis, то есть добивал бы сервис рестартами ровно в момент аварии.
-- **`RATE_LIMIT_TRUSTED_PROXIES` заполняется обязательно** и разными
-  значениями: в compose — подсеть docker-сети (она зафиксирована в манифесте
-  явно, чтобы адрес прокси был предсказуем), в k8s — pod-сеть
-  ingress-контроллера. Пусто → ключом per-IP лимита станет адрес прокси и все
-  клиенты будут делить один лимит на всех.
-- **`SERVER_WORKERS` в k8s задан явно (`2`), и это не тюнинг.** Лимит CPU
-  снят намеренно, значит квоты у cgroup нет и автоопределение упирается в
-  потолок; фиксируя число воркеров, мы делаем сопоставимым с ним лимит памяти.
-  Меняете одно — пересчитайте другое. В compose переменная пустая (авто): там
-  квота появляется, как только задан `cpus`.
-- **Порт наружу не публикуется.** Уровень 2 держится на заголовке, который
-  ставит прокси; прямой доступ к контейнеру его обходит. По той же причине
-  Service в k8s — `ClusterIP`, а `networkpolicy.yaml` закрывает и оставшийся
-  зазор: `ClusterIP` невидим снаружи кластера, но внутри доступен любому поду
-  любого namespace'а, то есть уровень 2 обходится соседом по кластеру.
-  В политике разрешены два источника — поды ingress-контроллера и namespace
-  скрейпера метрик; имена там кластерозависимы и правятся под стенд.
-  **NetworkPolicy исполняет CNI**: плагин без её поддержки примет манифест
-  молча и не сделает ничего, так что после применения стоит убедиться, что
-  посторонний под до порта 8080 не достаёт.
-- **Дренаж при остановке и grace period — одна настройка на два файла.**
-  `SERVER_SHUTDOWN_TIMEOUT_SECONDS` (25 с) обязан быть строго меньше
-  `terminationGracePeriodSeconds` в k8s (30 с) и `stop_grace_period` в compose
-  (30 с): иначе SIGKILL приходит ровно тогда, когда дренаж только истекает, и
-  времени не остаётся ни на последний запрос, ни на досылку телеметрии (её
-  отправляют уже после возврата из `run()`). Меняете одно — пересчитайте другое.
-  Дефолт actix (30 с) совпал бы с grace period, поэтому таймаут задан явно.
-- **`replicas: 3`, PDB и `topologySpreadConstraints` — одна конструкция, а не
-  три независимые настройки.** Разнос по узлам не даёт планировщику собрать все
-  реплики на одном узле (иначе drain уносит сервис целиком), а
-  `minAvailable: 2` в `pdb.yaml` заставляет drain отпускать поды по одному.
-  Меняете число реплик — пересчитайте `minAvailable`: при `replicas: 2` тот же
-  бюджет заблокирует любое добровольное выселение намертво. Жёсткий разнос по
-  узлам (`DoNotSchedule`) требует минимум трёх узлов; на меньшем кластере
-  реплики зависнут в `Pending` — там нужен `ScheduleAnyway`.
-- В `kustomization.yaml` метки задаются через `labels`, а не `commonLabels`:
-  последний дописывает метки и в `spec.selector` Deployment'а, а селектор
-  после создания неизменяем — обновление упало бы.
+### Load test
 
-### Нагрузочный тест
+`deployments/load/` measures `POST /tokens/verify` (k6 in a container — nothing
+to install on the host). It also holds an isolated dependency stand with its own
+project name and shifted ports, the instructions in
+[`deployments/load/README.md`](deployments/load/README.md) and the recorded
+baseline in [`BASELINE.md`](deployments/load/BASELINE.md).
 
-`deployments/load/` — замер `POST /tokens/verify` (k6 в контейнере, ставить на
-хост ничего не нужно). Там же изолированный стенд зависимостей со своим именем
-проекта и смещёнными портами, инструкция в
-[`deployments/load/README.md`](deployments/load/README.md) и зафиксированный
-baseline в [`BASELINE.md`](deployments/load/BASELINE.md).
+Measure with a release build only, and always with
+`RATE_LIMIT_VERIFY_ENABLED=false`: with the default per-IP limit (10 rps) the
+run measures the rate limiter, not the service.
 
-Мерить только release-сборкой и обязательно с `RATE_LIMIT_VERIFY_ENABLED=false`:
-с дефолтным per-IP лимитом (10 rps) прогон меряет rate limiter, а не сервис.
+### The OpenAPI spec in the repository
 
-### OpenAPI-спека в репозитории
-
-[`docs/openapi.json`](docs/openapi.json) — снимок контракта API, ровно тот
-документ, который сервис отдаёт на `GET /api-docs/openapi.json`. Он лежит в git
-не для красоты: пока спека существовала только в рантайме, изменение контракта
-не оставляло следа в диффе — ломающую правку нельзя было увидеть на ревью.
-
-```bash
-cargo test openapi                    # сверить файл с кодом
-UPDATE_OPENAPI=1 cargo test openapi   # перегенерировать файл
-```
-
-Выгружает и сверяет один и тот же тест — `spec_file_is_up_to_date`
-([`src/openapi.rs`](src/openapi.rs)). Пара «отдельный генератор + отдельный
-чекер» разошлась бы между собой, а генератор, который надо не забыть запустить,
-мёртв по построению: файл устарел бы при первой же правке. Тест гоняет CI на
-каждый PR, поэтому устаревший файл роняет пайплайн — с подсказкой, чем его
-починить.
-
-Регенерации требует и подъём версии в `Cargo.toml`: она попадает в
-`info.version`. Исключать это поле из сверки не стали — файл должен быть ровно
-тем, что отдаёт сервис, иначе это уже не снимок контракта, а его пересказ.
-
-**Актуальность файла — это две разные гарантии, и сторожат их два теста.**
-`spec_file_is_up_to_date` ловит расхождение файла с `ApiDoc`, но сам по себе он
-не спасает от главного: `ApiDoc` может разойтись с приложением. Добавили ручку,
-забыли `#[utoipa::path]` — файл по-прежнему совпадает с `ApiDoc`, тест зелёный, а
-спека врёт. Это закрывает `openapi_spec_lists_all_endpoints`: он сверяет пути
-спеки с роутами, **вычитанными из исходника** `configure_api` (плюс ручки на
-атрибут-макросах в `handlers.rs`), в обе стороны — и незадокументированную ручку,
-и путь в спеке, которого в приложении уже нет.
-
-Разбор роутов текстовый, потому что перечислить их у собранного actix-приложения
-нельзя: `ResourceMap` наружу не отдаётся, а «дёрнуть путь и посмотреть, не 404 ли»
-требует заранее знать список, который мы и ищем. Отсюда два следствия для правок:
-роуты в `configure_api` регистрируются **строковыми литералами** (не константами
-и не склейкой), а непустой `web::scope("...")` тест уронит — плоский разбор
-потеряет префикс, и об этом лучше узнать сразу. Исключение из сверки одно и
-явное — `/api-docs/openapi.json`: спека не описывает саму себя.
-
-### Релизы и CHANGELOG
-
-[`CHANGELOG.md`](CHANGELOG.md) собирается из истории коммитов скриптом
-[`scripts/changelog.sh`](scripts/changelog.sh) — руками файл не правят:
+[`docs/openapi.json`](docs/openapi.json) is a snapshot of the API contract —
+exactly the document the service serves at `GET /api-docs/openapi.json`. It is
+in git for a reason: while the spec existed only at runtime, a contract change
+left no trace in the diff, and a breaking change could not be seen in review.
 
 ```bash
-scripts/changelog.sh                 # тело секции: последний тег..HEAD
-scripts/changelog.sh --insert        # вписать секцию версии из Cargo.toml в CHANGELOG.md
-scripts/changelog.sh --all > CHANGELOG.md   # пересобрать файл целиком
+cargo test openapi                    # compare the file against the code
+UPDATE_OPENAPI=1 cargo test openapi   # regenerate the file
 ```
 
-Тот же скрипт вызывает `release.yml` и кладёт результат в описание GitHub
-Release — формулировки в файле и в релизе совпадают по построению, а не потому
-что кто-то следит за синхронностью.
+One and the same test both exports and compares — `spec_file_is_up_to_date`
+([`src/openapi.rs`](src/openapi.rs)). A pair of "separate generator plus
+separate checker" would drift apart, and a generator you have to remember to run
+is dead by construction: the file would go stale on the very first change. CI
+runs the test on every pull request, so a stale file fails the pipeline — with a
+hint on how to fix it.
 
-Отсюда требование к сообщениям коммитов: **conventional commits** (`feat:`,
-`fix:`, `docs:`, `perf:`, `refactor:`, `test:`, `ci:`, `style:`) с ключом задачи
-в скобках. Subject коммита попадает в CHANGELOG дословно — пишите его как
-строчку changelog'а, а не как записку себе. Тип определяет раздел (раскладка —
-в `bucket_for`), `feat!:` выносит изменение в «Ломающие изменения».
+Bumping the version in `Cargo.toml` also requires regeneration: the version goes
+into `info.version`. Excluding that field from the comparison was rejected — the
+file must be exactly what the service serves, otherwise it is a retelling of the
+contract rather than a snapshot of it.
 
-> **Версий больше, чем релизов.** Версия поднимается каждым коммитом, а тег
-> создаётся один — на финальную версию мержа. Поэтому в тегах есть пропуски
-> (1.11.0, 1.12.0, 1.12.1): их коммиты вошли в следующий выпущенный тег, а не
-> потерялись.
+**Keeping the file current is two different guarantees, and two tests stand
+watch over them.** `spec_file_is_up_to_date` catches the file drifting from
+`ApiDoc`, but on its own it does not save you from the main risk: `ApiDoc` can
+drift from the application. Add an endpoint, forget `#[utoipa::path]` — the file
+still matches `ApiDoc`, the test is green and the spec lies. That is what
+`openapi_spec_lists_all_endpoints` closes: it compares the paths of the spec
+against the routes **parsed out of the source** of `configure_api` (plus the
+endpoints declared through attribute macros in `handlers.rs`), in both
+directions — catching an undocumented endpoint as well as a path in the spec
+that no longer exists in the application.
 
-### Гигиена публичного репозитория
+The route parsing is textual because a built actix application cannot enumerate
+them: `ResourceMap` is not exposed, and "poke a path and see whether it 404s"
+requires knowing the very list we are looking for in advance. Two consequences
+for edits follow: routes in `configure_api` are registered with **string
+literals** (not constants, not concatenation), and a non-empty
+`web::scope("...")` will fail the test — flat parsing would lose the prefix, and
+it is better to find that out immediately. There is exactly one explicit
+exclusion from the comparison, `/api-docs/openapi.json`: the spec does not
+describe itself.
 
-Репозиторий рассчитан на внешнего читателя, и «входные» документы разведены по
-ролям — не сваливайте всё в один файл:
+### Releases and the changelog
 
-| Файл | Кому и о чём |
-|------|--------------|
-| [`README.md`](README.md) | Пришедшему извне: что сервис делает и чего **не** делает, где он стоит в системе, быстрый старт, карта остальной документации. |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Тому, кто хочет прислать PR: окружение, команды, что проверяет CI, соглашения по коду и коммитам, чеклист PR, лицензия вклада. |
-| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Правила общения (Contributor Covenant 2.1), контакт для жалоб — `andrey@filipov.dev`. |
-| [`SECURITY.md`](SECURITY.md) | Приватный канал для уязвимостей, сроки, область действия. |
-| `AGENTS.md` (этот файл) | Тому, кто уже внутри: архитектура, подводные камни, полная конфигурация. |
+[`CHANGELOG.md`](CHANGELOG.md) is assembled from the commit history by
+[`scripts/changelog.sh`](scripts/changelog.sh) — the file is never edited by
+hand:
 
-Шаблоны в [`.github/`](.github): формы issue
+```bash
+scripts/changelog.sh                 # the body of a section: last tag..HEAD
+scripts/changelog.sh --insert        # insert the section for the Cargo.toml version into CHANGELOG.md
+scripts/changelog.sh --all > CHANGELOG.md   # rebuild the whole file
+```
+
+`release.yml` calls the same script and puts the result into the GitHub release
+description — the wording in the file and in the release matches by
+construction, not because somebody keeps them in sync.
+
+Hence the requirement on commit messages: **conventional commits** (`feat:`,
+`fix:`, `docs:`, `perf:`, `refactor:`, `test:`, `ci:`, `style:`) with the task
+key in parentheses. The subject of a commit goes into the changelog verbatim —
+write it as a changelog line, not as a note to yourself. The type picks the
+section (the mapping is in `bucket_for`), and `feat!:` moves the change to
+"Breaking changes".
+
+> **There are more versions than releases.** The version is bumped by every
+> commit, while exactly one tag is created — for the final version of the merge.
+> That is why there are gaps in the tags (1.11.0, 1.12.0, 1.12.1): their commits
+> went into the next released tag rather than getting lost.
+
+> **The historical entries in `CHANGELOG.md` are in Russian, and that is a
+> deliberate decision** (JWT-114): the commit history is not being rewritten, so
+> the sections generated from it stay as they are. New entries are English, like
+> the commits they come from. The file is the single exception in the language
+> gate — see "Repository language".
+
+### Public repository hygiene
+The repository is written for an external reader, and the entry documents are
+split by role — do not pile everything into one file:
+
+| File | For whom, about what |
+|------|----------------------|
+| [`README.md`](README.md) | For someone arriving from outside: what the service does and does **not** do, where it sits in the system, the quick start, the map of the rest of the documentation. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | For someone who wants to send a pull request: environment, commands, what CI checks, code and commit conventions, the pull request checklist, the license of contributions. |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | The rules of engagement (Contributor Covenant 2.1), with `andrey@filipov.dev` as the contact for complaints. |
+| [`SECURITY.md`](SECURITY.md) | The private channel for vulnerabilities, the timelines, the scope. |
+| `AGENTS.md` (this file) | For someone already inside: architecture, pitfalls, the full configuration. |
+
+The templates live in [`.github/`](.github): the issue forms
 ([`ISSUE_TEMPLATE/bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml),
 [`feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml),
-[`docs.yml`](.github/ISSUE_TEMPLATE/docs.yml)) и
+[`docs.yml`](.github/ISSUE_TEMPLATE/docs.yml)) and
 [`PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
 
-> **Пустые issue выключены** (`blank_issues_enabled: false` в
-> [`ISSUE_TEMPLATE/config.yml`](.github/ISSUE_TEMPLATE/config.yml)) — иначе разбор
-> начинается с выпрашивания версии и шагов воспроизведения. Там же `contact_links`
-> уводит уязвимости в приватный адвайзори, а вопросы про ключи — в
-> `jwks-service-app`: это единственный способ показать человеку правильный канал
-> **до** того, как он опубликует находку.
+> **Blank issues are disabled** (`blank_issues_enabled: false` in
+> [`ISSUE_TEMPLATE/config.yml`](.github/ISSUE_TEMPLATE/config.yml)) — otherwise
+> triage starts by begging for the version and the steps to reproduce. The same
+> file uses `contact_links` to route vulnerabilities to a private advisory and
+> questions about keys to `jwks-service-app`: that is the only way to show
+> someone the right channel **before** they publish a finding.
 
-Чеклист PR в шаблоне дублирует правила из «Правил для агентов» (версия,
-`docs/openapi.json`, `internal_endpoints()`, генерируемый `CHANGELOG.md`).
-Меняете правило — правьте оба места, иначе шаблон начнёт требовать не то.
+The checklist in the pull request template duplicates the rules from "Rules for
+agents" (the version, `docs/openapi.json`, `internal_endpoints()`, the generated
+`CHANGELOG.md`). Change a rule and change both places, or the template starts
+demanding the wrong thing.
 
-**Метаданные самого репозитория** (`description`, `homepage`, `topics`) живут не
-в файлах, а в настройках GitHub, и потому уезжают тише всего. Текущие значения:
+**The metadata of the repository itself** (`description`, `homepage`, `topics`)
+lives in the GitHub settings rather than in files, which is why it drifts the
+most quietly of all. The current values:
 
 ```bash
 curl -s https://api.github.com/repos/filipov-dev/jwt-service-app \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["description"], d["homepage"], d["topics"], sep="\n")'
 ```
 
-- `description` — «Сервис выпуска, проверки и отзыва JWT: RS/ES/EdDSA, ключи из
-  внешнего JWKS, отзыв по `jti`, четыре уровня доступа». Та же по смыслу строка
-  лежит в метке образа `org.opencontainers.image.description`
-  ([`deployments/prod/Dockerfile`](deployments/prod/Dockerfile)) и в шапке
-  [`deployments/prod/README.md`](deployments/prod/README.md) — описании образа на
-  Docker Hub. Правите одну — сверьте остальные.
-- `homepage` — страница образа на Docker Hub: репозиторий читают, а запускают
-  образ.
+- `description` — "Issue, verify and revoke JWTs: RS/ES/EdDSA, keys from an
+  external JWKS, revocation by `jti`, four access levels". The same statement
+  appears in the image label `org.opencontainers.image.description`
+  ([`deployments/prod/Dockerfile`](deployments/prod/Dockerfile)) and at the top
+  of [`deployments/prod/README.md`](deployments/prod/README.md), the Docker Hub
+  description of the image. Change one and check the others.
+- `homepage` — the image page on Docker Hub: people read the repository but run
+  the image.
 - `topics` — `jwt`, `jwks`, `rust`, `actix-web`, `authentication`,
   `authorization`, `microservice`, `redis`, `openapi`, `totp`, `docker`,
   `security`.
 
-## Конфигурация (переменные окружения)
+## Configuration (environment variables)
 
-| Переменная | Дефолт | Назначение |
-|-----------|--------|-----------|
-| `HOST` | `127.0.0.1` | Адрес привязки. |
-| `PORT` | `8080` | Порт. |
-| `SERVER_WORKERS` | `auto` | Число воркер-потоков. `auto`/`0`/пусто — по квоте CPU cgroup (округление вверх), а при её отсутствии — потолок 4, но **не** число ядер хоста. |
-| `SERVER_CLIENT_REQUEST_TIMEOUT_MS` | `5000` | Время на приём заголовков запроса. `0` — без ограничения. |
-| `SERVER_KEEP_ALIVE_SECONDS` | `5` | Простой keep-alive-соединения. `0` — keep-alive выключен. |
-| `SERVER_SHUTDOWN_TIMEOUT_SECONDS` | `25` | Сколько времени сервер дослуживает запросы в полёте после сигнала остановки. `0` — рвать соединения сразу. Должно быть **строго меньше** `terminationGracePeriodSeconds` (k8s) / `stop_grace_period` (compose), иначе pod убивают посреди дренажа. |
-| `TOKEN_ALGORITHM` | `RS256` | Алгоритм подписи (см. `SUPPORTED_ALGORITHMS` в `key.rs`). |
-| `TOKEN_EXPIRATION_SECONDS` | `3600` | TTL токена и записи `jti` в Redis по умолчанию (когда `ttl` не передан в запросе). |
-| `TOKEN_TTL_MIN_SECONDS` | `1` | Нижняя граница кастомного `ttl` в теле `POST /tokens`. |
-| `TOKEN_TTL_MAX_SECONDS` | `86400` | Верхняя граница кастомного `ttl` в теле `POST /tokens`. |
-| `TOKEN_CLAIMS_MAX_COUNT` | `32` | Максимум пользовательских claims в теле `POST /tokens`. |
-| `TOKEN_CLAIMS_MAX_BYTES` | `4096` | Максимальный суммарный объём пользовательских claims. Токен ездит в заголовках — раздутый payload ломает прокси. |
-| `TOKEN_JKU` | — (нет) | Если задан, кладётся в заголовок `jku` и проверяется при верификации. |
-| `TOKEN_ISSUER_ALLOWLIST` | — (нет) | Разрешённые значения `iss` — списком через запятую (`Host` берётся как есть, вместе с портом; регистр не важен). Пусто → любой `Host` (прежнее поведение). |
-| `REFRESH_TOKEN_TTL_SECONDS` | `2592000` (30 суток) | Время жизни refresh-токена. Длинный срок безопасен за счёт ротации: украденный токен работает лишь до первого обмена настоящим клиентом. |
-| `REDIS_URL` | `redis://redis:6379` | Подключение к Redis. |
-| `REDIS_RESPONSE_TIMEOUT_MS` | `1000` | Таймаут ожидания ответа на команду. Без него зависший Redis удерживал бы обработчик неограниченно. |
-| `REDIS_CONNECT_TIMEOUT_MS` | `500` | Таймаут установки соединения. |
-| `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Базовый URL сервиса ключей. |
-| `JWKS_REQUEST_TIMEOUT_MS` | `2000` | Общий таймаут запроса к сервису ключей. Без него зависший JWKS удерживал бы воркер до таймаута ОС. |
-| `JWKS_CONNECT_TIMEOUT_MS` | `500` | Таймаут установки соединения с сервисом ключей. |
-| `JWKS_CACHE_TTL_SECONDS` | `300` | Сколько снимок JWKS считается свежим. `0` — кеш выключен (каждая верификация идёт в JWKS, прежнее поведение). |
-| `JWKS_CACHE_MISS_REFRESH_SECONDS` | `10` | Минимальный интервал между обновлениями кеша по неизвестному `kid`. Он же — задержка подхвата нового ключа при ротации. |
-| `JWKS_CACHE_STALE_GRACE_SECONDS` | `10` | Сколько снимок JWKS отдаётся **сверх** TTL, если сервис ключей недоступен (stale-while-revalidate). Предельный возраст пригодного снимка = TTL + отсрочка. Десяти секунд хватает на моргание сети и рестарт JWKS; длиннее — ровно настолько же дольше живёт отозванный ключ. `0` — отдача устаревших снимков выключена. |
-| `RUST_LOG` | — | Фильтр логов по уровням (`tracing-subscriber`, `EnvFilter`; дефолт `jwt_service_app=info`). |
-| `LOG_FORMAT` | `pretty` | Формат логов: `json` — построчный JSON (для сборщиков: Monium/ELK); иначе человекочитаемый `pretty` с ANSI. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL OTLP-коллектора (напр. `http://otel-collector:4318`); к нему добавляется `/v1/traces`. Не задан — трейсинг выключен. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (нет) | **Полный** URL для трейсов; используется как есть и имеет приоритет над базовым. |
-| `OTEL_SERVICE_NAME` | `jwt-service-app` | Имя сервиса в трейсах и логах (атрибут `service.name`). |
-| `OTEL_LOGS_ENABLED` | `false` | Слать ли **логи** по OTLP. Отдельный флаг: включение трейсов логи не включает. |
-| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — (нет) | **Полный** URL для логов; используется как есть и имеет приоритет над базовым. |
-| `GLITCHTIP_DSN` | — (нет) | DSN GlitchTip. Не задан — интеграция выключена. Принимается и `SENTRY_DSN`. **Секрет, не коммитить.** |
-| `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | Доля span-ов в Performance (0.0–1.0). `0.0` — performance выключен. |
-| `GLITCHTIP_ENABLE_LOGS` | `false` | Слать ли структурные логи в канал Logs. |
-| `GLITCHTIP_ENVIRONMENT` | — (нет) | Окружение (`prod`/`stage`) для группировки в GlitchTip. |
-| `AUTH_PROXY_SECRET` | — (**обязателен**) | Уровень 2: ожидаемый секрет заголовка. Без него сервис не стартует. |
-| `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Уровень 2: имя заголовка с секретом. |
-| `AUTH_TOTP_SECRET` | — (**обязателен**) | Уровень 3: основной TOTP-секрет (base32). Без него сервис не стартует. |
-| `AUTH_TOTP_SECRET_NEXT` | — (нет) | Уровень 3: второй активный секрет на время ротации (base32). |
-| `AUTH_TOTP_HEADER` | `X-TOTP-Code` | Уровень 3: имя заголовка с TOTP-кодом. |
-| `AUTH_TOTP_STEP_SECONDS` | `30` | Уровень 3: шаг окна TOTP. Для более узкого окна replay задайте меньшее значение (напр. `5`) — но тогда часы клиента и сервера должны быть синхронизированы по NTP; при рассинхроне поднимайте `AUTH_TOTP_SKEW_STEPS`. Дефолт 30 не меняем в коде: это общий контракт с клиентами. |
-| `AUTH_TOTP_DIGITS` | `6` | Уровень 3: число знаков кода (6–8). |
-| `AUTH_TOTP_ALGORITHM` | `SHA1` | Уровень 3: хеш HMAC (`SHA1`/`SHA256`/`SHA512`). |
-| `AUTH_TOTP_SKEW_STEPS` | `1` | Уровень 3: допуск по окнам в обе стороны (рассинхрон часов). |
-| `AUTH_TOTP_REPLAY_PROTECTION` | `false` | Уровень 3: запрет переигрывания TOTP-кода. Включение добавляет auth-слою зависимость от Redis; при недоступном Redis — fail-open. |
-| `RATE_LIMIT_VERIFY_ENABLED` | `true` | Per-IP лимит на `POST /tokens/verify`. |
-| `RATE_LIMIT_VERIFY_PER_SECOND` | `10` | Устойчивый темп per-IP (запросов/с на адрес). |
-| `RATE_LIMIT_VERIFY_BURST` | `20` | Ёмкость всплеска per-IP (размер ведра). |
-| `RATE_LIMIT_INTERNAL_ENABLED` | `false` | Глобальный cap на internal-ручки (`POST /tokens`, `DELETE /tokens/{jti}`). |
-| `RATE_LIMIT_INTERNAL_PER_SECOND` | `50` | Устойчивый темп глобального cap (запросов/с на эндпоинт). |
-| `RATE_LIMIT_INTERNAL_BURST` | `100` | Ёмкость всплеска глобального cap. |
-| `RATE_LIMIT_TRUSTED_PROXIES` | — (нет) | Список доверенных прокси (IP/CIDR через запятую). Только за ними доверяется `X-Forwarded-For`; пусто → ключ = peer-адрес. |
-| `RATE_LIMIT_FORWARDED_HEADER` | `X-Forwarded-For` | Имя заголовка с IP клиента (разбор — список справа налево). |
-| `AUTH_METRICS_TOKEN` | — (нет) | Уровень 4: статический Bearer-токен для скрейпа `GET /metrics`. Не задан → ручка не публикуется (`404`), сервис стартует. |
-| `CORS_ALLOWED_ORIGINS` | — (нет) | Разрешённые origin'ы CORS для `POST /tokens/verify` (список через запятую). Пусто → `allow_any_origin`. Применяется только к этой ручке. |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HOST` | `127.0.0.1` | Bind address. |
+| `PORT` | `8080` | Port. |
+| `SERVER_WORKERS` | `auto` | Number of worker threads. `auto`/`0`/empty means from the cgroup CPU quota (rounded up), and without a quota a ceiling of 4 — **not** the host core count. |
+| `SERVER_CLIENT_REQUEST_TIMEOUT_MS` | `5000` | Time allowed to receive the request headers. `0` means no limit. |
+| `SERVER_KEEP_ALIVE_SECONDS` | `5` | Idle time of a keep-alive connection. `0` disables keep-alive. |
+| `SERVER_SHUTDOWN_TIMEOUT_SECONDS` | `25` | How long the server keeps serving in-flight requests after a stop signal. `0` tears connections down immediately. Must be **strictly less** than `terminationGracePeriodSeconds` (k8s) / `stop_grace_period` (Compose), otherwise the pod is killed mid-drain. |
+| `TOKEN_ALGORITHM` | `RS256` | Signing algorithm (see `SUPPORTED_ALGORITHMS` in `key.rs`). |
+| `TOKEN_EXPIRATION_SECONDS` | `3600` | Default token TTL and TTL of the `jti` record in Redis (when `ttl` is not passed in the request). |
+| `TOKEN_TTL_MIN_SECONDS` | `1` | Lower bound for a custom `ttl` in the body of `POST /tokens`. |
+| `TOKEN_TTL_MAX_SECONDS` | `86400` | Upper bound for a custom `ttl` in the body of `POST /tokens`. |
+| `TOKEN_CLAIMS_MAX_COUNT` | `32` | Maximum number of custom claims in the body of `POST /tokens`. |
+| `TOKEN_CLAIMS_MAX_BYTES` | `4096` | Maximum total size of the custom claims. A token travels in headers, and a bloated payload breaks proxies. |
+| `TOKEN_JKU` | — (none) | When set, it is put into the `jku` header and checked during verification. |
+| `TOKEN_ISSUER_ALLOWLIST` | — (none) | Allowed `iss` values, comma-separated (`Host` is taken as is, port included; case-insensitive). Empty means any `Host` (the previous behaviour). |
+| `REFRESH_TOKEN_TTL_SECONDS` | `2592000` (30 days) | Lifetime of a refresh token. The long window is safe thanks to rotation: a stolen token works only until the real client next exchanges it. |
+| `REDIS_URL` | `redis://redis:6379` | Redis connection. |
+| `REDIS_RESPONSE_TIMEOUT_MS` | `1000` | Timeout waiting for a command response. Without it a hung Redis would hold the handler indefinitely. |
+| `REDIS_CONNECT_TIMEOUT_MS` | `500` | Connection timeout. |
+| `JWKS_SERVICE_URL` | `http://jwks-service-app:8080` | Base URL of the key service. |
+| `JWKS_REQUEST_TIMEOUT_MS` | `2000` | Overall timeout of a request to the key service. Without it a hung JWKS would hold a worker until the OS timeout. |
+| `JWKS_CONNECT_TIMEOUT_MS` | `500` | Connection timeout to the key service. |
+| `JWKS_CACHE_TTL_SECONDS` | `300` | How long a JWKS snapshot is considered fresh. `0` disables the cache (every verification goes to the JWKS, the previous behaviour). |
+| `JWKS_CACHE_MISS_REFRESH_SECONDS` | `10` | Minimum interval between cache refreshes triggered by an unknown `kid`. It is also the delay before a new key is picked up during rotation. |
+| `JWKS_CACHE_STALE_GRACE_SECONDS` | `10` | How long a JWKS snapshot is still served **beyond** its TTL while the key service is unavailable (stale-while-revalidate). The maximum age of a usable snapshot is TTL + grace. Ten seconds cover a network blip and a JWKS restart; a longer value keeps a revoked key alive for exactly as much longer. `0` disables serving stale snapshots. |
+| `RUST_LOG` | — | Log level filter (`tracing-subscriber`, `EnvFilter`; the default is `jwt_service_app=info`). |
+| `LOG_FORMAT` | `pretty` | Log format: `json` for line-delimited JSON (for collectors: Monium/ELK); anything else gives the human-readable `pretty` format with ANSI. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (none) | The **base** URL of the OTLP collector (e.g. `http://otel-collector:4318`); `/v1/traces` is appended to it. Unset means tracing is off. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (none) | The **full** URL for traces; used as is and takes precedence over the base one. |
+| `OTEL_SERVICE_NAME` | `jwt-service-app` | Service name in traces and logs (the `service.name` attribute). |
+| `OTEL_LOGS_ENABLED` | `false` | Whether to send **logs** over OTLP. A separate flag: enabling traces does not enable logs. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — (none) | The **full** URL for logs; used as is and takes precedence over the base one. |
+| `GLITCHTIP_DSN` | — (none) | GlitchTip DSN. Unset means the integration is off. `SENTRY_DSN` is accepted too. **A secret; do not commit it.** |
+| `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | Fraction of spans sent to Performance (0.0–1.0). `0.0` disables performance. |
+| `GLITCHTIP_ENABLE_LOGS` | `false` | Whether to send structured logs to the Logs channel. |
+| `GLITCHTIP_ENVIRONMENT` | — (none) | Environment (`prod`/`stage`) for grouping in GlitchTip. |
+| `AUTH_PROXY_SECRET` | — (**required**) | Level 2: the expected value of the secret header. The service does not start without it. |
+| `AUTH_PROXY_SECRET_HEADER` | `X-Proxy-Secret` | Level 2: the name of the header carrying the secret. |
+| `AUTH_TOTP_SECRET` | — (**required**) | Level 3: the primary TOTP secret (base32). The service does not start without it. |
+| `AUTH_TOTP_SECRET_NEXT` | — (none) | Level 3: a second active secret for the duration of a rotation (base32). |
+| `AUTH_TOTP_HEADER` | `X-TOTP-Code` | Level 3: the name of the header carrying the TOTP code. |
+| `AUTH_TOTP_STEP_SECONDS` | `30` | Level 3: the TOTP window step. For a narrower replay window set a smaller value (e.g. `5`) — but then the client and server clocks must be NTP-synchronised, and with drift you need a larger `AUTH_TOTP_SKEW_STEPS`. The default of 30 is not changed in code: it is the shared contract with the clients. |
+| `AUTH_TOTP_DIGITS` | `6` | Level 3: number of digits in the code (6–8). |
+| `AUTH_TOTP_ALGORITHM` | `SHA1` | Level 3: the HMAC hash (`SHA1`/`SHA256`/`SHA512`). |
+| `AUTH_TOTP_SKEW_STEPS` | `1` | Level 3: tolerance in windows in both directions (clock drift). |
+| `AUTH_TOTP_REPLAY_PROTECTION` | `false` | Level 3: forbid replaying a TOTP code. Enabling it adds a Redis dependency to the auth layer; with Redis unavailable it fails open. |
+| `RATE_LIMIT_VERIFY_ENABLED` | `true` | Per-IP limit on `POST /tokens/verify`. |
+| `RATE_LIMIT_VERIFY_PER_SECOND` | `10` | Sustained per-IP rate (requests per second per address). |
+| `RATE_LIMIT_VERIFY_BURST` | `20` | Per-IP burst capacity (bucket size). |
+| `RATE_LIMIT_INTERNAL_ENABLED` | `false` | Global cap on the internal endpoints (`POST /tokens`, `DELETE /tokens/{jti}`). |
+| `RATE_LIMIT_INTERNAL_PER_SECOND` | `50` | Sustained rate of the global cap (requests per second per endpoint). |
+| `RATE_LIMIT_INTERNAL_BURST` | `100` | Burst capacity of the global cap. |
+| `RATE_LIMIT_TRUSTED_PROXIES` | — (none) | List of trusted proxies (IP/CIDR, comma-separated). `X-Forwarded-For` is trusted only behind them; empty means the key is the peer address. |
+| `RATE_LIMIT_FORWARDED_HEADER` | `X-Forwarded-For` | Name of the header carrying the client IP (parsed as a list, right to left). |
+| `AUTH_METRICS_TOKEN` | — (none) | Level 4: the static bearer token for scraping `GET /metrics`. Unset means the endpoint is not published (`404`) and the service still starts. |
+| `CORS_ALLOWED_ORIGINS` | — (none) | Allowed CORS origins for `POST /tokens/verify` (comma-separated). Empty means `allow_any_origin`. Applies to that endpoint only. |
 
-`iss` токена берётся **из заголовка `Host` запроса**, а не из конфига, но его
-значение ограничивается `TOKEN_ISSUER_ALLOWLIST`. Список обязателен там, где
-несколько инстансов делят один `jwks-service-app`: без него у инстанса `A`
-выпускается токен с `Host: b.example.com`, подписанный общим ключом, и инстанс
-`B` примет его как свой. Выпуск (`POST /tokens`) и обмен refresh с `Host` вне
-списка дают `403`; проверка (`POST /tokens/verify`) — `401`, как и любой другой
-отказ верификации: причину публичная ручка наружу не раскрывает.
+The `iss` of a token comes **from the `Host` header of the request**, not from
+the configuration, but its value is constrained by `TOKEN_ISSUER_ALLOWLIST`. The
+list is mandatory wherever several instances share one `jwks-service-app`:
+without it instance `A` issues a token with `Host: b.example.com` signed by the
+shared key, and instance `B` accepts it as its own. Issuing (`POST /tokens`) and
+a refresh exchange with a `Host` outside the list give `403`; verification
+(`POST /tokens/verify`) gives `401`, like any other verification failure — a
+public endpoint does not reveal the reason.
 
-Секреты (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET*`) не логируются и не коммитятся;
-подставляйте их из секрет-менеджера. Дефолтные имена заголовков (`X-Proxy-Secret`,
-`X-TOTP-Code`) продублированы в OpenAPI как security-схемы `proxy_secret`/`totp` —
-при переопределении через env обновите описание схем в `main.rs`.
+Secrets (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET*`) are never logged and never
+committed; inject them from a secret manager. The default header names
+(`X-Proxy-Secret`, `X-TOTP-Code`) are duplicated in the OpenAPI spec as the
+`proxy_secret` and `totp` security schemes — when you override them through the
+environment, update the scheme descriptions in `main.rs`.
 
-## Соглашения и подводные камни
+## Conventions and pitfalls
 
-- **Сервис говорит только по HTTP/1.1: фича `http2` у `actix-web` выключена.**
-  Она тянула `h2` 0.3, которая не получила патча к RUSTSEC-2026-0258 (ветка 0.3
-  не выходит с июля 2025, а `actix-http` до сих пор требует `h2 ^0.3.27`).
-  Функционально не потеряно ничего: HTTP/2 у actix доступен либо через TLS с
-  ALPN (сервис TLS не терминирует — TLS на обратном прокси), либо через
-  `bind_auto_h2c()`, а сервер поднимается обычным `bind()`. То есть код `h2`
-  линковался, но был недостижим. В `Cargo.toml` дефолтные фичи перечислены
-  явно — при обновлении actix список надо сверять, иначе новая дефолтная фича
-  молча не включится. Планируемый gRPC (JWT-102) это не задевает: `tonic`
-  поднимает собственный сервер на `hyper` с `h2` 0.4. Включать `http2` обратно
-  имеет смысл, только если понадобится HTTP/2 в самом REST-API, — и тогда
-  сначала проверьте, вышел ли патч для `h2` 0.3.
-- **TLS-стек в бинаре ровно один — `native-tls` (JWT-46).** До этого линковались
-  два сразу: `rustls` + `aws-lc-rs` приезжали из дефолтных фич `reqwest`
-  (в 0.13 `default-tls` означает уже не `native-tls`, а `rustls`), а `native-tls`
-  — из `sentry` (фича `transport`). Выбран `native-tls`, потому что он
-  переиспользует openssl, который в сервисе обязателен для подписи JWT, —
-  и тогда весь rustls-стек (`aws-lc-rs`, `rustls-webpki`,
-  `rustls-platform-verifier`, `quinn`) уходит целиком. Итог: релизный бинарь
-  19 427 168 → 16 119 848 байт (−3,2 МиБ, −17 %), сборка зависимостей в Docker
-  213 → 169 с (пропал `cmake`-билд `aws-lc-sys`); из динамических зависимостей
-  остались только `libssl`/`libcrypto` рантайм-образа.
-  - **Корни доверия теперь системные** (`/etc/ssl/certs`), а не вшитый
-    `webpki-roots`: пакет `ca-certificates` в рантайм-образе обязателен, без него
-    HTTPS к JWKS и OTLP отвалится по проверке сертификата.
-  - **Фичи `reqwest` перечислены явно** — при обновлении сверяйте список с новым
-    дефолтом, иначе `default-tls` вернёт rustls обратно.
-  - **Второй бэкенд `jti` вернёт rustls**: YDB тянет `tonic`, а он ходит по TLS
-    через rustls. Это ещё один довод за раздельные сборки по бэкендам.
-- **Релизный профиль: LTO, один codegen-unit, срезанные символы (JWT-47).**
-  Секции `[profile.release]` в `Cargo.toml` не было вообще — прод-образ собирался
-  дефолтом cargo: LTO выключен, `codegen-units = 16`, таблица символов на месте.
-  Теперь `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`. Прод-бинарь
-  (Docker, сборка без кеша) 16 119 848 → 8 937 224 байта (−6,8 МиБ, −45 %),
-  образ 172 → 163 МБ. По частям (локальная сборка, 8 ядер): LTO с одним юнитом
-  дают −3,5 МиБ, `strip` — ещё −1,5 МиБ.
-  - **Платим временем сборки, и именно тем слоем, который кешируется хуже
-    всего.** Сборка образа целиком 331 → 423 с, но внутри неё `cargo chef cook`
-    (зависимости, в CI переиспользуются из кеша) 171 → 217 с, а финальный
-    `cargo build --release` — 11,5 → 100 с. То есть правка одного файла в
-    исходниках, которая раньше стоила десяток секунд, теперь стоит полторы
-    минуты: fat LTO — это один проход оптимизатора по всему графу на этапе
-    линковки, и кеш зависимостей от него не спасает; `codegen-units = 1`
-    вдобавок сериализует кодогенерацию. Локально чистая сборка 88 → 127 с.
-  - **`panic = "abort"` не добавлять.** Он убил бы канал паник в GlitchTip
-    (`sentry-panic` ставит хук и успевает отправить событие, пока стек
-    разматывается) и изоляцию воркеров actix: паника в одном запросе роняла бы
-    процесс целиком вместо одного соединения. Экономия несопоставима.
-  - **`strip = "symbols"` стоит стека паник в GlitchTip.** Само событие приходит
-    (сообщение и `file:line` — константы, вшитые в бинарь), но кадры backtrace'а
-    без таблицы символов не резолвятся: на Linux в релизной сборке без `strip`
-    кадры именованные, со `strip` список кадров пуст. Понадобится стек в
-    Issues — меняйте на `strip = "debuginfo"` (+1,5 МиБ к бинарю), а не
-    откатывайте LTO.
-- **Доменный код (`key.rs`, `jwt.rs`, `models/jwt.rs`) обрабатывает ошибки через
-  `Result`/`?`** и типы из `error.rs` / `models/jwt.rs` — без `.unwrap()`.
-  Продолжайте в том же стиле; `.unwrap()`/`.expect()` остаются только в `main.rs`
-  на старте (fail-fast при некорректной конфигурации).
-- **Refresh-токены (`jwt.rs`).** Выдаются только по явному запросу
-  (`"refresh": true` в теле `POST /tokens`) — контракт прежних клиентов не
-  меняется.
-  - **Ротация при каждом обмене**, а не переиспользование: старый токен сразу
-    помечается использованным. Переиспользуемый refresh с длинным TTL — это
-    долгоживущий пароль без способа обнаружить компрометацию.
-  - **Детектор повторного использования.** Предъявление уже использованного
-    токена означает утечку: настоящий клиент свой экземпляр уже обменял.
-    Отличить вора от жертвы невозможно, поэтому гасится **вся семья** — и
-    refresh-цепочка, и выданные по ней access-токены. Плата за ложное
-    срабатывание (клиент потерял ответ и повторил запрос) — повторный вход;
-    это дешевле, чем оставить вору рабочую цепочку.
-  - **Пометка использования обязана быть атомарной.** В Redis это `HSETNX`:
-    победитель ровно один, поэтому две параллельные попытки обмена одним токеном
-    не могут обе получить новую пару.
-  - **Access-токены тоже попадают в группу семьи.** Иначе детектор гасил бы
-    только refresh, а уже выданные access продолжали бы работать до своего `exp`.
-  - **Обмен закрыт уровнем 3, как и выпуск.** Обмен — это выпуск токена, просто
-    основанием служит предъявленный refresh, а не запрос доверенного бэкенда.
-    Уровень 2 здесь был бы дырой: proxy-secret статичен и вызывающего не
-    аутентифицирует, поэтому украденный refresh давал бы вечную цепочку токенов
-    любому, кто дотянулся через прокси. Конечное приложение с сервисом напрямую
-    не общается — с ним говорит бэкенд-потребитель, который и держит TOTP-секрет.
-- **Группы токенов (`models/jwt.rs`, `redis.rs`).** Механизм намеренно обобщён:
-  хранилище оперирует абстрактным ключом группы, а смысл задаёт вызывающий
-  ([`subject_group`]). Так его переиспользует отзыв семьи refresh-токенов
-  (JWT-28) — своего механизма там заводить не нужно.
-  - **ZSET, а не SET**: у элементов множества нет собственного TTL, и истёкшие
-    `jti` копились бы в индексе мёртвым грузом. Score = момент истечения, поэтому
-    их отрезает одна команда `ZREMRANGEBYSCORE`.
-  - **Индекс пишется по fail-fast**, как и сам `jti`: токен, не попавший в
-    индекс, пережил бы массовый отзыв. Тихо выпустить такой токен опаснее, чем не
-    выпустить вовсе.
-  - **Атомарности у отзыва нет намеренно**: параллельный выпуск во время отзыва
-    может добавить `jti` уже после `ZRANGE`, и такой токен уцелеет. Окно — доли
-    миллисекунды, а цена атомарности (Lua/WATCH) выше пользы: массовый отзыв
-    делают при компрометации, и следом обычно меняют учётные данные субъекта.
-  - **Ошибка отзыва отдаётся наружу как `500`**, а не маскируется успехом.
-    Это касается обеих ручек отзыва: молчаливый «успех» при неудавшемся отзыве
-    скомпрометированных токенов опаснее честной ошибки — вызывающий считает
-    задачу выполненной и не повторяет попытку. При этом **идемпотентность
-    сохраняется**: отзыв несуществующего `jti` — это `204`, а не ошибка, потому
-    что желаемое состояние достигнуто.
-- **Хранилище `jti` доступно только через трейт `JtiStore` (JWT-60).** Ни один
-  модуль выше `redis.rs` не должен упоминать `RedisClient`, `redis::` или
-  `RedisError` — иначе шов протекает и второй бэкенд не подключить.
-  - **HTTP-обработчики обобщены по хранилищу** (`create_token<S: JtiStore>` и
-    т.п.), конкретный тип подставляется один раз в `main.rs` (`configure_api::<RedisClient>`).
-    Отдельных «продакшн-обёрток» поверх обобщённых реализаций нет: они принимали
-    `web::Data<RedisClient>` и были ровно тем местом, где шов и протекал.
-  - **Поэтому роуты собираются вручную** (`web::resource(...)`/`.route(...)`), а
-    не атрибут-макросами actix (`#[post("/tokens")]`): те не умеют обобщённые
-    обработчики. Исключение — `livez`, он от хранилища не зависит.
-    `#[utoipa::path]` на обобщённой функции работает; полноту спеки сторожит тест
-    `openapi_spec_lists_all_endpoints`.
-  - **`/readyz` пингует хранилище через `JtiStore::ping`**, а не `RedisClient`
-    напрямую. Добавляя бэкенд, реализуйте `ping` честно: readiness — это
-    «сможем ли обслуживать», и без хранилища ответ «нет».
-  - **`where Self: Sized` в трейте не нужен**: `async fn` в трейте и так делает
-    его не объектно-безопасным, а хранилище всюду берётся по статическому типу.
-- **Новый ключ создаётся только на `404` от сервиса ключей.** В
-  `JwkService::private_key` ветка создания срабатывает исключительно на
-  [`JwkError::NotFound`], а он возвращается только при честном `404`; `5xx`,
-  нечитаемое тело и недоступность сети пробрасываются наверх как ошибка. Иначе
-  кратковременный сбой JWKS порождал бы новые ключи, мусор в хранилище и смену
-  активного `kid` на ровном месте. Сохраняйте это различие при правках `get_key`.
-- **Выпуск токена работает по fail-fast**: если `store_jti` не смог записать `jti`
-  (например, Redis недоступен), `create_new` возвращает `JwtError::StoreError` и
-  токен не отдаётся — это гарантирует консистентность с проверкой, которая
-  требует наличия `jti`. Сохраняйте это поведение при изменениях.
-- Ошибки наружу отдаются скупо: многие обработчики возвращают пустые
-  `500`/`401`/`422` без тела. Не считайте, что клиент получает детали.
-- **Соединение с Redis (`redis.rs`).** Клиент работает через `ConnectionManager`:
-  **одно** мультиплексированное соединение на процесс, которое менеджер сам
-  восстанавливает после обрыва. Раньше соединение открывалось на каждую команду,
-  и под нагрузкой это упиралось в исчерпание эфемерных портов (`os error 49`) —
-  валидные токены получали `401`, потому что `check_jti` не доходил до хранилища.
-  - **Инициализация ленивая, и это осознанно.** Недоступный на старте Redis не
-    роняет процесс: сервис поднимается, `GET /readyz` отвечает `503`, трафик на
-    под не идёт, а когда хранилище появится — соединение установится само, без
-    рестарта. Неудачная попытка не запоминается, следующий запрос пробует снова.
-  - **Ретраи ограничены одной попыткой** (дефолт crate — шесть с экспоненциальной
-    задержкой, суммарно больше шести секунд). Пока идут ретраи, висит обработчик,
-    в том числе `/readyz`; долгую недоступность правильнее показать в readiness,
-    чем прятать за ожиданием.
-- **Пользовательские claims (`models/jwt.rs`).** Поле `claims` в теле
-  `POST /tokens` вливается в payload **рядом** с зарегистрированными
-  (`#[serde(flatten)]`): потребитель токена ищет `role`, а не `extra.role`.
-  - **Служебные имена защищены.** `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`
-    (см. `RESERVED_CLAIMS`) переопределить нельзя — попытка даёт `422`. Иначе
-    клиент подменил бы `exp` и обошёл границы `TOKEN_TTL_MIN/MAX_SECONDS`, либо
-    выпустил токен от чужого имени через `iss`/`sub`.
-  - **Лимиты обязательны** (`TOKEN_CLAIMS_MAX_COUNT`, `TOKEN_CLAIMS_MAX_BYTES`):
-    токен ездит в HTTP-заголовках, и раздутый payload ломает прокси с их
-    ограничением на размер заголовка.
-  - **Содержимое claims не логируется** — там бывают персональные данные. В лог
-    уходит только имя конфликтующего ключа либо факт превышения лимита; это
-    согласуется с общим правилом не писать тела и заголовки.
-  - **При обмене refresh-токена claims НЕ переносятся.** Мы их не храним в записи
-    refresh, и переносить не стали намеренно: это продлевало бы роли и scope,
-    выданные когда-то давно, без нового решения о правах. Нужны claims в
-    обновлённом токене — выпускайте пару заново через `POST /tokens`.
-- **Кеш публичных ключей (`jwk.rs`).** JWKS кешируется в памяти: до этого каждая
-  верификация тянула весь `/.well-known/jwks.json` и создавала новый HTTP-клиент,
-  из-за чего нагрузка транслировалась на сервис ключей один к одному (замер — в
+- **The service speaks HTTP/1.1 only: the `http2` feature of `actix-web` is
+  off.** It pulled in `h2` 0.3, which never got a patch for RUSTSEC-2026-0258
+  (the 0.3 branch has had no release since July 2025, and `actix-http` still
+  requires `h2 ^0.3.27`). Nothing is lost functionally: HTTP/2 in actix is
+  reachable either through TLS with ALPN (the service does not terminate TLS —
+  that is the reverse proxy) or through `bind_auto_h2c()`, while the server
+  comes up with a plain `bind()`. In other words the `h2` code was linked in but
+  unreachable. Default features are listed explicitly in `Cargo.toml` — when
+  upgrading actix the list has to be checked, otherwise a new default feature
+  silently stays off. The planned gRPC work (JWT-102) is unaffected: `tonic`
+  brings its own server on `hyper` with `h2` 0.4. Turning `http2` back on makes
+  sense only if HTTP/2 is needed in the REST API itself — and then check first
+  whether a patch for `h2` 0.3 has been released.
+- **There is exactly one TLS stack in the binary — `native-tls` (JWT-46).**
+  Before that, two were linked at once: `rustls` + `aws-lc-rs` arrived through
+  the default features of `reqwest` (in 0.13 `default-tls` no longer means
+  `native-tls` but `rustls`), and `native-tls` came from `sentry` (the
+  `transport` feature). `native-tls` won because it reuses openssl, which the
+  service needs anyway for signing JWTs — and that lets the entire rustls stack
+  (`aws-lc-rs`, `rustls-webpki`, `rustls-platform-verifier`, `quinn`) go away
+  completely. The result: the release binary went from 19,427,168 to 16,119,848
+  bytes (−3.2 MiB, −17%), dependency builds in Docker from 213 s to 169 s (the
+  `cmake` build of `aws-lc-sys` disappeared); of the dynamic dependencies only
+  `libssl`/`libcrypto` from the runtime image remain.
+  - **The trust roots are now the system ones** (`/etc/ssl/certs`) rather than a
+    baked-in `webpki-roots`: the `ca-certificates` package in the runtime image
+    is mandatory, and without it HTTPS to the JWKS and to OTLP fails certificate
+    validation.
+  - **The `reqwest` features are listed explicitly** — when upgrading, compare
+    the list against the new defaults, or `default-tls` brings rustls back.
+  - **A second `jti` backend will bring rustls back**: YDB pulls in `tonic`, and
+    that speaks TLS through rustls. One more argument for splitting the builds
+    per backend.
+- **The release profile: LTO, one codegen unit, stripped symbols (JWT-47).**
+  There was no `[profile.release]` section in `Cargo.toml` at all — the
+  production image was built with the cargo defaults: LTO off,
+  `codegen-units = 16`, the symbol table intact. It is now `lto = "fat"`,
+  `codegen-units = 1`, `strip = "symbols"`. The production binary (Docker, build
+  without cache) went from 16,119,848 to 8,937,224 bytes (−6.8 MiB, −45%) and
+  the image from 172 to 163 MB. Broken down (local build, 8 cores): LTO with one
+  unit accounts for −3.5 MiB and `strip` for another −1.5 MiB.
+  - **We pay in build time, and in exactly the layer that caches worst.**
+    Building the whole image went from 331 s to 423 s, but inside that
+    `cargo chef cook` (dependencies, reused from cache in CI) went from 171 s to
+    217 s while the final `cargo build --release` went from 11.5 s to 100 s. In
+    other words, editing a single source file used to cost ten seconds and now
+    costs a minute and a half: fat LTO is one pass of the optimiser over the
+    whole graph at link time, and a dependency cache does not help;
+    `codegen-units = 1` serialises code generation on top of that. A clean local
+    build went from 88 s to 127 s.
+  - **Do not add `panic = "abort"`.** It would kill the panic channel into
+    GlitchTip (`sentry-panic` installs a hook and manages to send the event
+    while the stack unwinds) and the worker isolation of actix: a panic in one
+    request would take down the whole process instead of a single connection.
+    The savings are not comparable.
+  - **`strip = "symbols"` costs the panic stack in GlitchTip.** The event itself
+    still arrives (the message and `file:line` are constants baked into the
+    binary), but backtrace frames do not resolve without a symbol table: on
+    Linux a release build without `strip` gives named frames, and with `strip`
+    the frame list is empty. If you need the stack in Issues, switch to
+    `strip = "debuginfo"` (+1.5 MiB on the binary) rather than reverting LTO.
+- **Domain code (`key.rs`, `jwt.rs`, `models/jwt.rs`) handles errors through
+  `Result`/`?`** and the types from `error.rs` / `models/jwt.rs` — no
+  `.unwrap()`. Keep to that style; `.unwrap()`/`.expect()` remain only in
+  `main.rs` at startup (fail-fast on invalid configuration).
+- **Refresh tokens (`jwt.rs`).** They are issued only on explicit request
+  (`"refresh": true` in the body of `POST /tokens`) — the contract of existing
+  clients does not change.
+  - **Rotation on every exchange**, not reuse: the old token is marked used
+    immediately. A reusable refresh token with a long TTL is a long-lived
+    password with no way to detect compromise.
+  - **Reuse detector.** Presenting an already-used token means a leak: the real
+    client has exchanged its copy already. There is no way to tell the thief
+    from the victim, so the **whole family** is killed — the refresh chain and
+    the access tokens issued through it. The price of a false positive (a client
+    lost the response and retried) is one more sign-in; that is cheaper than
+    leaving the thief a working chain.
+  - **Marking a token used must be atomic.** In Redis that is `HSETNX`: there is
+    exactly one winner, so two concurrent attempts to exchange the same token
+    cannot both get a new pair.
+  - **Access tokens go into the family group too.** Otherwise the detector would
+    kill only the refresh tokens while the access tokens already issued kept
+    working until their `exp`.
+  - **The exchange is behind level 3, like issuing.** An exchange *is* issuing a
+    token; it just rests on a presented refresh token rather than on a request
+    from a trusted backend. Level 2 would be a hole here: the proxy secret is
+    static and does not authenticate the caller, so a stolen refresh token would
+    give anyone who can reach through the proxy an endless chain of tokens. The
+    end application never talks to the service directly — the consuming backend
+    does, and it is what holds the TOTP secret.
+- **Token groups (`models/jwt.rs`, `redis.rs`).** The mechanism is deliberately
+  generic: the store operates on an abstract group key and the caller supplies
+  the meaning ([`subject_group`]). That is how the revocation of a refresh token
+  family reuses it (JWT-28) — no separate mechanism is needed there.
+  - **A ZSET, not a SET**: elements of a set have no TTL of their own, and
+    expired `jti` values would pile up in the index as dead weight. The score is
+    the expiry moment, so a single `ZREMRANGEBYSCORE` cuts them off.
+  - **The index is written fail-fast**, exactly like the `jti` itself: a token
+    that did not make it into the index would survive a bulk revocation. Issuing
+    such a token silently is more dangerous than not issuing one at all.
+  - **Revocation is deliberately not atomic**: a concurrent issue during a
+    revocation may add a `jti` after the `ZRANGE`, and such a token survives. The
+    window is a fraction of a millisecond, and the cost of atomicity (Lua/WATCH)
+    outweighs the benefit: bulk revocation happens on compromise, and the
+    subject's credentials are usually rotated right after.
+  - **A revocation error surfaces as `500`** rather than being masked as
+    success. This applies to both revocation endpoints: a silent "success" for a
+    failed revocation of compromised tokens is more dangerous than an honest
+    error — the caller considers the job done and does not retry.
+    **Idempotency is preserved** at the same time: revoking a `jti` that does
+    not exist is `204`, not an error, because the desired state has been
+    reached.
+- **The `jti` store is reachable only through the `JtiStore` trait (JWT-60).**
+  No module above `redis.rs` may mention `RedisClient`, `redis::` or
+  `RedisError` — otherwise the seam leaks and a second backend cannot be plugged
+  in.
+  - **The HTTP handlers are generic over the store**
+    (`create_token<S: JtiStore>` and so on), and the concrete type is supplied
+    once in `main.rs` (`configure_api::<RedisClient>`). There are no separate
+    "production wrappers" over the generic implementations: those took
+    `web::Data<RedisClient>` and were exactly where the seam leaked.
+  - **That is why routes are assembled by hand**
+    (`web::resource(...)`/`.route(...)`) rather than with the actix attribute
+    macros (`#[post("/tokens")]`): those cannot handle generic handlers. The
+    exception is `livez`, which does not depend on the store.
+    `#[utoipa::path]` works on a generic function; the completeness of the spec
+    is guarded by the `openapi_spec_lists_all_endpoints` test.
+  - **`/readyz` pings the store through `JtiStore::ping`**, not `RedisClient`
+    directly. When adding a backend, implement `ping` honestly: readiness means
+    "can we serve", and without a store the answer is no.
+  - **`where Self: Sized` is not needed in the trait**: an `async fn` in a trait
+    already makes it non-object-safe, and the store is always taken by static
+    type.
+- **A new key is created only on a `404` from the key service.** In
+  `JwkService::private_key` the creation branch fires exclusively on
+  [`JwkError::NotFound`], which is returned only for an honest `404`; `5xx`, an
+  unreadable body and network failures propagate upwards as errors. Otherwise a
+  brief JWKS outage would spawn new keys, litter the store and change the active
+  `kid` for no reason. Preserve that distinction when editing `get_key`.
+- **Token issuing is fail-fast**: if `store_jti` could not write the `jti` (for
+  example Redis is unavailable), `create_new` returns `JwtError::StoreError` and
+  no token is handed out — that is what guarantees consistency with
+  verification, which requires the `jti` to be present. Preserve this behaviour
+  when making changes.
+- Errors are returned tersely: many handlers return empty `500`/`401`/`422`
+  responses with no body. Do not assume the client receives any detail.
+- **The Redis connection (`redis.rs`).** The client works through a
+  `ConnectionManager`: **one** multiplexed connection per process, which the
+  manager re-establishes after a drop. Previously a connection was opened per
+  command, and under load that ran into ephemeral port exhaustion
+  (`os error 49`) — valid tokens got `401` because `check_jti` never reached the
+  store.
+  - **Initialisation is lazy, and deliberately so.** A Redis that is unavailable
+    at startup does not bring the process down: the service comes up,
+    `GET /readyz` answers `503`, no traffic is routed to the pod, and once the
+    store appears the connection establishes itself without a restart. A failed
+    attempt is not remembered; the next request tries again.
+  - **Retries are limited to a single attempt** (the crate default is six with
+    exponential backoff, more than six seconds in total). While retries are in
+    flight a handler is blocked, `/readyz` included; a long outage is better
+    shown in readiness than hidden behind waiting.
+- **Custom claims (`models/jwt.rs`).** The `claims` field in the body of
+  `POST /tokens` is merged into the payload **alongside** the registered ones
+  (`#[serde(flatten)]`): the consumer of the token looks for `role`, not
+  `extra.role`.
+  - **Reserved names are protected.** `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`,
+    `jti` (see `RESERVED_CLAIMS`) cannot be overridden — an attempt gives `422`.
+    Otherwise a client could substitute `exp` and bypass the
+    `TOKEN_TTL_MIN/MAX_SECONDS` bounds, or issue a token on someone else's
+    behalf through `iss`/`sub`.
+  - **The limits are mandatory** (`TOKEN_CLAIMS_MAX_COUNT`,
+    `TOKEN_CLAIMS_MAX_BYTES`): a token travels in HTTP headers, and a bloated
+    payload breaks proxies with their header size limits.
+  - **The contents of the claims are never logged** — they may contain personal
+    data. Only the name of the conflicting key or the fact that a limit was
+    exceeded goes into the log; that is consistent with the general rule of not
+    writing bodies and headers.
+  - **Claims are NOT carried over on a refresh exchange.** We do not store them
+    in the refresh record, and carrying them over was rejected deliberately: it
+    would extend roles and scopes granted long ago without a fresh decision
+    about permissions. If you need claims in the renewed token, issue a new pair
+    through `POST /tokens`.
+- **The public key cache (`jwk.rs`).** The JWKS is cached in memory: before
+  that, every verification pulled the whole `/.well-known/jwks.json` and created
+  a new HTTP client, so load was translated one-to-one onto the key service (the
+  measurement is in
   [`deployments/load/BASELINE.md`](deployments/load/BASELINE.md)).
-  - **`JwkService` создаётся один раз на процесс** и дальше клонируется: кеш и пул
-    соединений спрятаны за `Arc` и общие для всех копий. Не создавайте его на
-    запрос — именно так и выглядела проблема.
-  - **Промах по неизвестному `kid` троттлится** (`JWKS_CACHE_MISS_REFRESH_SECONDS`).
-    Без этого кеш не защищал бы от главного сценария: поток токенов со случайными
-    `kid` промахивался бы мимо кеша и снова заваливал JWKS. Обратная сторона —
-    новый ключ после ротации подхватывается с задержкой до этого интервала.
-  - **Обновление под замком** (`tokio::sync::Mutex`): на всплеск одновременных
-    промахов в JWKS уходит один запрос, остальные ждут и забирают готовый кеш.
-  - **Недоступный JWKS не кладёт верификацию** (`JWKS_CACHE_STALE_GRACE_SECONDS`):
-    если обновление не удалось, отдаётся последний известный снимок, пока его
-    возраст не превысил TTL + отсрочку. Это размен доступности на актуальность,
-    поэтому отсрочка короткая и обязательная: она ровно настолько же продлевает
-    жизнь **отозванному ключу**. Отзыв конкретных токенов (`jti` в Redis) при
-    этом работает как обычно — размен касается только компрометации ключа.
-    Каждая такая отдача пишется в лог (WARN) и в метрику
-    `jwks_cache_total{result="stale"}`. Повторные походы в лежащий сервис
-    троттлятся тем же `JWKS_CACHE_MISS_REFRESH_SECONDS`: иначе каждый запрос
-    ждал бы таймаута, и verify лежал бы уже по латентности.
-  - **`GET /readyz` ходит в JWKS напрямую, мимо кеша**, но недоступность сервиса
-    ключей считает отказом только тогда, когда **и** пригодного снимка в памяти
-    нет. Проба отвечает на вопрос «сможем ли мы обслужить запрос», а не «жива ли
-    зависимость»: readiness на живости JWKS гасил бы поды за десяток секунд, и до
-    stale-кеша трафик просто не доходил бы — фича не работала бы в k8s вовсе.
-    Такое состояние отдаётся как `status: "degraded"` (код по-прежнему `200`), а
-    как только снимок перестаёт быть пригодным, под уходит из балансировки сам.
-    **Redis такой поблажки не имеет** — без него не проверить `jti`, и отозванный
-    токен стал бы валидным. Выпуск токенов в состоянии `degraded` всё равно не
-    работает (за приватным ключом нужен живой JWKS) и отвечает `500` вместо
-    `503` от балансировщика — но он не работал и раньше, только вместе с ним
-    ложилась ещё и верификация.
-  - **У клиента заданы таймауты** (`JWKS_REQUEST_TIMEOUT_MS`,
-    `JWKS_CONNECT_TIMEOUT_MS`). `reqwest` по умолчанию не ограничивает время
-    запроса, поэтому зависший — не упавший, а именно висящий — JWKS удерживал бы
-    воркеры до таймаута ОС. Кеш частоту обращений сократил, но от одного
-    зависшего запроса не спасает.
-- **Логирование (`logging.rs`).** Каждый запрос оборачивается span'ом
-  `http_request` с `request_id` (заголовок `X-Request-Id`: берётся входящий, если
-  валиден, иначе генерируется UUID и возвращается в ответе). По завершении — одна
-  строка `request completed` с методом/путём/статусом/латентностью. **Не логируйте
-  заголовки и тело** — там секреты (`X-Proxy-Secret`, `X-TOTP-Code`) и токены.
-  Уровень доступа пишется в span из `auth.rs` (`Span::current().record`).
-- **Уровни логирования выбираются по виновнику**, а не по «серьёзности» текста.
-  В `tracing` их пять (`TRACE < DEBUG < INFO < WARN < ERROR`); отдельного
-  `CRITICAL`/`FATAL` **нет** — фатальное = паника на старте (fail-fast).
+  - **`JwkService` is created once per process** and cloned afterwards: the
+    cache and the connection pool sit behind an `Arc` and are shared by every
+    copy. Do not create it per request — that is exactly what the problem looked
+    like.
+  - **A miss on an unknown `kid` is throttled**
+    (`JWKS_CACHE_MISS_REFRESH_SECONDS`). Without that the cache would not defend
+    against the main scenario: a stream of tokens with random `kid` values would
+    miss the cache and bury the JWKS again. The flip side is that a new key
+    after a rotation is picked up with a delay of up to that interval.
+  - **Refreshes happen under a lock** (`tokio::sync::Mutex`): a burst of
+    simultaneous misses turns into a single request to the JWKS while the rest
+    wait and take the ready cache.
+  - **An unavailable JWKS does not take verification down**
+    (`JWKS_CACHE_STALE_GRACE_SECONDS`): if a refresh failed, the last known
+    snapshot is served until its age exceeds TTL + grace. That is a trade of
+    freshness for availability, which is why the grace is short and mandatory:
+    it extends the life of a **revoked key** by exactly as much. Revocation of
+    individual tokens (`jti` in Redis) keeps working as usual — the trade
+    concerns key compromise only. Every such response is written to the log
+    (WARN) and to the `jwks_cache_total{result="stale"}` metric. Repeated trips
+    to a downed service are throttled by the same
+    `JWKS_CACHE_MISS_REFRESH_SECONDS`: otherwise every request would wait for
+    the timeout and verify would be down on latency alone.
+  - **`GET /readyz` goes to the JWKS directly, bypassing the cache**, but counts
+    an unavailable key service as a failure only when there is **also** no
+    usable snapshot in memory. The probe answers "can we serve a request", not
+    "is the dependency alive": readiness tied to JWKS liveness would kill the
+    pods within ten seconds and traffic would never reach the stale cache — the
+    feature would not work in Kubernetes at all. That state is reported as
+    `status: "degraded"` (the code stays `200`), and as soon as the snapshot
+    stops being usable the pod leaves the load balancer on its own. **Redis gets
+    no such leniency** — without it the `jti` cannot be checked and a revoked
+    token would become valid. Issuing tokens does not work in the `degraded`
+    state anyway (a live JWKS is needed to fetch the private key) and answers
+    `500` instead of a `503` from the load balancer — but it did not work before
+    either, only back then verification went down with it.
+  - **The client has timeouts** (`JWKS_REQUEST_TIMEOUT_MS`,
+    `JWKS_CONNECT_TIMEOUT_MS`). `reqwest` does not limit request duration by
+    default, so a hung — not crashed, but hanging — JWKS would hold workers
+    until the OS timeout. The cache reduced the request rate but does not save
+    you from a single hung request.
+- **Logging (`logging.rs`).** Every request is wrapped in an `http_request` span
+  with a `request_id` (the `X-Request-Id` header: the incoming one is used when
+  valid, otherwise a UUID is generated and returned in the response). On
+  completion there is a single `request completed` line with the method, path,
+  status and latency. **Do not log headers or bodies** — they contain secrets
+  (`X-Proxy-Secret`, `X-TOTP-Code`) and tokens. The access level is recorded
+  into the span from `auth.rs` (`Span::current().record`).
+- **Log levels are chosen by who is at fault**, not by how "serious" the text
+  sounds. `tracing` has five (`TRACE < DEBUG < INFO < WARN < ERROR`); there is
+  **no** separate `CRITICAL`/`FATAL` — fatal means a panic at startup
+  (fail-fast).
 
-  | Уровень | Когда | Примеры |
-  |--------:|-------|---------|
-  | `ERROR` | сервис не смог выполнить работу; годится для алертов | Redis/JWKS недоступны, сбой крипты при подписи, битый материал ключа |
-  | `WARN` | деградация или сигнал безопасности, запрос обработан | проблема конфигурации (с откатом), отказ в доступе (401), rate-limit (429) |
-  | `INFO` | жизненный цикл и бизнес-события | старт сервера, сводка конфигурации, `request completed`, отзыв токена |
-  | `DEBUG` | вина клиента и детали работы | протухший/подделанный/битый токен, `ttl` вне границ, шаги запросов к JWKS |
-  | `TRACE` | не используется | — |
+  | Level | When | Examples |
+  |------:|------|----------|
+  | `ERROR` | the service could not do its job; suitable for alerts | Redis/JWKS unavailable, a crypto failure while signing, corrupt key material |
+  | `WARN` | degradation or a security signal, request still handled | a configuration problem (with a fallback), access denied (401), rate limit (429) |
+  | `INFO` | lifecycle and business events | server start, configuration summary, `request completed`, token revoked |
+  | `DEBUG` | the client's fault and internal detail | an expired/forged/corrupt token, a `ttl` out of bounds, the steps of JWKS requests |
+  | `TRACE` | unused | — |
 
-  **Клиентские ошибки — это `DEBUG`, а не `ERROR`**: иначе каждый протухший токен
-  поднимал бы ложные алерты в проде. Ошибку логирует слой, который знает
-  **причину** (например `jwk.rs` — отказ JWKS на `ERROR`); вышестоящие слои пишут
-  исход на `DEBUG`, чтобы не было дублей.
-- **Трейсинг (`tracing_otel.rs`).** Включается **только** при заданном
-  `OTEL_EXPORTER_OTLP_ENDPOINT` — span'ы уходят по OTLP/HTTP в OpenTelemetry
-  Collector, откуда их забирает Monium (либо Jaeger/Tempo). Слой поверх той же
-  `tracing`-шины, что и логи, поэтому span `http_request` и вложенные
-  `jwks.*`/`redis.*` попадают и в логи, и в трейсы.
-  - **Путь сигнала обязателен.** `OTEL_EXPORTER_OTLP_ENDPOINT` — это **базовый**
-    URL, к которому добавляется путь сигнала (`/v1/traces`, `/v1/logs`). Если
-    послать базовый URL как есть, коллектор ответит `404`, а данные будут **молча
-    теряться** (см. `signal_endpoint`).
-  - **Логи по OTLP — отдельный сигнал и отдельный флаг** (`OTEL_LOGS_ENABLED`).
-    Включение трейсов логи **не** включает: они и так идут в stdout, и там, где их
-    собирает агент с контейнерного лога, отправка по сети была бы дублированием.
-    Логи, записанные внутри запроса, несут `Trace ID`/`Span ID` — в бэкенде можно
-    переходить от трассы к её логам и обратно.
-  - **Клиент экспортёра — блокирующий, намеренно.** Batch-процессор работает на
-    своём выделенном потоке без tokio-рантайма; асинхронный HTTP-клиент там
-    паникует («there is no reactor running»). Основной async-рантайм это не задевает.
-  - **Propagation (W3C).** Входящий `traceparent` подхватывается и делает наш span
-    потомком чужой трассы; исходящие запросы к JWKS получают свой `traceparent` —
-    трасса склеивается сквозь сервисы.
-  - **Не fail-fast**, как и rate limiting: ошибка настройки экспортёра не роняет
-    сервис, только предупреждение в лог. Телеметрия не должна быть причиной
-    недоступности.
-  - Статус трейсинга логируется **после** установки subscriber'а: до неё писать
-    некуда, сообщение было бы потеряно (поэтому `init_tracer_provider` возвращает
-    [`Status`], а не логирует сам).
-- **GlitchTip (`sentry_glitchtip.rs`).** Включается **только** при заданном
-  `GLITCHTIP_DSN` (принимается и `SENTRY_DSN`). Закрывает **три** канала, а не
-  только ошибки — всё поверх той же `tracing`-шины:
+  **Client errors are `DEBUG`, not `ERROR`**: otherwise every expired token
+  would raise a false alert in production. The error is logged by the layer that
+  knows the **cause** (for example `jwk.rs` logs a JWKS failure at `ERROR`);
+  layers above record the outcome at `DEBUG` so that there are no duplicates.
+- **Tracing (`tracing_otel.rs`).** Enabled **only** when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set — spans go over OTLP/HTTP to an
+  OpenTelemetry Collector, from which Monium (or Jaeger/Tempo) picks them up. It
+  is a layer over the same `tracing` bus as the logs, so the `http_request` span
+  and the nested `jwks.*`/`redis.*` spans end up in both logs and traces.
+  - **The signal path is mandatory.** `OTEL_EXPORTER_OTLP_ENDPOINT` is the
+    **base** URL to which the signal path is appended (`/v1/traces`,
+    `/v1/logs`). Send the base URL as is and the collector answers `404` while
+    the data is **silently lost** (see `signal_endpoint`).
+  - **Logs over OTLP are a separate signal with a separate flag**
+    (`OTEL_LOGS_ENABLED`). Enabling traces does **not** enable logs: they go to
+    stdout anyway, and where an agent collects them from the container log,
+    sending them over the network would be duplication. Logs written inside a
+    request carry the `Trace ID`/`Span ID` — in the backend you can move from a
+    trace to its logs and back.
+  - **The exporter client is blocking, deliberately.** The batch processor runs
+    on its own dedicated thread without a tokio runtime; an async HTTP client
+    panics there ("there is no reactor running"). The main async runtime is
+    unaffected.
+  - **Propagation (W3C).** An incoming `traceparent` is picked up and makes our
+    span a child of someone else's trace; outgoing requests to the JWKS get
+    their own `traceparent` — the trace is stitched across services.
+  - **Not fail-fast**, like rate limiting: a misconfigured exporter does not
+    bring the service down, only a warning into the log. Telemetry must never be
+    a cause of unavailability.
+  - The tracing status is logged **after** the subscriber is installed: before
+    that there is nowhere to write and the message would be lost (which is why
+    `init_tracer_provider` returns a [`Status`] instead of logging itself).
+- **GlitchTip (`sentry_glitchtip.rs`).** Enabled **only** when `GLITCHTIP_DSN`
+  is set (`SENTRY_DSN` is accepted too). It covers **three** channels, not just
+  errors — all on top of the same `tracing` bus:
 
-  | Канал | Что уходит | Включение |
-  |-------|-----------|-----------|
-  | **Issues** | паники и события уровня `ERROR` | всегда при DSN |
-  | **Performance** | span-ы → транзакции (`http_request` и вложенные) | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
-  | **Logs** | структурные логи `DEBUG`/`INFO`/`WARN` | `GLITCHTIP_ENABLE_LOGS=true` |
+  | Channel | What goes there | Enabled by |
+  |---------|-----------------|------------|
+  | **Issues** | panics and `ERROR`-level events | always, given a DSN |
+  | **Performance** | spans → transactions (`http_request` and nested ones) | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
+  | **Logs** | structured `DEBUG`/`INFO`/`WARN` logs | `GLITCHTIP_ENABLE_LOGS=true` |
 
-  - Разложение по каналам задаёт `event_filter` слоя: `ERROR` → issue,
-    `WARN`/`INFO` → лог + breadcrumb, `DEBUG` → лог, `TRACE` → игнор.
-  - **Логи батчатся** и досылаются пачкой (в т.ч. при завершении процесса) —
-    в отличие от issues, они появляются в UI не мгновенно.
-  - **Не fail-fast**: некорректный DSN не роняет сервис. **DSN не логируется.**
-  - Performance по умолчанию **выключен** (`0.0`): транзакции стоят объёма,
-    включайте осознанно.
-- **Метрики (`metrics.rs`).** Экспозиция Prometheus на `GET /metrics` — **уровень
-  доступа 4** (Bearer-токен `AUTH_METRICS_TOKEN`; без него ручки нет — `404`). Ручку скрейпят Prometheus/Yandex
-  Managed Prometheus, Zabbix (`agent2` с prometheus-плагином) и Monium (через
-  Prometheus-совместимость); отдельный экспортёр под Zabbix не нужен. Пример
-  конфигурации скрейпа:
+  - The split across channels is defined by the layer's `event_filter`: `ERROR`
+    → issue, `WARN`/`INFO` → log plus breadcrumb, `DEBUG` → log, `TRACE` →
+    ignored.
+  - **Logs are batched** and flushed in bulk (including at process shutdown) —
+    unlike issues, they do not appear in the UI instantly.
+  - **Not fail-fast**: an invalid DSN does not bring the service down. **The DSN
+    is never logged.**
+  - Performance is **off** by default (`0.0`): transactions cost volume, so
+    enable them deliberately.
+- **Metrics (`metrics.rs`).** The Prometheus exposition on `GET /metrics` is
+  **access level 4** (the `AUTH_METRICS_TOKEN` bearer token; without it the
+  endpoint does not exist — `404`). It is scraped by Prometheus / Yandex Managed
+  Prometheus, by Zabbix (`agent2` with the prometheus plugin) and by Monium
+  (through Prometheus compatibility); no separate Zabbix exporter is needed. An
+  example scrape configuration:
 
   ```yaml
   scrape_configs:
@@ -848,11 +932,11 @@ curl -s https://api.github.com/repos/filipov-dev/jwt-service-app \
         - targets: ['jwt-service-app:8080']
   ```
 
-  Токен — **не замена сетевой изоляции**: ручку всё равно не стоит публиковать
-  наружу (метрики раскрывают операционную картину).
+  The token is **not a substitute for network isolation**: the endpoint still
+  should not be exposed publicly (metrics reveal the operational picture).
 
-  | Метрика | Тип | Лейблы |
-  |---------|-----|--------|
+  | Metric | Type | Labels |
+  |--------|------|--------|
   | `http_requests_total` | counter | `method`, `endpoint`, `status` |
   | `http_request_duration_seconds` | histogram | `method`, `endpoint` |
   | `jwt_tokens_issued_total` / `jwt_tokens_revoked_total` | counter | — |
@@ -863,85 +947,107 @@ curl -s https://api.github.com/repos/filipov-dev/jwt-service-app \
   | `jwks_cache_total` | counter | `result` (`hit`/`miss`/`throttled`) |
   | `redis_command_duration_seconds` | histogram | `command`, `success` |
 
-  **Кардинальность:** в лейбл `endpoint` идёт **шаблон роута** (`/tokens/{jti}`),
-  а не фактический путь — иначе каждый `jti` порождал бы свою серию. Ничего
-  клиентского (токены, секреты, IP) в лейблы не кладите.
-- **Воркеры и таймауты сервера (`server.rs`) не оставлены на дефолтах actix.**
-  - **Число воркеров считается от квоты CPU, а не от числа ядер.** Дефолт actix
-    — по ядрам процесса, то есть по ядрам **хоста**: под без лимита CPU на
-    64-ядерном узле поднимал 64 воркер-потока, которые обязаны были уложиться в
-    лимит памяти пода. Порядок выбора: явный `SERVER_WORKERS` → квота cgroup
-    (v2 `cpu.max`, v1 `cpu.cfs_quota_us`) → потолок 4. `available_parallelism`
-    как источник истины не годится: он уже учитывает квоту и потому не даёт
-    отличить «квота 4 ядра» от «у хоста 4 ядра», а решение здесь разное.
-  - **`requests.cpu` на число воркеров не влияет никак** — это гарантия
-    планировщика, в cgroup она видна как вес, а не как квота.
-  - **Таймауты выставлены явно** (`client_request_timeout`, keep-alive), хотя
-    значения совпадают с дефолтами actix: за прокси медленных клиентов режет
-    прокси, но образ раздаётся публично и разворачивается напрямую тоже.
-- Комментарии в коде местами на русском — это норма для проекта, продолжайте
-  в том же стиле, если правите соседний код. **Исключение — `docs/clients/`**:
-  там комментарии английские, потому что сайт с примерами переводится на 30
-  языков. Содержательность при этом не режем: докстринг должен ёмко объяснять,
-  что делает вызов и почему (ротация refresh, replay-защита, идемпотентность,
-  коды ответов), — файл читается без похода в
-  [`docs/clients/README.md`](docs/clients/README.md). Правите пример — не
-  возвращайте туда русские докстринги.
-- Версия в `Cargo.toml` — это **триггер релиза**: пуш в `master` с изменением
-  `Cargo.toml` запускает `release.yml`, который создаёт GitHub Release и
-  дёргает `docker.yml` для сборки/публикации образов (`filipov/jwt-service-app`,
-  `ghcr.io/filipov-dev/jwt-service-app`). Меняйте версию осознанно.
-- `release.yml` клонируется с `fetch-depth: 0`. Не убирайте: описание релиза
-  собирается по коммитам от предыдущего тега, а при обычном shallow-клоне
-  истории и тегов в раннере нет и секция получится пустой.
-- Ни релиз, ни тег, созданные `GITHUB_TOKEN`, не запускают другие workflow —
-  такое ограничение GitHub против бесконечных циклов. Поэтому `docker.yml`
-  дёргается явным `workflow_dispatch` через API, а не по событию `release`.
-- **Разрешающий CORS — только на `POST /tokens/verify`** — это единственная
-  публичная ручка, которую имеет смысл дёргать из браузера. Разрешённые origin'ы
-  задаёт `CORS_ALLOWED_ORIGINS` (список через запятую); если пусто —
-  `allow_any_origin` (дефолт, обратная совместимость).
-- **На остальные ручки** (health, OpenAPI, выпуск/отзыв токенов) вешается
-  `deny_cors()` — не отключённый, а **запрещающий** CORS: список разрешённых
-  origin'ов пуст, любой кросс-доменный запрос из браузера отклоняется (preflight
-  `OPTIONS` — отказ). Запросы без `Origin` (internal app-to-app, `curl`) проходят.
-- **Правило: под разрешающим CORS должна оставаться ровно одна публичная ручка**
-  (`/tokens/verify`). Новые ручки по умолчанию получают `deny_cors()`; не вешайте
-  на них разрешающий CORS без явного решения.
-- CORS — самый внешний слой на ручке, чтобы preflight `OPTIONS` обрабатывался до
-  auth и rate-limit.
+  **Cardinality:** the `endpoint` label carries the **route template**
+  (`/tokens/{jti}`), not the actual path — otherwise every `jti` would spawn its
+  own series. Never put anything client-supplied (tokens, secrets, IPs) into
+  labels.
+- **Server workers and timeouts (`server.rs`) are not left at the actix
+  defaults.**
+  - **The worker count is derived from the CPU quota, not from the core count.**
+    The actix default follows the process cores, that is the **host** cores: a
+    pod without a CPU limit on a 64-core node started 64 worker threads that all
+    had to fit into the pod memory limit. The order of preference is an explicit
+    `SERVER_WORKERS` → the cgroup quota (v2 `cpu.max`, v1 `cpu.cfs_quota_us`) →
+    a ceiling of 4. `available_parallelism` is unfit as the source of truth: it
+    already accounts for the quota and therefore cannot distinguish "a quota of
+    4 cores" from "the host has 4 cores", and the decision differs between the
+    two.
+  - **`requests.cpu` has no effect on the worker count whatsoever** — it is a
+    scheduler guarantee and appears in the cgroup as a weight, not as a quota.
+  - **The timeouts are set explicitly** (`client_request_timeout`, keep-alive)
+    even though the values match the actix defaults: behind a proxy it is the
+    proxy that cuts off slow clients, but the image is distributed publicly and
+    gets deployed directly too.
+- **Repository language: English, everywhere that is visible from the outside.**
+  Code, comments, docstrings, `utoipa` descriptions, documentation, templates,
+  workflows, manifests, image labels, commit messages (they end up in the
+  changelog and in release bodies) and pull request titles and bodies. No
+  exceptions, and no mixed languages inside a file. The gate is
+  [`scripts/check-language.sh`](scripts/check-language.sh), run by `ci.yml` on
+  every pull request: any Cyrillic in a tracked file fails the pipeline. Its
+  allowlist is a per-file list with a reason inside the script; today it holds
+  exactly one entry, `CHANGELOG.md`, because the file is generated from a commit
+  history that was deliberately left in Russian (JWT-114). Run it locally with
+  `scripts/check-language.sh`.
+  - **The generated `docs/openapi.json` is checked too**, and the check matters
+    most there: Cyrillic reaches it from `utoipa` annotations in `src/` without
+    the author noticing, and the spec is served by a live endpoint to everyone
+    running the image.
+- Version in `Cargo.toml` is a **release trigger**: pushing a `Cargo.toml`
+  change to `master` runs `release.yml`, which creates a GitHub release and
+  dispatches `docker.yml` to build and publish the images
+  (`filipov/jwt-service-app`, `ghcr.io/filipov-dev/jwt-service-app`). Change the
+  version deliberately.
+- `release.yml` clones with `fetch-depth: 0`. Do not remove it: the release
+  description is assembled from the commits since the previous tag, and with an
+  ordinary shallow clone the runner has neither history nor tags, so the section
+  would come out empty.
+- Neither a release nor a tag created by `GITHUB_TOKEN` triggers other
+  workflows — a GitHub restriction against infinite loops. That is why
+  `docker.yml` is dispatched explicitly through the API with `workflow_dispatch`
+  rather than on the `release` event.
+- **Permissive CORS applies to `POST /tokens/verify` only** — it is the single
+  public endpoint that makes sense to call from a browser. The allowed origins
+  come from `CORS_ALLOWED_ORIGINS` (comma-separated); when empty, it is
+  `allow_any_origin` (the default, for backwards compatibility).
+- **Every other endpoint** (health, OpenAPI, issuing and revoking tokens) gets
+  `deny_cors()` — not disabled CORS but **denying** CORS: the list of allowed
+  origins is empty and any cross-origin browser request is rejected (a preflight
+  `OPTIONS` is refused). Requests without an `Origin` (internal app-to-app,
+  `curl`) go through.
+- **The rule: exactly one public endpoint may sit under permissive CORS**
+  (`/tokens/verify`). New endpoints get `deny_cors()` by default; do not put
+  permissive CORS on them without an explicit decision.
+- CORS is the outermost layer on an endpoint so that a preflight `OPTIONS` is
+  handled before auth and rate limiting.
 
-## Правила для агентов
+## Rules for agents
 
-- Соблюдайте существующую структуру модулей; новый крипто-/JWT-код держите в
-  `key.rs` / `models/jwt.rs`, HTTP-слой — в `handlers.rs`.
-- Перед завершением задачи прогоняйте `cargo build` и `cargo clippy`.
-- **С каждым коммитом обязательно поднимайте версию** в `Cargo.toml` по semver,
-  выбирая разряд по сути изменения:
-  - **major** — сломана обратная совместимость (несовместимые изменения API,
-    формата токенов, конфигурации и т.п.);
-  - **minor** — новый функционал с сохранением обратной совместимости;
-  - **patch** — багфикс (или иные изменения без нового функционала: рефакторинг,
-    правки документации, CI).
+- Respect the existing module structure; keep new crypto and JWT code in
+  `key.rs` / `models/jwt.rs` and the HTTP layer in `handlers.rs`.
+- Run `cargo build` and `cargo clippy` before calling a task done.
+- **Every commit must bump the version** in `Cargo.toml` per semver, choosing
+  the digit by the nature of the change:
+  - **major** — backwards compatibility is broken (incompatible changes to the
+    API, the token format, the configuration and so on);
+  - **minor** — new functionality with backwards compatibility preserved;
+  - **patch** — a bug fix (or any other change without new functionality:
+    refactoring, documentation edits, CI).
 
-  Учтите: пуш такого изменения в `master` запускает релиз и публикацию
-  Docker-образов (см. «Соглашения и подводные камни»).
-- **Перед мержем впишите секцию версии в `CHANGELOG.md`**: `scripts/changelog.sh
-  --insert` (см. «Релизы и CHANGELOG»). Тег появляется только после мержа,
-  поэтому пересборка `--all` в этот момент положила бы изменения в «Не
-  выпущено» — раздел с номером версии даёт только `--insert`.
-- **Правило, вписанное в чеклист PR, живёт в двух местах** — в этом разделе и
-  в [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md)
-  (плюс краткий пересказ в [`CONTRIBUTING.md`](CONTRIBUTING.md)). Меняете
-  правило — правьте все места сразу, см. «Гигиена публичного репозитория».
-- Не коммитьте и не пушьте без явной просьбы пользователя.
-- Не добавляйте секреты в репозиторий; креды CI лежат в GitHub Secrets.
-- При добавлении эндпоинта не забудьте аннотацию `utoipa::path` и регистрацию
-  схем/путей в `ApiDoc` (`openapi.rs`), иначе он не попадёт в OpenAPI. Пути в
-  `paths(...)` пишутся как `handlers::foo`, а не `crate::handlers::foo`: `utoipa`
-  берёт текст пути как имя тега, под которым ручки группируются в Swagger UI.
-- **Правя спеку или версию — перегенерируйте `docs/openapi.json`**:
-  `UPDATE_OPENAPI=1 cargo test openapi`. Файл сверяется с кодом тестом
-  `spec_file_is_up_to_date`, и разошедшийся роняет CI. Версия из `Cargo.toml`
-  попадает в `info.version`, поэтому обязательный подъём версии — тоже повод
-  перегенерировать.
+  Note that pushing such a change to `master` triggers a release and publishes
+  Docker images (see "Conventions and pitfalls").
+- **Insert the version section into `CHANGELOG.md` before merging**:
+  `scripts/changelog.sh --insert` (see "Releases and the changelog"). The tag
+  only appears after the merge, so rebuilding with `--all` at that moment would
+  file the changes under "Unreleased" — only `--insert` produces a section with
+  a version number.
+- **Write in English.** Code, comments, documentation, commit messages, pull
+  request titles and bodies — see "Repository language". Run
+  `scripts/check-language.sh` before finishing; CI runs it anyway.
+- **A rule written into the pull request checklist lives in two places** — in
+  this section and in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) (plus a
+  short retelling in [`CONTRIBUTING.md`](CONTRIBUTING.md)). Change a rule and
+  change every place at once, see "Public repository hygiene".
+- Do not commit and do not push without being asked.
+- Do not add secrets to the repository; CI credentials live in GitHub Secrets.
+- When adding an endpoint, do not forget the `utoipa::path` annotation and the
+  registration of the schemas and paths in `ApiDoc` (`openapi.rs`), or it will
+  not reach the OpenAPI spec. Paths in `paths(...)` are written as
+  `handlers::foo`, not `crate::handlers::foo`: `utoipa` takes the path text as
+  the tag name that groups the endpoints in Swagger UI.
+- **When editing the spec or the version, regenerate `docs/openapi.json`**:
+  `UPDATE_OPENAPI=1 cargo test openapi`. The file is compared against the code
+  by the `spec_file_is_up_to_date` test, and a mismatch fails CI. The version
+  from `Cargo.toml` goes into `info.version`, so the mandatory version bump is a
+  reason to regenerate too.

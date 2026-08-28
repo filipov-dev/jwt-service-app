@@ -1,20 +1,20 @@
 /target
 /.idea
 
-# Внутренние заметки для агентов; каноничная копия — на Вики
+# Internal notes for agents; the canonical copy lives on the wiki
 # (homepage/projects/jwt-service-app/agents-internal)
 AGENTS_INTERNAL.md
 
-# Артефакты нагрузочного прогона: выпущенные токены и выгрузка k6.
-# Токены — настоящие подписанные JWT, им в репозитории не место.
+# Artifacts of a load run: the issued tokens and the k6 export.
+# The tokens are real signed JWTs and have no place in the repository.
 /deployments/load/tokens.json
 /deployments/load/summary.json
 
-# Боевое окружение: заполненные секреты уровней доступа. В репозитории лежат
-# только образцы — .env.example и k8s/secret.example.yaml.
+# The production environment: filled-in access level secrets. Only the samples
+# are committed — .env.example and k8s/secret.example.yaml.
 /deployments/prod/.env
 /deployments/prod/k8s/secret.yaml
 
-# Мусор macOS Finder: заводится в любой открытой папке, к репозиторию отношения
-# не имеет. Без слеша в начале — на любой глубине, а не только в корне.
+# macOS Finder litter: it appears in any folder that is opened and has nothing
+# to do with the repository. No leading slash — at any depth, not just the root.
 .DS_Store

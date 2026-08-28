@@ -1,12 +1,13 @@
-// Нагрузочный сценарий k6 для `POST /tokens/verify` (JWT-34).
+// The k6 load scenario for `POST /tokens/verify` (JWT-34).
 //
-// Ручка выбрана не случайно: это единственная публичная ручка сервиса и самая
-// горячая — на неё приходится основной трафик, и именно её путь расчищают
-// JWT-24 (переиспользование соединения Redis) и JWT-25 (кеш JWKS).
+// The endpoint was not chosen at random: it is the service's only public
+// endpoint and the hottest one — it takes the bulk of the traffic, and it is its
+// path that JWT-24 (reusing the Redis connection) and JWT-25 (the JWKS cache)
+// clear up.
 //
-// Токены сценарий не выпускает: выпуск закрыт уровнем 3 (TOTP), а считать
-// одноразовые коды внутри k6 неудобно. Их готовит `run.sh` и кладёт в
-// `tokens.json` рядом со сценарием.
+// The scenario does not issue tokens: issuing is behind level 3 (TOTP), and
+// computing one-time codes inside k6 is awkward. `run.sh` prepares them and puts
+// them into `tokens.json` next to the scenario.
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -18,24 +19,27 @@ const TARGET = __ENV.TARGET_URL || 'http://host.docker.internal:8080';
 const PROXY_SECRET = __ENV.PROXY_SECRET || 'dev-proxy-secret';
 const PROXY_HEADER = __ENV.PROXY_HEADER || 'X-Proxy-Secret';
 const AUDIENCE = __ENV.AUDIENCE || 'load-test';
-// `iss` токена берётся из заголовка `Host` запроса, поэтому при проверке он
-// обязан совпадать с тем, с которым токен выпускали, иначе будет честный 401.
+// The `iss` of a token comes from the `Host` header of the request, so during
+// verification it must match the one the token was issued with, or an honest 401
+// follows.
 const HOST_HEADER = __ENV.HOST_HEADER || 'jwt-load.local';
-// Пауза между итерациями. Нужна для сравнения «до/после» при ОДИНАКОВОМ темпе:
-// если оптимизация подняла потолок, то без ограничения прогон уходит на другой
-// уровень нагрузки и латентности становятся несопоставимы.
+// The pause between iterations. It is needed for a before/after comparison at
+// the SAME rate: if an optimisation raised the ceiling, then without a limit the
+// run moves to a different load level and the latencies become incomparable.
 const SLEEP_MS = Number(__ENV.SLEEP_MS || 0);
 
-// Отказы считаем отдельным счётчиком: k6 сам по себе считает failed только
-// транспортные ошибки, а нам нужны и 401/429 — они означают, что замер
-// невалиден (протухшие токены либо не отключённый rate limit).
+// Failures are counted by a separate counter: on its own k6 counts only
+// transport errors as failed, while we also need 401/429 — they mean the
+// measurement is invalid (expired tokens, or a rate limit that was not turned
+// off).
 const rejected = new Counter('verify_rejected');
 
 export const options = {
     vus: Number(__ENV.VUS || 50),
     duration: __ENV.DURATION || '30s',
-    // Порог только на долю успешных ответов. Пороги на латентность для baseline
-    // намеренно не ставим: baseline — это измерение, а не проверка.
+    // A threshold on the share of successful responses only. Latency thresholds
+    // are deliberately not set for the baseline: a baseline is a measurement, not
+    // a check.
     thresholds: {
         checks: ['rate>0.99'],
     },

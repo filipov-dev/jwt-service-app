@@ -1,13 +1,17 @@
-# Боевой стенд: сервис + Redis за обратным прокси.
+# The production stand: the service plus Redis behind a reverse proxy.
 #
-# Отличия от dev-стенда (`deployments/dev/docker-compose.yml`), кроме очевидного
-# отсутствия Swagger UI и Redis Commander:
-#   * образ берётся из реестра, а не собирается локально;
-#   * секреты приходят из `.env` (см. `.env.example`), а не лежат в open-source;
-#   * порт сервиса НЕ публикуется на хост — наружу смотрит только прокси;
-#   * подсеть задана явно, чтобы `RATE_LIMIT_TRUSTED_PROXIES` был детерминирован.
+# The differences from the dev stand (`deployments/dev/docker-compose.yml`),
+# beyond the obvious absence of Swagger UI and Redis Commander:
+#   * the image comes from a registry rather than being built locally;
+#   * the secrets come from `.env` (see `.env.example`) rather than sitting in
+#     open source;
+#   * the service port is NOT published to the host — only the proxy faces
+#     outwards;
+#   * the subnet is set explicitly so that `RATE_LIMIT_TRUSTED_PROXIES` is
+#     deterministic.
 #
-# Запуск (имя проекта обязательно — папка называется `prod` у многих сервисов):
+# Running it (the project name is mandatory — many services have a `prod`
+# directory):
 #   docker compose -p jwt-prod --env-file .env up -d
 
 name: jwt-prod
@@ -16,8 +20,8 @@ services:
   app:
     image: filipov/jwt-service-app:${JWT_SERVICE_VERSION:-latest}
     restart: unless-stopped
-    # Порт наружу не публикуется: уровни 2 и 3 держатся на заголовках, которые
-    # проставляет прокси, а прямой доступ к контейнеру их обходит.
+    # The port is not published: levels 2 and 3 rest on headers set by the proxy,
+    # and direct access to the container bypasses them.
     expose:
       - "8080"
     environment:
@@ -30,37 +34,39 @@ services:
       TOKEN_ALGORITHM: ${TOKEN_ALGORITHM:-RS256}
       TOKEN_EXPIRATION_SECONDS: ${TOKEN_EXPIRATION_SECONDS:-3600}
 
-      # Домены, допустимые в claim `iss` (значение заголовка Host), через
-      # запятую. Пусто — любой Host, как раньше. Задавайте явно: при общем с
-      # соседним инстансом jwks-service-app иначе тут выпускается токен с чужим
-      # `iss`, подписанный общим ключом, и сосед примет его как свой.
+      # The domains acceptable in the `iss` claim (the value of the Host header),
+      # comma-separated. Empty means any Host, as before. Set it explicitly: with
+      # a jwks-service-app shared with a neighbouring instance, a token with
+      # someone else's `iss` signed by the shared key is issued here and the
+      # neighbour accepts it as its own.
       TOKEN_ISSUER_ALLOWLIST: ${TOKEN_ISSUER_ALLOWLIST:-}
 
-      # Воркеры и таймауты соединений. Пусто — сервис считает воркеров сам: по
-      # квоте CPU контейнера, а если её нет (здесь `cpus` не задан) — по потолку
-      # по умолчанию, а НЕ по числу ядер хоста. Задаёте `cpus` в deploy.resources
-      # — число подстроится под квоту автоматически.
+      # The workers and the connection timeouts. Empty means the service works
+      # the worker count out itself: from the container's CPU quota, and without
+      # one (`cpus` is not set here) from the default ceiling rather than the host
+      # core count. Set `cpus` in deploy.resources and the number adapts to the
+      # quota automatically.
       SERVER_WORKERS: ${SERVER_WORKERS:-}
       SERVER_CLIENT_REQUEST_TIMEOUT_MS: ${SERVER_CLIENT_REQUEST_TIMEOUT_MS:-5000}
       SERVER_KEEP_ALIVE_SECONDS: ${SERVER_KEEP_ALIVE_SECONDS:-5}
 
-      # Время на дослуживание запросов при остановке. Согласовано со
-      # stop_grace_period ниже: дефолт docker — 10 с, то есть без него контейнер
-      # получил бы SIGKILL посреди дренажа.
+      # The time allowed to finish requests on shutdown. Aligned with
+      # stop_grace_period below: the docker default is 10 s, so without it the
+      # container would get SIGKILL mid-drain.
       SERVER_SHUTDOWN_TIMEOUT_SECONDS: ${SERVER_SHUTDOWN_TIMEOUT_SECONDS:-25}
 
-      # Секреты — только из .env, который в репозиторий не коммитится.
-      AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?нужен AUTH_PROXY_SECRET}
-      AUTH_TOTP_SECRET: ${AUTH_TOTP_SECRET:?нужен AUTH_TOTP_SECRET}
+      # The secrets come only from .env, which is not committed.
+      AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?AUTH_PROXY_SECRET is required}
+      AUTH_TOTP_SECRET: ${AUTH_TOTP_SECRET:?AUTH_TOTP_SECRET is required}
       AUTH_TOTP_SECRET_NEXT: ${AUTH_TOTP_SECRET_NEXT:-}
       AUTH_METRICS_TOKEN: ${AUTH_METRICS_TOKEN:-}
 
-      # Запрет переигрывания TOTP-кода: в проде включён, здесь Redis рядом.
+      # TOTP replay protection: enabled in production, Redis is right here.
       AUTH_TOTP_REPLAY_PROTECTION: "true"
 
-      # Ключ per-IP лимита берётся из X-Forwarded-For, только если запрос пришёл
-      # с доверенного адреса. За прокси без этого списка все клиенты выглядят
-      # одним адресом (адресом прокси) и делят общий лимит на всех.
+      # The per-IP limit key is taken from X-Forwarded-For only when the request
+      # came from a trusted address. Behind a proxy without this list every client
+      # looks like one address (the proxy's) and they all share a single limit.
       RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-172.31.0.0/16}
 
       LOG_FORMAT: ${LOG_FORMAT:-json}
@@ -72,15 +78,17 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # Дефолт docker — 10 с, меньше дренажа (SERVER_SHUTDOWN_TIMEOUT_SECONDS=25):
-    # контейнер получал бы SIGKILL с запросами в полёте. Аналог
-    # terminationGracePeriodSeconds в k8s-манифесте, запас над дренажем тот же —
-    # на досылку телеметрии после остановки сервера.
+    # The docker default is 10 s, less than the drain
+    # (SERVER_SHUTDOWN_TIMEOUT_SECONDS=25): the container would get SIGKILL with
+    # requests in flight. The equivalent of terminationGracePeriodSeconds in the
+    # k8s manifest, with the same headroom over the drain — for flushing telemetry
+    # after the server stops.
     stop_grace_period: 30s
     healthcheck:
-      # В runtime-образе нет ни curl, ни wget — только bash. Поэтому запрос
-      # делается через /dev/tcp: это встроенное в bash перенаправление, внешних
-      # утилит не требует. Проверять `nc`/`curl` бессмысленно — их там нет.
+      # The runtime image has neither curl nor wget — only bash. So the request
+      # goes through /dev/tcp: a redirection built into bash that needs no
+      # external tools. Reaching for `nc`/`curl` is pointless — they are not
+      # there.
       test:
         - CMD
         - bash
@@ -99,8 +107,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # AOF: в Redis лежат выданные jti и refresh-токены. Без персистентности
-    # перезапуск Redis «разотзывает» все отозванные токены и гасит живые сессии.
+    # AOF: Redis holds the issued jti values and refresh tokens. Without
+    # persistence a Redis restart "un-revokes" every revoked token and kills the
+    # live sessions.
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -117,7 +126,8 @@ networks:
   default:
     ipam:
       config:
-        # Подсеть зафиксирована, чтобы RATE_LIMIT_TRUSTED_PROXIES не приходилось
-        # править после каждого пересоздания сети: адрес прокси из этой подсети
-        # предсказуем. Меняете подсеть — меняйте и список доверенных прокси.
+        # The subnet is pinned so that RATE_LIMIT_TRUSTED_PROXIES does not have
+        # to be edited after every recreation of the network: a proxy address from
+        # this subnet is predictable. Change the subnet and change the list of
+        # trusted proxies too.
         - subnet: 172.31.0.0/16

@@ -1,142 +1,151 @@
-# Клиентские примеры уровня 3 (TOTP)
+# Client examples for level 3 (TOTP)
 
-Рабочие примеры подключения клиента ко **всем эндпоинтам уровня 3**, защищённым
-TOTP (RFC 6238).
+Working examples of connecting a client to **every level 3 endpoint**, protected
+by TOTP (RFC 6238).
 
-Каждый пример:
+Every example:
 
-1. читает общий секрет из переменной окружения `AUTH_TOTP_SECRET` (секреты **не**
-   зашиты в код);
-2. вычисляет TOTP-код по дефолтным параметрам сервиса — **SHA-1, 6 знаков,
-   шаг 30 секунд** — **заново перед каждым запросом**;
-3. вызывает ручку, передавая код в заголовке **`X-TOTP-Code`**;
-4. показывает полный сценарий: выпуск пары → обмен refresh → отзыв.
+1. reads the shared secret from the `AUTH_TOTP_SECRET` environment variable
+   (secrets are **not** baked into the code);
+2. computes the TOTP code with the service's default parameters — **SHA-1, 6
+   digits, a 30-second step** — **anew before every request**;
+3. calls the endpoint, passing the code in the **`X-TOTP-Code`** header;
+4. shows the full scenario: issue a pair → exchange the refresh token → revoke.
 
-> Параметры (алгоритм, число знаков, шаг, имя заголовка) настраиваются на сервере
-> через env — см. таблицу в [AGENTS.md](../../AGENTS.md#переменные-окружения). Если
-> вы меняли дефолты, синхронизируйте их в клиенте.
+> The parameters (algorithm, number of digits, step, header name) are configured
+> on the server through env — see the table in
+> [AGENTS.md](../../AGENTS.md#configuration-environment-variables). If you changed
+> the defaults, mirror them in the client.
 
-## Эндпоинты уровня 3
+## The level 3 endpoints
 
-| Ручка | Назначение | Тело запроса | Успешный ответ |
-|-------|-----------|--------------|----------------|
-| `POST /tokens` | Выпуск токена | `{"sub", "aud", "ttl"?, "refresh"?, "claims"?}` | `200` + `{"token", "refresh_token"?}` |
-| `POST /tokens/refresh` | Обмен refresh-токена | `{"refresh_token"}` | `200` + `{"token", "refresh_token"}` |
-| `DELETE /tokens/{jti}` | Отзыв одного токена | — | `204` |
-| `DELETE /subjects/{sub}/tokens` | Отзыв всех токенов субъекта | — | `200` + `{"revoked": N}` |
+| Endpoint | Purpose | Request body | Successful response |
+|----------|---------|--------------|---------------------|
+| `POST /tokens` | Issue a token | `{"sub", "aud", "ttl"?, "refresh"?, "claims"?}` | `200` plus `{"token", "refresh_token"?}` |
+| `POST /tokens/refresh` | Exchange a refresh token | `{"refresh_token"}` | `200` plus `{"token", "refresh_token"}` |
+| `DELETE /tokens/{jti}` | Revoke one token | — | `204` |
+| `DELETE /subjects/{sub}/tokens` | Revoke every token of a subject | — | `200` plus `{"revoked": N}` |
 
-Проверка токена (`POST /tokens/verify`) — уровень 2, не TOTP: её дёргает обратный
-прокси со своим секретом, поэтому в этих примерах её нет.
+Token verification (`POST /tokens/verify`) is level 2 rather than TOTP: it is
+called by the reverse proxy with its own secret, so it is absent from these
+examples.
 
-### Коды ответов
+### Response codes
 
-| Код | Когда | Что делать клиенту |
-|-----|-------|--------------------|
-| `401` | Неверный, просроченный или уже предъявленный TOTP-код; на `/tokens/refresh` — неизвестный, истёкший или уже использованный refresh-токен | Пересчитать код и повторить; для refresh — выпустить пару заново, **не** повторять обмен |
-| `403` | `Host` вне аллоулиста issuer'ов (выпуск и обмен refresh) | Согласовать значение `Host` с администратором сервиса |
-| `422` | Некорректные параметры или запрещённое имя claim | Исправить тело запроса; время жизни менять через `ttl`, а не через `exp` |
-| `500` | Недоступны JWKS или Redis | Операция **не выполнена** — повторить попытку |
+| Code | When | What the client should do |
+|------|------|---------------------------|
+| `401` | A wrong, expired or already presented TOTP code; on `/tokens/refresh`, an unknown, expired or already used refresh token | Recompute the code and retry; for a refresh token, issue a new pair and do **not** retry the exchange |
+| `403` | `Host` is outside the issuer allowlist (issuing and the refresh exchange) | Agree the `Host` value with the service administrator |
+| `422` | Invalid parameters or a forbidden claim name | Fix the request body; change the lifetime through `ttl`, not through `exp` |
+| `500` | The JWKS or Redis is unavailable | The operation was **not** performed — retry |
 
-Отзыв (`DELETE /tokens/{jti}`) идемпотентен: отзыв несуществующего `jti` — тоже
-`204`, желаемое состояние достигнуто. Массовый отзыв возвращает число погашенных
-токенов; уже истёкшие не считаются.
+Revocation (`DELETE /tokens/{jti}`) is idempotent: revoking a `jti` that does not
+exist is also `204`, because the desired state has been reached. Bulk revocation
+returns the number of tokens killed; already expired ones do not count.
 
-### Заголовок `Host` определяет `iss`
+### The `Host` header determines `iss`
 
-Значение claim `iss` берётся из заголовка `Host` запроса. Он должен **совпадать**
-при выпуске и при проверке, иначе токен не пройдёт верификацию. В примерах он
-задан явно (`example.com`) — подставьте своё значение.
+The value of the `iss` claim comes from the `Host` header of the request. It must
+**match** at issue time and at verification time, or the token fails
+verification. In the examples it is set explicitly (`example.com`) — substitute
+your own value.
 
-Инстанс может ограничивать список допустимых issuer'ов
-(`TOKEN_ISSUER_ALLOWLIST` на стороне сервиса). Тогда `Host` вне списка получает
-`403` при выпуске и обмене refresh-токена и `401` при проверке — согласуйте
-значение с администратором сервиса.
+An instance may restrict the list of acceptable issuers
+(`TOKEN_ISSUER_ALLOWLIST` on the service side). A `Host` outside the list then
+gets `403` on issuing and on a refresh exchange, and `401` on verification —
+agree the value with the service administrator.
 
-## Пользовательские claims
+## Custom claims
 
-Поле `claims` в теле `POST /tokens` добавляет в payload произвольные значения —
-роли, scope, tenant, внутренний идентификатор:
+The `claims` field in the body of `POST /tokens` adds arbitrary values to the
+payload — roles, scope, tenant, an internal identifier:
 
 ```json
 {"sub": "user1", "aud": ["api1"], "claims": {"role": "admin", "scope": ["read"]}}
 ```
 
-Они лежат в payload **рядом** с зарегистрированными, то есть потребитель токена
-читает `role`, а не `extra.role`.
+They sit in the payload **alongside** the registered ones, so the consumer of the
+token reads `role`, not `extra.role`.
 
-Ограничения:
+The limits:
 
-- **служебные имена запрещены** — `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`;
-  попытка переопределить даёт `422`. Менять время жизни нужно через `ttl`, а не
-  через `exp`;
-- **число ключей и объём ограничены** (`TOKEN_CLAIMS_MAX_COUNT`,
-  `TOKEN_CLAIMS_MAX_BYTES`): токен ездит в заголовках, и раздутый payload ломает
-  прокси;
-- **при обмене refresh-токена claims не переносятся** — сервис их не запоминает.
-  Нужны те же claims в обновлённом токене? Выпускайте пару заново.
+- **reserved names are forbidden** — `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`,
+  `jti`; an attempt to override one gives `422`. Change the lifetime through
+  `ttl`, not through `exp`;
+- **the number of keys and the size are limited** (`TOKEN_CLAIMS_MAX_COUNT`,
+  `TOKEN_CLAIMS_MAX_BYTES`): a token travels in headers and a bloated payload
+  breaks proxies;
+- **claims are not carried over on a refresh exchange** — the service does not
+  remember them. Need the same claims in the renewed token? Issue a new pair.
 
-## Refresh-токены: ротация и детектор кражи
+## Refresh tokens: rotation and the theft detector
 
-`"refresh": true` в теле `POST /tokens` возвращает вместе с токеном ещё и
-`refresh_token` — непрозрачную строку для продления сессии без повторного входа.
+`"refresh": true` in the body of `POST /tokens` returns a `refresh_token`
+alongside the token — an opaque string for extending a session without signing in
+again.
 
-Правила, которые обязан соблюдать клиент:
+The rules a client must follow:
 
-1. **После обмена старый refresh недействителен.** Каждый обмен возвращает новый
-   токен — сохраните его и выбросьте предыдущий.
-2. **Не ретрайте обмен старым токеном.** Если ответ потерялся, а обмен на сервере
-   прошёл, повторная попытка с тем же refresh будет расценена как кража.
-3. **Повторное предъявление гасит всю семью.** Сервер не может отличить вора от
-   законного владельца, поэтому отзывает всю цепочку: и refresh-токены, и
-   выданные по ним access-токены. Клиенту придётся входить заново.
+1. **After an exchange the old refresh token is invalid.** Every exchange returns
+   a new one — store it and throw the previous one away.
+2. **Do not retry an exchange with the old token.** If the response was lost but
+   the exchange went through on the server, another attempt with the same refresh
+   token is treated as theft.
+3. **Presenting one twice kills the whole family.** The server cannot tell a
+   thief from the rightful owner, so it revokes the entire chain: the refresh
+   tokens and the access tokens issued through them. The client has to sign in
+   again.
 
-Практический вывод: сохраняйте новый `refresh_token` **до** того, как сочтёте
-операцию успешной, и при неопределённости лучше выпустить пару заново, чем
-повторять обмен.
+The practical conclusion: store the new `refresh_token` **before** you consider
+the operation successful, and when in doubt issue a new pair rather than retrying
+the exchange.
 
-## Один код — один запрос
+## One code, one request
 
-**Считайте код заново перед каждым запросом.** Не кэшируйте его и не
-переиспользуйте между вызовами, даже если окно ещё не закрылось.
+**Compute the code anew before every request.** Do not cache it and do not reuse
+it between calls, even while the window is still open.
 
-Причина: на сервере может быть включена защита от переигрывания
-(`AUTH_TOTP_REPLAY_PROTECTION`). Тогда сервер запоминает предъявленный код на
-время окна, и **второй запрос с тем же кодом получит `401`** — притом что код
-сам по себе ещё валиден.
+The reason: the server may have replay protection enabled
+(`AUTH_TOTP_REPLAY_PROTECTION`). It then remembers a presented code for the
+duration of the window, and **a second request with the same code gets `401`** —
+even though the code itself is still valid.
 
-Что ломается на практике:
+What breaks in practice:
 
-- **Ретрай по таймауту.** Если запрос не получил ответа и вы повторяете его с
-  тем же кодом — повтор отклонят. Пересчитайте код перед повторной попыткой.
-- **Несколько операций подряд.** Выпустить токен и тут же отозвать другой одним
-  кодом не выйдет — нужен свой код на каждый вызов.
-- **Пул воркеров с общим кодом.** Если код считается раз и раздаётся нескольким
-  параллельным запросам, пройдёт ровно один из них.
+- **A retry on timeout.** If a request got no response and you repeat it with the
+  same code, the repeat is rejected. Recompute the code before retrying.
+- **Several operations in a row.** Issuing a token and immediately revoking
+  another with one code does not work — every call needs its own.
+- **A worker pool with a shared code.** If the code is computed once and handed
+  to several concurrent requests, exactly one of them goes through.
 
-Флаг по умолчанию **выключен**, и без него код переигрываем — но пишите клиент
-так, будто он включён: тогда включение на сервере ничего не сломает. Все примеры
-ниже этому правилу следуют — код считается непосредственно перед вызовом.
+The flag is **off** by default, and without it a code is replayable — but write
+the client as though it were on: enabling it on the server then breaks nothing.
+Every example below follows that rule — the code is computed immediately before
+the call.
 
-## Формат секрета
+## The secret format
 
-Секрет по соглашению кодируется в **base32** (совместимо с Google Authenticator и
-большинством TOTP-библиотек). Часть низкоуровневых примеров (C, C++, Objective-C,
-Erlang, Julia, Lua, PowerShell, F#, VB.NET, Haskell, Zig) для краткости трактуют
-`AUTH_TOTP_SECRET` как сырые байты — для них добавьте декодер base32 или храните
-секрет в подходящей для примера форме. В шапке каждого такого файла это отмечено.
+By convention the secret is encoded in **base32** (compatible with Google
+Authenticator and most TOTP libraries). Some of the low-level examples (C, C++,
+Objective-C, Erlang, Julia, Lua, PowerShell, F#, VB.NET, Haskell, Zig) treat
+`AUTH_TOTP_SECRET` as raw bytes for brevity — for those, add a base32 decoder or
+store the secret in the form the example expects. The header of each such file
+says so.
 
-## Индекс языков
+## The language index
 
-Каждый пример покрывает все четыре ручки и **самодостаточен**: комментарии
-английские и ёмкие — объясняют, что делает вызов и почему именно так (ротация
-refresh и гашение семьи, «один код — один запрос», идемпотентность отзыва,
-ограничения claims, коды ответов), — в принятой для языка нотации (JSDoc,
-docstrings, Javadoc, KDoc, rustdoc, PHPDoc, YARD, Doxygen, POD, edoc, Haddock,
-roxygen2, LDoc, comment-based help). Читать файл можно, не открывая этот README;
-здесь то же самое собрано в одном месте и переводится вместе с сайтом.
+Every example covers all four endpoints and is **self-contained**: the comments
+are English and to the point — they explain what a call does and why it is done
+that way (refresh rotation and killing the family, "one code, one request", the
+idempotency of revocation, the claim limits, the response codes) — in the
+notation the language uses (JSDoc, docstrings, Javadoc, KDoc, rustdoc, PHPDoc,
+YARD, Doxygen, POD, edoc, Haddock, roxygen2, LDoc, comment-based help). A file
+can be read without opening this README; the same material is gathered here in
+one place and is translated together with the site.
 
-| Язык | Файл | Библиотека / приём |
-|------|------|--------------------|
+| Language | File | Library / technique |
+|----------|------|---------------------|
 | Python | [python.py](python.py) | `pyotp` |
 | JavaScript (Node) | [javascript.js](javascript.js) | `otplib` |
 | TypeScript | [typescript.ts](typescript.ts) | `otplib` |
@@ -168,9 +177,9 @@ roxygen2, LDoc, comment-based help). Читать файл можно, не от
 | Visual Basic .NET | [vbnet.vb](vbnet.vb) | `HMACSHA1` (.NET) |
 | Zig | [zig.zig](zig.zig) | `std.crypto` HMAC-SHA1 |
 
-## Переменные окружения примеров
+## The environment variables of the examples
 
-| Переменная | Назначение |
-|-----------|-----------|
-| `AUTH_TOTP_SECRET` | Общий TOTP-секрет (base32). |
-| `JWT_SERVICE_URL` | Базовый URL сервиса (по умолчанию `http://localhost:8080`). |
+| Variable | Purpose |
+|----------|---------|
+| `AUTH_TOTP_SECRET` | The shared TOTP secret (base32). |
+| `JWT_SERVICE_URL` | The base URL of the service (`http://localhost:8080` by default). |

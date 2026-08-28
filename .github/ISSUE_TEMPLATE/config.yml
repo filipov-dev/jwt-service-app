@@ -1,20 +1,22 @@
-# Пустые issue выключены намеренно: шаблоны спрашивают ровно то, без чего
-# разбор всё равно начнётся с уточняющих вопросов.
+# Blank issues are disabled on purpose: the forms ask for exactly the things
+# without which triage would start with follow-up questions anyway.
 blank_issues_enabled: false
 contact_links:
-  - name: Сообщить об уязвимости (приватно)
+  - name: Report a vulnerability (privately)
     url: https://github.com/filipov-dev/jwt-service-app/security/advisories/new
     about: >-
-      Не заводите публичный issue на уязвимость — он раскрывает её всем, кто
-      запустил образ, раньше, чем появится патч. Приватный адвайзори или письмо
-      на security@filipov.dev. Политика и сроки — в SECURITY.md.
-  - name: Ключи, JWKS и их ротация
+      Do not open a public issue for a vulnerability — it exposes the finding to
+      everyone running the image before a patch exists. Use a private advisory,
+      or write to security@filipov.dev. The policy and the timelines are in
+      SECURITY.md.
+  - name: Keys, JWKS and their rotation
     url: https://github.com/filipov-dev/jwks-service-app/issues
     about: >-
-      Этот сервис ключи не генерирует и не хранит — за них отвечает
-      jwks-service-app. Баги про ключи заводите в его репозитории.
-  - name: Документация проекта
-    url: https://github.com/filipov-dev/jwt-service-app#документация
+      This service neither generates nor stores keys — jwks-service-app does.
+      File bugs about keys in its repository.
+  - name: Project documentation
+    url: https://github.com/filipov-dev/jwt-service-app#documentation
     about: >-
-      Переменные окружения, уровни доступа, конфиги прокси, клиентские примеры,
-      observability и прод-манифесты — возможно, ответ уже есть.
+      Environment variables, access levels, proxy configurations, client
+      examples, observability and production manifests — the answer may already
+      be there.

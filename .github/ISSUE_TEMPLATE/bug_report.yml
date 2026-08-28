@@ -1,65 +1,65 @@
-name: Баг
-description: Сервис ведёт себя не так, как описано в документации
+name: Bug
+description: The service behaves differently from what the documentation says
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        **Нашли уязвимость — закройте эту форму.** Публичный issue раскрывает
-        её всем, кто запустил образ, раньше, чем выйдет патч. Приватный
-        адвайзори (Security → Report a vulnerability) или письмо на
-        security@filipov.dev — см. [SECURITY.md](https://github.com/filipov-dev/jwt-service-app/blob/master/SECURITY.md).
+        **Found a vulnerability? Close this form.** A public issue exposes it to
+        everyone running the image before a patch ships. Use a private advisory
+        (Security → Report a vulnerability) or write to security@filipov.dev —
+        see [SECURITY.md](https://github.com/filipov-dev/jwt-service-app/blob/master/SECURITY.md).
 
-        **Секреты, приватные ключи и живые токены в issue не вставляйте.**
-        Значения замените на `...`.
+        **Do not paste secrets, private keys or live tokens into an issue.**
+        Replace the values with `...`.
 
   - type: input
     id: version
     attributes:
-      label: Версия сервиса
-      description: Тег образа или `info.version` из `GET /api-docs/openapi.json`.
-      placeholder: "1.17.11"
+      label: Service version
+      description: The image tag, or `info.version` from `GET /api-docs/openapi.json`.
+      placeholder: "1.17.12"
     validations:
       required: true
 
   - type: dropdown
     id: runtime
     attributes:
-      label: Как запущен
+      label: How it is running
       options:
-        - Docker (одиночный контейнер)
+        - Docker (single container)
         - Docker Compose
         - Kubernetes
         - cargo run / cargo build
-        - Иначе (опишите ниже)
+        - Something else (describe below)
     validations:
       required: true
 
   - type: textarea
     id: what-happens
     attributes:
-      label: Что происходит
-      description: Фактическое поведение — код ответа, тело, строка лога.
+      label: What happens
+      description: The actual behaviour — response code, body, log line.
     validations:
       required: true
 
   - type: textarea
     id: what-expected
     attributes:
-      label: Что ожидалось
+      label: What you expected
       description: >-
-        И, если можно, откуда взялось ожидание: строка в README/AGENTS.md,
-        OpenAPI-спека, RFC.
+        And, if you can, where the expectation came from: a line in
+        README/AGENTS.md, the OpenAPI spec, an RFC.
     validations:
       required: true
 
   - type: textarea
     id: steps
     attributes:
-      label: Шаги воспроизведения
+      label: Steps to reproduce
       description: >-
-        `curl` или короткий скрипт нагляднее описания словами. Заголовки
-        оставьте, значения секретов замените на `...`.
+        A `curl` invocation or a short script is clearer than prose. Keep the
+        headers, replace secret values with `...`.
       render: shell
     validations:
       required: true
@@ -67,11 +67,11 @@ body:
   - type: textarea
     id: config
     attributes:
-      label: Относящаяся к делу конфигурация
+      label: Relevant configuration
       description: >-
-        Переменные окружения **без значений секретов**: какие уровни доступа
-        включены, задан ли `RATE_LIMIT_TRUSTED_PROXIES`, включена ли
-        `AUTH_TOTP_REPLAY_PROTECTION`, какой `TOKEN_ALGORITHM`.
+        Environment variables **without secret values**: which access levels are
+        enabled, whether `RATE_LIMIT_TRUSTED_PROXIES` is set, whether
+        `AUTH_TOTP_REPLAY_PROTECTION` is on, which `TOKEN_ALGORITHM` is in use.
       render: shell
     validations:
       required: false
@@ -79,9 +79,9 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Логи
+      label: Logs
       description: >-
-        Строки вокруг ошибки. Читаемее с `LOG_FORMAT=json` и
+        The lines around the error. More readable with `LOG_FORMAT=json` and
         `RUST_LOG=jwt_service_app=debug`.
       render: shell
     validations:
@@ -90,13 +90,14 @@ body:
   - type: checkboxes
     id: checks
     attributes:
-      label: Перед отправкой
+      label: Before submitting
       options:
-        - label: Проверил, что на последнем теге поведение то же (или указал, что не проверял)
+        - label: I checked that the behaviour is the same on the latest tag (or said that I did not)
           required: false
-        - label: Секретов и живых токенов в тексте нет
+        - label: There are no secrets or live tokens in the text
           required: true
         - label: >-
-            Это не одно из решений, разобранных в разделе «Что уязвимостью не
-            считается» SECURITY.md и «Соглашения и подводные камни» AGENTS.md
+            This is not one of the decisions covered by "What is not considered
+            a vulnerability" in SECURITY.md or "Conventions and pitfalls" in
+            AGENTS.md
           required: false

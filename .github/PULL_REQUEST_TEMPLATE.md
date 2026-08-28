@@ -1,32 +1,37 @@
-## Что изменилось
+## What changed
 
-<!-- Коротко и по сути: что теперь работает иначе. -->
+<!-- Short and to the point: what now works differently. -->
 
-## Зачем
+## Why
 
-<!-- Задача, issue или ключ трекера. Если правка меняет принятое ранее решение
-     (они разобраны в AGENTS.md), объясните, почему прежнее больше не годится. -->
+<!-- The task, the issue or the tracker key. If the change reverses a decision
+     taken earlier (they are documented in AGENTS.md), explain why the previous
+     one no longer holds. -->
 
-## Как проверялось
+## How it was verified
 
-<!-- Что прогнали локально и что проверили руками: curl к ручке, поднятый стенд,
-     новый тест. «Собралось» — не проверка. -->
+<!-- What you ran locally and what you checked by hand: a curl against the
+     endpoint, a stand you brought up, a new test. "It compiles" is not a
+     verification. -->
 
-## Чеклист
+## Checklist
 
-- [ ] `cargo fmt --all` и `cargo clippy --all-targets -- -D warnings` — чисто
-- [ ] `cargo test` — зелёные, новый код покрыт тестами рядом
-- [ ] версия в `Cargo.toml` поднята по semver
-- [ ] `docs/openapi.json` перегенерирован, если менялись ручки, схемы или версия
-      (`UPDATE_OPENAPI=1 cargo test openapi`)
-- [ ] документация (`README.md`, `AGENTS.md`, `docs/`) поправлена вместе с кодом
-- [ ] новая внутренняя ручка вписана в `internal_endpoints()` (`src/main.rs`)
-- [ ] секретов, приватных ключей и живых токенов в диффе нет
-- [ ] `CHANGELOG.md` руками не правился — он генерируемый
+- [ ] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` are clean
+- [ ] `cargo test` is green and the new code has tests next to it
+- [ ] `scripts/check-language.sh` is clean — everything is in English
+- [ ] the version in `Cargo.toml` is bumped per semver
+- [ ] `docs/openapi.json` is regenerated if endpoints, schemas or the version
+      changed (`UPDATE_OPENAPI=1 cargo test openapi`)
+- [ ] the documentation (`README.md`, `AGENTS.md`, `docs/`) is updated together
+      with the code
+- [ ] a new internal endpoint is listed in `internal_endpoints()` (`src/main.rs`)
+- [ ] there are no secrets, private keys or live tokens in the diff
+- [ ] `CHANGELOG.md` was not edited by hand — it is generated
 
-<!-- Subject коммита попадает в CHANGELOG дословно: conventional commits
-     (feat/fix/docs/perf/refactor/test/ci/style) и ключ задачи в скобках.
-     Подробности — в CONTRIBUTING.md. -->
+<!-- The commit subject goes into the changelog verbatim: conventional commits
+     (feat/fix/docs/perf/refactor/test/ci/style) with the task key in
+     parentheses. The details are in CONTRIBUTING.md. -->
 
-<!-- Нашли уязвимость — не описывайте её здесь и не присылайте патч публичным
-     PR: приватный адвайзори или security@filipov.dev, см. SECURITY.md. -->
+<!-- Found a vulnerability? Do not describe it here and do not send the patch as
+     a public pull request: use a private advisory or security@filipov.dev, see
+     SECURITY.md. -->

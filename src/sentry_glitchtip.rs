@@ -1,90 +1,93 @@
-//! Интеграция с GlitchTip (Sentry-совместимый бэкенд).
+//! The GlitchTip integration (a Sentry-compatible backend).
 //!
-//! Закрывает **три** канала наблюдаемости, а не только ошибки:
+//! It covers **three** observability channels, not just errors:
 //!
-//! | Канал | Что уходит | Как включается |
-//! |-------|-----------|----------------|
-//! | **Issues** | паники и события уровня `ERROR` | всегда при заданном DSN |
-//! | **Performance** | span-ы → транзакции с длительностью | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
-//! | **Logs** | структурные логи (`INFO`/`WARN`/`DEBUG`) | `GLITCHTIP_ENABLE_LOGS=true` |
+//! | Channel | What goes there | How it is enabled |
+//! |---------|-----------------|-------------------|
+//! | **Issues** | panics and `ERROR`-level events | always, given a DSN |
+//! | **Performance** | spans → transactions with a duration | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
+//! | **Logs** | structured logs (`INFO`/`WARN`/`DEBUG`) | `GLITCHTIP_ENABLE_LOGS=true` |
 //!
-//! Всё это — слой поверх той же `tracing`-шины, что логи ([`crate::logging`]) и
-//! OpenTelemetry ([`crate::tracing_otel`]): один источник событий, разные выходы.
+//! All of it is a layer over the same `tracing` bus as the logs
+//! ([`crate::logging`]) and OpenTelemetry ([`crate::tracing_otel`]): one source
+//! of events, several outputs.
 //!
-//! ## Включение
+//! ## Enabling
 //!
-//! Только при заданном `GLITCHTIP_DSN` (принимается и `SENTRY_DSN` — имя из
-//! Sentry-совместимых инструментов). Не задан — интеграция выключена целиком.
+//! Only when `GLITCHTIP_DSN` is set (`SENTRY_DSN` is accepted too — the name
+//! used by Sentry-compatible tooling). Unset means the integration is off
+//! entirely.
 //!
-//! **Не fail-fast.** Некорректный DSN не роняет сервис: предупреждение в лог и
-//! работа без GlitchTip. Телеметрия не должна быть причиной недоступности.
+//! **Not fail-fast.** An invalid DSN does not bring the service down: a warning
+//! into the log and it keeps working without GlitchTip. Telemetry must never be
+//! a cause of unavailability.
 //!
-//! ## Секреты
+//! ## Secrets
 //!
-//! DSN **не логируется** — в сообщениях фигурирует только факт включения. В теле
-//! событий не должно быть токенов и секретов: см. политику в [`crate::logging`]
-//! (заголовки и тело запросов мы не пишем в принципе).
+//! The DSN is **never logged** — only the fact that the integration is on
+//! appears in the messages. Event bodies must contain no tokens or secrets: see
+//! the policy in [`crate::logging`] (we never write request headers or bodies).
 
 use std::env;
 
 use sentry::ClientInitGuard;
 
-/// Основное имя переменной с DSN.
+/// The primary name of the DSN variable.
 const DSN_VAR: &str = "GLITCHTIP_DSN";
 
-/// Совместимое имя (его выставляют Sentry-совместимые инструменты).
+/// The compatible name (set by Sentry-compatible tooling).
 const DSN_VAR_ALT: &str = "SENTRY_DSN";
 
-/// Доля span-ов, уходящих в performance-мониторинг (0.0 — выключено).
+/// Fraction of spans sent to performance monitoring (0.0 means off).
 const TRACES_RATE_VAR: &str = "GLITCHTIP_TRACES_SAMPLE_RATE";
 
-/// Включение структурных логов.
+/// Enabling structured logs.
 const ENABLE_LOGS_VAR: &str = "GLITCHTIP_ENABLE_LOGS";
 
-/// Исход инициализации.
+/// The outcome of initialisation.
 ///
-/// Как и в [`crate::tracing_otel::Status`], нужен потому, что инициализация
-/// происходит **до** установки `tracing`-subscriber'а: залогируй мы прямо там,
-/// сообщение было бы потеряно.
+/// As in [`crate::tracing_otel::Status`], it exists because initialisation
+/// happens **before** the `tracing` subscriber is installed: logging right there
+/// would lose the message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
-    /// DSN не задан — интеграция выключена.
+    /// No DSN is set — the integration is off.
     Disabled,
-    /// Интеграция включена.
+    /// The integration is on.
     Enabled {
-        /// Включён ли performance-мониторинг (доля семплирования > 0).
+        /// Whether performance monitoring is on (sampling rate > 0).
         performance: bool,
-        /// Включены ли структурные логи.
+        /// Whether structured logs are on.
         logs: bool,
     },
 }
 
 impl Status {
-    /// Включены ли структурные логи. Нужен [`layer`]: с 0.49 канал Logs
-    /// фильтруем сами, см. комментарий там.
+    /// Whether structured logs are on. Needed by [`layer`]: since 0.49 we filter
+    /// the Logs channel ourselves, see the comment there.
     pub fn logs_enabled(&self) -> bool {
         matches!(self, Status::Enabled { logs: true, .. })
     }
 
-    /// Пишет статус в лог. Вызывать после установки subscriber'а.
+    /// Writes the status to the log. Call it after the subscriber is installed.
     pub fn log(&self) {
         match self {
             Status::Disabled => {
-                tracing::debug!("GlitchTip: интеграция выключена ({DSN_VAR} не задан)");
+                tracing::debug!("GlitchTip: integration disabled ({DSN_VAR} is not set)");
             }
             Status::Enabled { performance, logs } => {
-                // DSN намеренно не пишем — это секрет.
+                // The DSN is deliberately not written — it is a secret.
                 tracing::info!(
                     performance,
                     logs,
-                    "GlitchTip: интеграция включена (ошибки и паники)"
+                    "GlitchTip: integration enabled (errors and panics)"
                 );
             }
         }
     }
 }
 
-/// Читает `f32` из окружения с откатом на `default`.
+/// Reads an `f32` from the environment, falling back to `default`.
 fn env_f32(key: &str, default: f32) -> f32 {
     env::var(key)
         .ok()
@@ -94,7 +97,7 @@ fn env_f32(key: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
-/// Читает булев флаг из окружения (`true`/`1`/`yes`).
+/// Reads a boolean flag from the environment (`true`/`1`/`yes`).
 fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
@@ -102,7 +105,7 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// Читает DSN: сначала `GLITCHTIP_DSN`, затем совместимый `SENTRY_DSN`.
+/// Reads the DSN: `GLITCHTIP_DSN` first, then the compatible `SENTRY_DSN`.
 fn read_dsn() -> Option<String> {
     for var in [DSN_VAR, DSN_VAR_ALT] {
         if let Some(dsn) = env::var(var).ok().filter(|s| !s.trim().is_empty()) {
@@ -112,36 +115,36 @@ fn read_dsn() -> Option<String> {
     None
 }
 
-/// Инициализирует клиент GlitchTip.
+/// Initialises the GlitchTip client.
 ///
-/// Возвращает guard (держать живым до конца работы процесса — при его уничтожении
-/// досылаются накопленные события) и статус для последующего логирования.
+/// Returns a guard (keep it alive until the process ends — destroying it flushes
+/// the accumulated events) and a status to be logged later.
 ///
-/// Ничего не делает и возвращает [`Status::Disabled`], если DSN не задан.
+/// Does nothing and returns [`Status::Disabled`] when no DSN is set.
 pub fn init() -> (Option<ClientInitGuard>, Status) {
     let Some(dsn) = read_dsn() else {
         return (None, Status::Disabled);
     };
 
-    // 0.0 — performance выключен (дефолт): транзакции стоят денег и объёма,
-    // включать осознанно.
+    // 0.0 means performance is off (the default): transactions cost money and
+    // volume, so enable them deliberately.
     let traces_sample_rate = env_f32(TRACES_RATE_VAR, 0.0);
     let enable_logs = env_bool(ENABLE_LOGS_VAR, false);
 
-    // С 0.49 `ClientOptions` — `#[non_exhaustive]`: литерал структуры извне крейта
-    // не собирается, остаётся только билдер.
+    // Since 0.49 `ClientOptions` is `#[non_exhaustive]`: a struct literal does
+    // not compile outside the crate, leaving only the builder.
     let mut options = sentry::ClientOptions::new()
-        // Версия сервиса — чтобы issues группировались по релизам.
+        // The service version — so that issues are grouped by release.
         .release(env!("CARGO_PKG_VERSION"));
 
     if let Ok(environment) = env::var("GLITCHTIP_ENVIRONMENT") {
         options = options.environment(environment);
     }
 
-    // Ставим стратегию сэмплирования только при ненулевой доле. Пустая доля —
-    // это `TracesSamplingStrategy::Disabled` (дефолт), и она отличается от явной
-    // `FixedRate(0.0)`: последняя всё ещё уважает решение родителя из входящего
-    // trace-контекста, то есть транзакции продолжали бы уходить.
+    // The sampling strategy is set only for a non-zero rate. An absent rate is
+    // `TracesSamplingStrategy::Disabled` (the default), and that differs from an
+    // explicit `FixedRate(0.0)`: the latter still respects the parent decision
+    // from an incoming trace context, so transactions would keep being sent.
     if traces_sample_rate > 0.0 {
         options = options.traces_sample_rate(traces_sample_rate);
     }
@@ -157,19 +160,19 @@ pub fn init() -> (Option<ClientInitGuard>, Status) {
     )
 }
 
-/// Строит `tracing`-слой, раскладывающий события по каналам GlitchTip.
+/// Builds the `tracing` layer that splits events across the GlitchTip channels.
 ///
-/// - `ERROR` → **issue** (событие в разделе Issues);
-/// - `WARN`/`INFO`/`DEBUG` → **log** (раздел Logs), если `logs`, иначе
-///   «хлебные крошки» к будущим ошибкам (`DEBUG` в этом случае отбрасывается);
-/// - span-ы → **транзакции** (раздел Performance), если включено семплирование.
+/// - `ERROR` → an **issue** (an entry in the Issues section);
+/// - `WARN`/`INFO`/`DEBUG` → a **log** (the Logs section) when `logs` is on,
+///   otherwise breadcrumbs for future errors (`DEBUG` is dropped in that case);
+/// - spans → **transactions** (the Performance section) when sampling is on.
 ///
-/// `logs` приходит снаружи (см. [`Status::logs_enabled`]), а не из
-/// `ClientOptions::enable_logs`: с 0.49 то поле объявлено deprecated — по
-/// апстриму логи, захваченные вручную, уходят всегда, а опция влияет только на
-/// автоматический захват интеграциями. Рекомендованный путь — настраивать, что
-/// именно шлёт интеграция, её собственными средствами; для `tracing` это и есть
-/// event-фильтр ниже.
+/// `logs` comes from the outside (see [`Status::logs_enabled`]) rather than from
+/// `ClientOptions::enable_logs`: since 0.49 that field is deprecated — upstream,
+/// manually captured logs are always sent and the option only affects automatic
+/// capture by integrations. The recommended path is to configure what an
+/// integration sends by its own means, and for `tracing` that is the event
+/// filter below.
 pub fn layer<S>(logs: bool) -> sentry::integrations::tracing::SentryLayer<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -177,9 +180,9 @@ where
     use sentry::integrations::tracing::EventFilter;
 
     sentry::integrations::tracing::layer().event_filter(move |md| match *md.level() {
-        // Сбой сервиса — заводим issue.
+        // A service failure — open an issue.
         tracing::Level::ERROR => EventFilter::Event,
-        // Остальное — в Logs (и как breadcrumbs к ошибкам).
+        // Everything else goes to Logs (and as breadcrumbs for errors).
         tracing::Level::WARN | tracing::Level::INFO => {
             if logs {
                 EventFilter::Log | EventFilter::Breadcrumb
@@ -203,7 +206,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Тесты трогают глобальные env — сериализуем.
+    /// The tests touch global env vars — serialise them.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear() {
@@ -260,8 +263,8 @@ mod tests {
         assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 1.0);
         env::set_var(TRACES_RATE_VAR, "-1");
         assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 0.0);
-        env::set_var(TRACES_RATE_VAR, "не число");
-        assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 0.0, "мусор → дефолт");
+        env::set_var(TRACES_RATE_VAR, "not a number");
+        assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 0.0, "garbage → default");
         env::set_var(TRACES_RATE_VAR, "0.25");
         assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 0.25);
         clear();
@@ -286,7 +289,7 @@ mod tests {
     fn logs_flag_parsing() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        assert!(!env_bool(ENABLE_LOGS_VAR, false), "по умолчанию выключено");
+        assert!(!env_bool(ENABLE_LOGS_VAR, false), "off by default");
         for truthy in ["true", "1", "yes", "TRUE"] {
             env::set_var(ENABLE_LOGS_VAR, truthy);
             assert!(env_bool(ENABLE_LOGS_VAR, false), "{truthy}");
