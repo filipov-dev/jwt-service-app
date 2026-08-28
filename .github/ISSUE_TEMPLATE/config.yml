@@ -1,0 +1,20 @@
+# Пустые issue выключены намеренно: шаблоны спрашивают ровно то, без чего
+# разбор всё равно начнётся с уточняющих вопросов.
+blank_issues_enabled: false
+contact_links:
+  - name: Сообщить об уязвимости (приватно)
+    url: https://github.com/filipov-dev/jwt-service-app/security/advisories/new
+    about: >-
+      Не заводите публичный issue на уязвимость — он раскрывает её всем, кто
+      запустил образ, раньше, чем появится патч. Приватный адвайзори или письмо
+      на security@filipov.dev. Политика и сроки — в SECURITY.md.
+  - name: Ключи, JWKS и их ротация
+    url: https://github.com/filipov-dev/jwks-service-app/issues
+    about: >-
+      Этот сервис ключи не генерирует и не хранит — за них отвечает
+      jwks-service-app. Баги про ключи заводите в его репозитории.
+  - name: Документация проекта
+    url: https://github.com/filipov-dev/jwt-service-app#документация
+    about: >-
+      Переменные окружения, уровни доступа, конфиги прокси, клиентские примеры,
+      observability и прод-манифесты — возможно, ответ уже есть.

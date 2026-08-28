@@ -1,0 +1,36 @@
+name: Документация
+description: Ошибка, пробел или непонятное место в документации
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Если ответ на ваш вопрос пришлось искать по коду — это баг
+        документации, а не ваш. Заводите смело.
+
+  - type: input
+    id: where
+    attributes:
+      label: Где
+      description: Файл и раздел или ссылка на строку.
+      placeholder: "AGENTS.md → Конфигурация, строка про JWKS_CACHE_STALE_GRACE_SECONDS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что не так
+      description: >-
+        Расходится с поведением сервиса, противоречит другому разделу,
+        неоднозначно читается или отсутствует вовсе.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Как правильно
+      description: Формулировка, если она у вас есть. Необязательно.
+    validations:
+      required: false
