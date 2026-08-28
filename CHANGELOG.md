@@ -12,6 +12,24 @@
 и инструкции по эксплуатации — изменения для потребителя сервиса) и
 «Внутреннее» (CI, тесты, форматирование).
 
+## [1.17.11] - 2026-08-28
+
+### Внутреннее
+
+- bump parking_lot from 0.12.3 to 0.12.5
+- bump serde_json from 1.0.138 to 1.0.151
+- bump uuid from 1.24.0 to 1.25.0
+- bump redis from 1.2.4 to 1.6.0
+- bump thiserror from 2.0.19 to 2.0.20
+- bump actions/upload-artifact from 4 to 7
+- bump docker/login-action from 4.5.2 to 4.6.0
+- bump actions/download-artifact from 4 to 8
+- bump actix-web from 4.9.0 to 4.14.0
+
+### Прочее
+
+- JWT-113: миграция на sentry 0.49
+
 ## [1.17.10] - 2026-08-27
 
 ### Документация
@@ -365,6 +383,7 @@
 - Init
 
 [Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.11]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.10...v1.17.11
 [1.17.10]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.9...v1.17.10
 [1.17.9]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.8...v1.17.9
 [1.17.8]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.7...v1.17.8

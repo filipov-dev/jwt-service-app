@@ -60,6 +60,12 @@ pub enum Status {
 }
 
 impl Status {
+    /// Включены ли структурные логи. Нужен [`layer`]: с 0.49 канал Logs
+    /// фильтруем сами, см. комментарий там.
+    pub fn logs_enabled(&self) -> bool {
+        matches!(self, Status::Enabled { logs: true, .. })
+    }
+
     /// Пишет статус в лог. Вызывать после установки subscriber'а.
     pub fn log(&self) {
         match self {
@@ -122,18 +128,25 @@ pub fn init() -> (Option<ClientInitGuard>, Status) {
     let traces_sample_rate = env_f32(TRACES_RATE_VAR, 0.0);
     let enable_logs = env_bool(ENABLE_LOGS_VAR, false);
 
-    let guard = sentry::init((
-        dsn,
-        sentry::ClientOptions {
-            // Версия сервиса — чтобы issues группировались по релизам.
-            release: Some(env!("CARGO_PKG_VERSION").into()),
-            environment: env::var("GLITCHTIP_ENVIRONMENT").ok().map(Into::into),
-            traces_sample_rate,
-            // Структурные логи (канал Logs в GlitchTip).
-            enable_logs,
-            ..Default::default()
-        },
-    ));
+    // С 0.49 `ClientOptions` — `#[non_exhaustive]`: литерал структуры извне крейта
+    // не собирается, остаётся только билдер.
+    let mut options = sentry::ClientOptions::new()
+        // Версия сервиса — чтобы issues группировались по релизам.
+        .release(env!("CARGO_PKG_VERSION"));
+
+    if let Ok(environment) = env::var("GLITCHTIP_ENVIRONMENT") {
+        options = options.environment(environment);
+    }
+
+    // Ставим стратегию сэмплирования только при ненулевой доле. Пустая доля —
+    // это `TracesSamplingStrategy::Disabled` (дефолт), и она отличается от явной
+    // `FixedRate(0.0)`: последняя всё ещё уважает решение родителя из входящего
+    // trace-контекста, то есть транзакции продолжали бы уходить.
+    if traces_sample_rate > 0.0 {
+        options = options.traces_sample_rate(traces_sample_rate);
+    }
+
+    let guard = sentry::init((dsn, options));
 
     (
         Some(guard),
@@ -147,21 +160,40 @@ pub fn init() -> (Option<ClientInitGuard>, Status) {
 /// Строит `tracing`-слой, раскладывающий события по каналам GlitchTip.
 ///
 /// - `ERROR` → **issue** (событие в разделе Issues);
-/// - `WARN`/`INFO`/`DEBUG` → **log** (раздел Logs), если логи включены, иначе
-///   «хлебные крошки» к будущим ошибкам;
+/// - `WARN`/`INFO`/`DEBUG` → **log** (раздел Logs), если `logs`, иначе
+///   «хлебные крошки» к будущим ошибкам (`DEBUG` в этом случае отбрасывается);
 /// - span-ы → **транзакции** (раздел Performance), если включено семплирование.
-pub fn layer<S>() -> sentry::integrations::tracing::SentryLayer<S>
+///
+/// `logs` приходит снаружи (см. [`Status::logs_enabled`]), а не из
+/// `ClientOptions::enable_logs`: с 0.49 то поле объявлено deprecated — по
+/// апстриму логи, захваченные вручную, уходят всегда, а опция влияет только на
+/// автоматический захват интеграциями. Рекомендованный путь — настраивать, что
+/// именно шлёт интеграция, её собственными средствами; для `tracing` это и есть
+/// event-фильтр ниже.
+pub fn layer<S>(logs: bool) -> sentry::integrations::tracing::SentryLayer<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     use sentry::integrations::tracing::EventFilter;
 
-    sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
+    sentry::integrations::tracing::layer().event_filter(move |md| match *md.level() {
         // Сбой сервиса — заводим issue.
         tracing::Level::ERROR => EventFilter::Event,
         // Остальное — в Logs (и как breadcrumbs к ошибкам).
-        tracing::Level::WARN | tracing::Level::INFO => EventFilter::Log | EventFilter::Breadcrumb,
-        tracing::Level::DEBUG => EventFilter::Log,
+        tracing::Level::WARN | tracing::Level::INFO => {
+            if logs {
+                EventFilter::Log | EventFilter::Breadcrumb
+            } else {
+                EventFilter::Breadcrumb
+            }
+        }
+        tracing::Level::DEBUG => {
+            if logs {
+                EventFilter::Log
+            } else {
+                EventFilter::Ignore
+            }
+        }
         tracing::Level::TRACE => EventFilter::Ignore,
     })
 }
@@ -233,6 +265,21 @@ mod tests {
         env::set_var(TRACES_RATE_VAR, "0.25");
         assert_eq!(env_f32(TRACES_RATE_VAR, 0.0), 0.25);
         clear();
+    }
+
+    #[test]
+    fn status_reports_logs_flag() {
+        assert!(Status::Enabled {
+            performance: false,
+            logs: true
+        }
+        .logs_enabled());
+        assert!(!Status::Enabled {
+            performance: true,
+            logs: false
+        }
+        .logs_enabled());
+        assert!(!Status::Disabled.logs_enabled());
     }
 
     #[test]
