@@ -27,6 +27,7 @@
 - [ ] a new internal endpoint is listed in `internal_endpoints()` (`src/main.rs`)
 - [ ] there are no secrets, private keys or live tokens in the diff
 - [ ] `CHANGELOG.md` was not edited by hand — it is generated
+      (`scripts/changelog.sh --check` is clean, or rebuild it with `--all`)
 
 <!-- The commit subject goes into the changelog verbatim: conventional commits
      (feat/fix/docs/perf/refactor/test/ci/style) with the task key in
