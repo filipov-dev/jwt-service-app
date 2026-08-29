@@ -12,9 +12,11 @@ one-off script, a key in an example, a config dump in a debugging commit.
 
 ## The verdict
 
-**The history is clean.** As of 2026-08-25 (`1ec2040`, master) two independent
+**The history is clean.** As of 2026-08-29 (`7030671`, master) two independent
 scanners report zero unreviewed findings. Everything they found consists of demo
-values from the local stands, reviewed one by one below.
+values from the local stands, reviewed one by one below. This is the re-run
+immediately before the switch to public; the first full pass was on 2026-08-25
+(`1ec2040`) and found the same four values and nothing else.
 
 Not a single **verified** secret (trufflehog verifies findings over the network):
 `verified_secrets: 0`.
@@ -23,12 +25,12 @@ Not a single **verified** secret (trufflehog verifies findings over the network)
 
 | | |
 |---|---|
-| Point of check | `1ec2040`, master, 2026-08-25 |
-| Commits in the history | 155 (54 of them merge commits) |
-| Scanned by gitleaks | 101 commits (merge commits are skipped: they have no diff of their own) |
-| Scanned by trufflehog | 1598 chunks, ~1.3 MB |
-| Unique paths over the whole history | 94 added, 108 objects counting renames |
-| Ref coverage | 22 local branches, 53 remote ones, 49 tags and **74 pull request refs** |
+| Point of check | `7030671`, master, 2026-08-29 |
+| Commits in the history | 194 (83 of them merge commits) |
+| Scanned by gitleaks | 116 commits (merge commits are skipped: they have no diff of their own) |
+| Scanned by trufflehog | 2927 chunks, ~2.1 MB |
+| Unique paths over the whole history | 111 added, 127 objects counting renames |
+| Ref coverage | 23 local branches, 69 remote ones, 62 tags and **90 pull request refs** |
 
 **The pull request refs (`refs/pull/*/head`) are in scope deliberately.** A commit
 removed from a branch by a force push stays reachable on GitHub through the pull
@@ -39,8 +41,8 @@ the public does. They are fetched explicitly:
 git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
 ```
 
-In this repository the pull request refs added 6 commits beyond those reachable
-from branches; there are no findings in them.
+The pull request refs are fetched into the scan and carry no findings of their
+own.
 
 ## What it was scanned with
 

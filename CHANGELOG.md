@@ -23,6 +23,12 @@ and "Internal" (CI, tests, formatting).
 Entries before 1.17.13 are in Russian: the repository switched to English in
 JWT-114 and the commit history was deliberately left as it was.
 
+## [1.17.16] - 2026-08-29
+
+### Fixed
+
+- rebuild CHANGELOG.md from the history and gate it in CI (JWT-115)
+
 ## [1.17.15] - 2026-08-29
 
 ### Documentation
@@ -474,7 +480,8 @@ JWT-114 and the commit history was deliberately left as it was.
 
 - Init
 
-[Unreleased]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.15...HEAD
+[Unreleased]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.16...HEAD
+[1.17.16]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.15...v1.17.16
 [1.17.15]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.13...v1.17.15
 [1.17.13]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.12...v1.17.13
 [1.17.12]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.11...v1.17.12
