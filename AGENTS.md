@@ -272,9 +272,11 @@ instead of `401` on `/metrics`, failing open when Redis is unavailable), and
 wording that drifts apart turns documented behaviour into a "confirmed finding".
 
 > **The "Report a vulnerability" link in `SECURITY.md` depends on a repository
-> setting** — Private vulnerability reporting, see the settings checklist in
-> [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md). With the
-> setting off the link leads nowhere and email is the only working channel, so
+> setting** — Private vulnerability reporting, which is on; it and the two other
+> settings that live outside the code are recorded, with the commands that read
+> them back, in
+> [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md). Turn it
+> off and the link leads nowhere while `SECURITY.md` goes on advertising it, so
 > check the two together when you touch either.
 
 **CI is built for a public repository**: `ci.yml`, `audit.yml` and `secrets.yml`

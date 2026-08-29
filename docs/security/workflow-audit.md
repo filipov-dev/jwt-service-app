@@ -1,7 +1,9 @@
 # The GitHub Actions security audit for pull requests from forks
 
-The gate before switching the repository to public (JWT-52), alongside the
-[history audit for secrets](secret-audit.md).
+The audit that gated the switch to public (JWT-52, made in JWT-72), alongside
+the [history audit for secrets](secret-audit.md). The repository is public now,
+so this is a record rather than a plan — but the threat model and the routine at
+the end apply to every workflow added from here on.
 
 A public repository means **anyone can open a pull request**, and a pull request
 starts workflows. Everything that reaches the runner in the process is someone
@@ -109,42 +111,65 @@ script through `"$VAR"` — the shell then receives it as a variable value.
   'pull_request'`), or a quick series of merges would leave the default branch
   unchecked.
 
-## Required in the repository settings
+## The settings outside the code
 
-Not fixable by code; done by hand in Settings. **The order matters:** half of
-these settings do not exist for a private repository, so a checklist that says
-"do all of this before publication" cannot be followed — GitHub refuses them
-until the switch has happened.
+Three settings do the work no file in this repository can, which is exactly why
+they drift the most quietly of all: nothing in a diff shows them changing, and
+CI cannot fail over them. This is the record of what they are set to and why —
+and the commands that read them back, because a claim about a setting is worth
+what its verification is worth.
 
-### Beforehand
+| Setting | Value | API |
+|---|---|---|
+| Actions → Workflow permissions | `read` | `/actions/permissions/workflow` |
+| Actions → Fork pull request workflows | `all_external_contributors` | `/actions/permissions/fork-pr-contributor-approval` |
+| Advanced Security → Private vulnerability reporting | on | `/private-vulnerability-reporting` |
 
-- **Settings → Actions → Workflow permissions: `Read repository contents`.**
-  Anything else and the very first workflow added without an explicit
-  `permissions` block silently gets a write token. It does not affect the
-  workflows that exist today — all five declare `permissions` and override the
-  default — which is exactly why the wrong value here would go unnoticed.
+```bash
+repo=https://api.github.com/repos/filipov-dev/jwt-service-app
+curl -sH "authorization: token $TOKEN" "$repo/actions/permissions/workflow"
+curl -sH "authorization: token $TOKEN" "$repo/actions/permissions/fork-pr-contributor-approval"
+curl -so /dev/null -w '%{http_code}\n' -H "authorization: token $TOKEN" \
+    "$repo/private-vulnerability-reporting"   # 204 when on, 404 when off
+```
 
-### In the same sitting as the switch to public
+**Workflow permissions are `read`, not because the current workflows need it.**
+All five declare an explicit `permissions` block and override the default
+whatever it is — which is the reason a wrong value here would go unnoticed for a
+long time. It bites the *next* workflow, the one added without a `permissions`
+block, which would silently receive a write token.
 
-Neither of these can be prepared in advance, and both are easy to forget once
-the repository is already open:
+**Fork pull request runs need approval from every external contributor**, not
+only a first-time one. GitHub's default releases the brakes after a
+contributor's first merged pull request; from then on their pushes start runs
+unattended. The runner holds no secrets either way (see "The triggers"), so this
+is not what stands between a fork and `DOCKER_HUB_TOKEN` — it is control over
+who gets to run code on the queue, and it costs one click per pull request.
 
-- **Settings → Actions → Fork pull request workflows: `Require approval for all
-  external contributors`.** The default is approval only for a first-time
-  contributor; after their first merged pull request the runs become automatic.
-  The setting does not exist while the repository is private — the API answers
-  `422 Fork PR approval is not allowed for private repositories`.
-- **Settings → Advanced Security → Private vulnerability reporting: on.** It is
-  what makes the "Report a vulnerability" link in
-  [`SECURITY.md`](../../SECURITY.md) work; until it is on, the private channel
-  documented there is email only. Public repositories only — the API answers
-  `404` for `/private-vulnerability-reporting` while the repository is private.
+**Private vulnerability reporting is on**, and that is what makes the "Report a
+vulnerability" link in [`SECURITY.md`](../../SECURITY.md) go somewhere. With it
+off the link is dead and the private channel that file documents is email alone
+— a security policy pointing at a channel that does not exist is worse than one
+that only offers email, because the reader believes the first one.
 
-### Optional
+### Turning this on somewhere else
 
-- **An environment with required reviewers for publishing the images** — should
-  the wish arise to run `docker.yml` other than manually and other than from a
-  tag.
+The order is not free to choose, and it is the part that catches people copying
+this setup: **two of the three cannot be set before the repository is public.**
+GitHub refuses them outright — `422 Fork PR approval is not allowed for private
+repositories` and `404` for `/private-vulnerability-reporting`. Only the
+workflow permissions can be prepared in advance. So a checklist reading "do all
+of this before publication" cannot be followed; the switch itself has to sit in
+the middle of it, with the other two applied immediately after, in the same
+sitting. They are easy to forget once the repository is already open and the
+interesting part is over.
+
+### Considered and not set
+
+- **An environment with required reviewers for publishing the images.** It would
+  matter if `docker.yml` were ever to run other than manually and other than
+  from a tag. Today both of those already require write access, so the reviewer
+  gate would guard a door that is locked.
 
 ## Residual risks
 
