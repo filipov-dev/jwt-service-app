@@ -1,6 +1,6 @@
-# Автообновление зависимостей. Cargo — раз в неделю, GitHub Actions — раз в неделю.
-# Уязвимости отдельно отслеживает `cargo audit` (см. audit.yml); dependabot же
-# держит зависимости и версии actions свежими.
+# Automatic dependency updates. Cargo weekly, GitHub Actions weekly.
+# Vulnerabilities are tracked separately by `cargo audit` (see audit.yml);
+# dependabot only keeps dependencies and action versions fresh.
 version: 2
 updates:
   - package-ecosystem: "cargo"

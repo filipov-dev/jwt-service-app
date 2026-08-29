@@ -5,9 +5,9 @@ metadata:
   labels:
     app.kubernetes.io/name: jwt-service-app
 spec:
-  # ClusterIP, а не LoadBalancer/NodePort: наружу сервис смотрит только через
-  # ingress, который ставит X-Proxy-Secret. Публикация Service напрямую даёт
-  # доступ в обход прокси, то есть в обход уровня 2.
+  # ClusterIP rather than LoadBalancer/NodePort: the service faces outwards only
+  # through the ingress, which injects X-Proxy-Secret. Publishing the Service
+  # directly gives access past the proxy, that is, past level 2.
   type: ClusterIP
   selector:
     app.kubernetes.io/name: jwt-service-app

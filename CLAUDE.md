@@ -1,13 +1,13 @@
 # CLAUDE.md
 
-Основные инструкции по проекту находятся в [AGENTS.md](AGENTS.md) — читай его
-первым. Там описаны архитектура, карта модулей, команды, конфигурация и
-подводные камни.
+The main project instructions live in [AGENTS.md](AGENTS.md) — read it first.
+It covers the architecture, the module map, the commands, the configuration and
+the pitfalls.
 
-Ниже — только дополнения, специфичные для Claude Code.
+What follows are only the additions specific to Claude Code.
 
-- Отвечай пользователю на русском (язык проекта и комментариев в коде).
-- Не коммить и не пуш без явной просьбы. Пуш в `master` с изменением
-  `Cargo.toml` запускает релиз и публикацию Docker-образов — не трогай версию
-  без необходимости.
-- После правок прогоняй `cargo build` и `cargo clippy` перед завершением задачи.
+- Do not commit and do not push without being asked. Pushing a `Cargo.toml`
+  version change to `master` triggers a release and publishes Docker images —
+  do not touch the version without a reason.
+- Run `cargo build` and `cargo clippy` after making changes, before calling the
+  task done.

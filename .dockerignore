@@ -1,14 +1,15 @@
-# Артефакты компиляции — собираются внутри образа, в контекст не нужны
-# (иначе локальный target/ на гигабайты тормозит COPY и инвалидирует кеш).
+# Build artifacts — they are produced inside the image and are not needed in the
+# context (otherwise a local target/ of several gigabytes slows COPY down and
+# invalidates the cache).
 /target
 
-# VCS и локальные настройки
+# VCS and local settings
 .git
 .gitignore
 
-# Приватные заметки агентов (см. AGENTS.md) — не должны попадать в образ
+# Private agent notes (see AGENTS.md) — they must not reach the image
 AGENTS_INTERNAL.md
 
-# Прочее окружение разработки
+# Other development environment
 .env
 *.log

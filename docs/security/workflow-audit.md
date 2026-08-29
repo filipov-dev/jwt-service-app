@@ -1,154 +1,160 @@
-# Аудит GitHub Actions на безопасность при PR с форков
+# The GitHub Actions security audit for pull requests from forks
 
-Гейт перед переводом репозитория в public (JWT-52), рядом с
-[аудитом истории на секреты](secret-audit.md).
+The gate before switching the repository to public (JWT-52), alongside the
+[history audit for secrets](secret-audit.md).
 
-Публичный репозиторий означает, что **PR может открыть кто угодно**, а PR
-запускает workflow. Всё, что при этом попадает в раннер, — чужой код: он
-компилируется, выполняется тестами и билд-скриптами. Вопрос аудита не «доверяем
-ли мы автору PR» (не доверяем по построению), а «что максимум получит тот, кто
-пришёл с враждебным PR».
+A public repository means **anyone can open a pull request**, and a pull request
+starts workflows. Everything that reaches the runner in the process is someone
+else's code: it is compiled and executed by the tests and the build scripts. The
+question this audit answers is not "do we trust the author of the pull request"
+(we do not, by construction) but "what is the most somebody arriving with a
+hostile pull request can get".
 
-## Вердикт
+## The verdict
 
-**Секреты с форка недостижимы.** На 2026-08-26 ни один workflow, у которого
-есть доступ к `DOCKER_HUB_TOKEN` или право записи, не запускается событием,
-которое может вызвать посторонний. Ни одного `pull_request_target` в
-репозитории нет. Правки этого аудита — не закрытие дыры, а сужение того, что
-лежит в раннере рядом с чужим кодом.
+**The secrets are out of reach from a fork.** As of 2026-08-26 not a single
+workflow with access to `DOCKER_HUB_TOKEN` or with write permissions is started
+by an event an outsider can cause. There is no `pull_request_target` anywhere in
+the repository. The changes made by this audit do not close a hole; they narrow
+what sits in the runner next to someone else's code.
 
-Остаётся **исполнение произвольного кода в непривилегированном раннере** — это
-не устраняется, а ограничивается: см. «Остаточные риски».
+What remains is **arbitrary code execution in an unprivileged runner** — that is
+not eliminated but bounded: see "Residual risks".
 
-## Модель угрозы
+## The threat model
 
-Что даёт GitHub для `pull_request` с форка в публичном репозитории:
+What GitHub grants a `pull_request` from a fork in a public repository:
 
-| | С форка | Со своей ветки / `master` |
+| | From a fork | From an own branch / `master` |
 |---|---|---|
-| `secrets.*` (кроме `GITHUB_TOKEN`) | **пусто** | доступны |
-| `GITHUB_TOKEN` | **read-only**, независимо от блока `permissions` | как объявлено в `permissions` |
-| Запись в кеш `master` | нет (кеш PR изолирован) | да |
-| Запуск `workflow_dispatch` | нет (нужен write-доступ к репозиторию) | да |
-| Исполнение кода в раннере | **да** | да |
+| `secrets.*` (other than `GITHUB_TOKEN`) | **empty** | available |
+| `GITHUB_TOKEN` | **read-only**, regardless of the `permissions` block | as declared in `permissions` |
+| Writing to the `master` cache | no (the pull request cache is isolated) | yes |
+| Starting `workflow_dispatch` | no (write access to the repository is required) | yes |
+| Executing code in the runner | **yes** | yes |
 
-Ключевое: блок `permissions` в workflow умеет только **сужать**. Для форка
-потолок и так read-only, поэтому `permissions` — защита от своих же будущих
-ошибок и от того, кто получил write-доступ, а не от анонимного PR.
+The key point: a `permissions` block in a workflow can only **narrow**. For a
+fork the ceiling is read-only anyway, so `permissions` protects against our own
+future mistakes and against somebody who obtained write access — not against an
+anonymous pull request.
 
-## Триггеры: что откуда запускается
+## The triggers: what starts from where
 
-| Workflow | Триггеры | Достижим с форка | Секреты в job'ах |
+| Workflow | Triggers | Reachable from a fork | Secrets in the jobs |
 |---|---|---|---|
-| `ci.yml` | `pull_request` → `master`, `push` → `master`, `workflow_dispatch` | **да**, через `pull_request` | нет ни одной ссылки на `secrets.*` |
-| `audit.yml` | `pull_request` → `master`, `push` → `master`, `schedule`, `workflow_dispatch` | **да**, через `pull_request` | нет ни одной ссылки на `secrets.*` |
-| `secrets.yml` | `pull_request` → `master`, `push` → `master`, `schedule`, `workflow_dispatch` | **да**, через `pull_request` | нет ни одной ссылки на `secrets.*` |
-| `docker.yml` | `push` тега, `release: published`, `workflow_dispatch` | **нет** | `DOCKER_HUB_USERNAME`, `DOCKER_HUB_TOKEN`, `GITHUB_TOKEN` |
-| `release.yml` | `push` → `master` по пути `Cargo.toml` | **нет** | `GITHUB_TOKEN` (write) |
+| `ci.yml` | `pull_request` → `master`, `push` → `master`, `workflow_dispatch` | **yes**, through `pull_request` | not a single reference to `secrets.*` |
+| `audit.yml` | `pull_request` → `master`, `push` → `master`, `schedule`, `workflow_dispatch` | **yes**, through `pull_request` | not a single reference to `secrets.*` |
+| `secrets.yml` | `pull_request` → `master`, `push` → `master`, `schedule`, `workflow_dispatch` | **yes**, through `pull_request` | not a single reference to `secrets.*` |
+| `docker.yml` | a tag `push`, `release: published`, `workflow_dispatch` | **no** | `DOCKER_HUB_USERNAME`, `DOCKER_HUB_TOKEN`, `GITHUB_TOKEN` |
+| `release.yml` | `push` → `master` on the `Cargo.toml` path | **no** | `GITHUB_TOKEN` (write) |
 
-Три workflow, которые видит форк, не ссылаются на `secrets.` ни разу —
-проверено грепом, а не на глаз. Два workflow с секретами запускаются только
-событиями, которые требуют write-доступа к репозиторию: пуш тега, публикация
-релиза, ручной dispatch. Пуш в `master` с изменением `Cargo.toml` — тоже
-привилегированное действие: форк пушит в свою копию, а не сюда.
+The three workflows a fork can see never reference `secrets.` — verified by grep
+rather than by eye. The two workflows with secrets start only on events that
+require write access to the repository: a tag push, a release publication, a
+manual dispatch. A push to `master` with a `Cargo.toml` change is a privileged
+action too: a fork pushes to its own copy, not here.
 
-**`pull_request_target` не используется нигде.** Это главный способ прострелить
-себе ногу: он выполняет workflow из базовой ветки, но с секретами и write-токеном
-в контексте чужого PR, и один `checkout` с `github.event.pull_request.head.sha`
-превращает его в исполнение чужого кода с полными правами. Введение
-`pull_request_target` в этот репозиторий требует отдельного решения, а не
-попутной правки.
+**`pull_request_target` is not used anywhere.** It is the primary way to shoot
+yourself in the foot: it runs the workflow from the base branch but with the
+secrets and a write token in the context of somebody else's pull request, and a
+single `checkout` of `github.event.pull_request.head.sha` turns it into execution
+of foreign code with full permissions. Introducing `pull_request_target` into this
+repository requires a decision of its own, not a drive-by change.
 
-## `permissions` у `GITHUB_TOKEN`
+## The `permissions` of `GITHUB_TOKEN`
 
-Явный блок есть в каждом workflow — неперечисленные права обнуляются:
+There is an explicit block in every workflow — anything not listed is zeroed out:
 
-| Workflow | `permissions` | Зачем |
+| Workflow | `permissions` | What for |
 |---|---|---|
-| `ci.yml` | `contents: read` | только checkout |
-| `audit.yml` | `contents: read` | только checkout |
-| `secrets.yml` | `contents: read` | checkout; артефакт отчёта заливается своим механизмом, права `contents` ему не нужны |
-| `docker.yml` | `contents: read`, `packages: write` | checkout + пуш образов в GHCR (нужен обеим job'ам) |
-| `release.yml` | `contents: write`, `actions: write` | создать тег и релиз; дёрнуть `docker.yml` через `workflow_dispatch` |
+| `ci.yml` | `contents: read` | checkout only |
+| `audit.yml` | `contents: read` | checkout only |
+| `secrets.yml` | `contents: read` | checkout; the report artifact is uploaded by its own mechanism and needs no `contents` permission |
+| `docker.yml` | `contents: read`, `packages: write` | checkout plus pushing the images to GHCR (both jobs need it) |
+| `release.yml` | `contents: write`, `actions: write` | creating the tag and the release; dispatching `docker.yml` through `workflow_dispatch` |
 
-Сужать дальше нечего: убрать `packages: write` из `docker.yml` или `contents:
-write` из `release.yml` — значит сломать их основную работу.
+There is nothing left to narrow: removing `packages: write` from `docker.yml` or
+`contents: write` from `release.yml` means breaking their main job.
 
-## Подстановка данных события в shell
+## Substituting event data into a shell
 
-Классическая инъекция — `${{ github.event.pull_request.title }}` внутри `run:`:
-заголовок PR пишет посторонний, а подставляется он в скрипт **до** запуска
-шелла, то есть как код, а не как данные. В репозитории таких подстановок нет:
-единственные ссылки на контекст события — `${{ github.actor }}` в `docker.yml`
-(имя пользователя для логина в GHCR, не в `run:`) и `${{ matrix.platform }}` из
-статической матрицы.
+The classic injection is `${{ github.event.pull_request.title }}` inside a `run:`:
+the pull request title is written by an outsider, and it is substituted into the
+script **before** the shell starts, that is, as code rather than as data. There
+are no such substitutions in this repository: the only references to the event
+context are `${{ github.actor }}` in `docker.yml` (the username for the GHCR
+login, not in a `run:`) and `${{ matrix.platform }}` from a static matrix.
 
-Правило на будущее: данные события кладите в `env:` шага и читайте в скрипте
-через `"$VAR"` — тогда шелл получит их как значение переменной.
+The rule for the future: put event data into a step's `env:` and read it in the
+script through `"$VAR"` — the shell then receives it as a variable value.
 
-## Что изменено этим аудитом
+## What this audit changed
 
-- **`persist-credentials: false` на всех `actions/checkout`.** По умолчанию
-  checkout оставляет токен в `.git/config` рабочего каталога до конца job'ы. В
-  `ci.yml`, `audit.yml` и `secrets.yml` дальше по шагам выполняется код из PR
-  (`cargo build`, `cargo test`, билд-скрипты зависимостей, сам
-  `scripts/scan-secrets.sh` — всё из ветки автора), и лежащий рядом токен ему
-  доступен. Для форка токен read-only, так что цена находки невелика, но и
-  нужды в нём нет: по сети в git не ходит ни один шаг ни в одном workflow.
-  В `docker.yml` и `release.yml` тот же флаг выставлен по другой причине — там
-  токен write-scoped, и держать его в файловой системе дольше, чем нужно,
-  незачем.
-- **`concurrency` с отменой предыдущего прогона в `ci.yml`, `audit.yml`,
-  `secrets.yml`.** Публичный репозиторий — это ещё и возможность занять очередь
-  раннеров серией пушей в PR. Новый пуш в ту же ветку отменяет незавершённый
-  прогон того же PR; прогоны на `master` не отменяются никогда
-  (`cancel-in-progress` включается только для `github.event_name ==
-  'pull_request'`), иначе быстрая серия мержей оставила бы дефолтную ветку без
-  проверки.
+- **`persist-credentials: false` on every `actions/checkout`.** By default
+  checkout leaves the token in the working directory's `.git/config` for the rest
+  of the job. In `ci.yml`, `audit.yml` and `secrets.yml` the steps that follow run
+  code from the pull request (`cargo build`, `cargo test`, the build scripts of
+  the dependencies, `scripts/scan-secrets.sh` itself — all from the author's
+  branch), and a token lying next to it is available to that code. For a fork the
+  token is read-only, so the value of such a find is low, but there is no need for
+  it either: not a single step in any workflow talks to git over the network. In
+  `docker.yml` and `release.yml` the same flag is set for a different reason —
+  there the token is write-scoped, and keeping it on the filesystem longer than
+  necessary is pointless.
+- **`concurrency` with cancellation of the previous run in `ci.yml`, `audit.yml`
+  and `secrets.yml`.** A public repository also means the runner queue can be
+  occupied by a series of pushes to a pull request. A new push to the same branch
+  cancels an unfinished run of the same pull request; runs on `master` are never
+  cancelled (`cancel-in-progress` is enabled only for `github.event_name ==
+  'pull_request'`), or a quick series of merges would leave the default branch
+  unchecked.
 
-## Требуется в настройках репозитория
+## Required in the repository settings
 
-Кодом не чинится, делается руками в Settings до публикации:
+Not fixable by code; done by hand in Settings before publication:
 
 - **Settings → Actions → Workflow permissions: `Read repository contents`.**
-  Сейчас у репозитория стоит `write` (проверено через API,
-  `default_workflow_permissions: "write"`). На текущие workflow это не влияет —
-  у всех пяти есть явный блок `permissions`, который перекрывает дефолт, — но
-  первый же workflow, добавленный без такого блока, получит write-токен молча.
+  The repository currently has `write` (verified through the API,
+  `default_workflow_permissions: "write"`). It does not affect the current
+  workflows — all five have an explicit `permissions` block that overrides the
+  default — but the very first workflow added without such a block would silently
+  get a write token.
 - **Settings → Actions → Fork pull request workflows: `Require approval for all
-  external contributors`.** Дефолт для публичных репозиториев — одобрение
-  только для тех, кто пишет впервые; после первого смерженного PR прогоны
-  становятся автоматическими.
-- **Environment с required reviewers на публикацию образов** — если появится
-  желание запускать `docker.yml` не только вручную и не только с тега.
+  external contributors`.** The default for public repositories is approval only
+  for first-time contributors; after the first merged pull request the runs become
+  automatic.
+- **An environment with required reviewers for publishing the images** — should
+  the wish arise to run `docker.yml` other than manually and other than from a
+  tag.
 
-## Остаточные риски
+## Residual risks
 
-- **Исполнение произвольного кода в раннере.** Любой CI, который собирает PR,
-  выполняет чужой код: `build.rs` зависимостей, тесты, скрипты. Ограничение —
-  отсутствие секретов и read-only токен, а не песочница. Раннер одноразовый,
-  сеть у него открыта; исходить надо из того, что содержимое раннера на PR с
-  форка публично.
-- **Actions закреплены тегами, а не SHA.** `dtolnay/rust-toolchain@stable`,
-  `Swatinem/rust-cache@v2`, `docker/login-action@v4.5.2`,
-  `peter-evans/dockerhub-description@v5` — теги подвижны, и компрометация
-  апстрима даёт чужой код в наших job'ах, в том числе в `docker.yml` рядом с
-  `DOCKER_HUB_TOKEN`. К форкам это отношения не имеет, версии обновляет
-  dependabot (`github-actions`, еженедельно). Переход на SHA-пиннинг —
-  отдельная задача.
-- **Кеш `Swatinem/rust-cache` на PR с форка.** Отравить кеш `master` из PR
-  нельзя: GitHub изолирует кеши PR-ветки от базовой. Обратное направление —
-  штатное: PR читает кеш `master`, и это всего лишь скомпилированные
-  зависимости.
+- **Arbitrary code execution in the runner.** Any CI that builds a pull request
+  executes foreign code: the `build.rs` of the dependencies, the tests, the
+  scripts. The bound is the absence of secrets and a read-only token, not a
+  sandbox. The runner is disposable and its network is open; assume that the
+  contents of a runner on a pull request from a fork are public.
+- **The actions are pinned to tags rather than to SHAs.**
+  `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`,
+  `docker/login-action@v4.5.2`, `peter-evans/dockerhub-description@v5` — tags are
+  mutable, and a compromise upstream puts foreign code in our jobs, `docker.yml`
+  next to `DOCKER_HUB_TOKEN` included. This has nothing to do with forks, and the
+  versions are updated by dependabot (`github-actions`, weekly). Moving to SHA
+  pinning is a task of its own.
+- **The `Swatinem/rust-cache` cache on a pull request from a fork.** The `master`
+  cache cannot be poisoned from a pull request: GitHub isolates the caches of a
+  pull request branch from the base one. The other direction is normal: a pull
+  request reads the `master` cache, and that is merely compiled dependencies.
 
-## Регламент: добавляете workflow — проверьте
+## The routine: adding a workflow means checking
 
-1. Есть ли в триггерах `pull_request`? Если да — в job'ах не должно быть ни
-   одной ссылки на `secrets.` (`GITHUB_TOKEN` — исключение, он read-only).
-2. `pull_request_target` — нет. Если кажется, что нужен, это повод для
-   обсуждения, а не для коммита.
-3. Явный блок `permissions` с минимальным набором прав.
-4. `actions/checkout` — с `persist-credentials: false`, если ниже нет git-команд
-   по сети.
-5. Данные события (`github.event.*`) — только через `env:` шага, никогда прямой
-   подстановкой в `run:`.
+1. Do the triggers include `pull_request`? If so, the jobs must not contain a
+   single reference to `secrets.` (`GITHUB_TOKEN` is the exception, it is
+   read-only).
+2. `pull_request_target` — no. If it seems necessary, that is grounds for a
+   discussion, not for a commit.
+3. An explicit `permissions` block with the minimum set of permissions.
+4. `actions/checkout` with `persist-credentials: false`, unless there are git
+   commands over the network below.
+5. Event data (`github.event.*`) only through a step's `env:`, never substituted
+   directly into a `run:`.

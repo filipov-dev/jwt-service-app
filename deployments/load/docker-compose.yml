@@ -1,17 +1,20 @@
-# Изолированный стенд зависимостей для нагрузочного теста (JWT-34).
+# An isolated dependency stand for the load test (JWT-34).
 #
-# ЗАЧЕМ ОТДЕЛЬНЫЙ ФАЙЛ, а не `deployments/dev`:
+# WHY A SEPARATE FILE rather than `deployments/dev`:
 #
-# 1. Имя проекта. Compose по умолчанию берёт имя проекта из имени папки, а папка
-#    `dev` встречается у многих сервисов сразу — контейнеры разных стендов
-#    оказываются в одном проекте `dev` и «угоняют» друг друга (compose считает
-#    чужой контейнер своим сервисом и пересоздаёт его). Здесь имя проекта
-#    закреплено директивой `name:` и от папки не зависит.
-# 2. Порты. Dev-стенд публикует 6379/5432/8082 — они обычно уже заняты другими
-#    локальными стендами. Здесь порты смещены и конфликтовать им не с чем.
-# 3. Состав. Для замера нужны только зависимости: сам сервис запускается с хоста
-#    release-сборкой (dev-контейнер собран под hot-reload и для замеров не годится
-#    — debug-профиль искажает цифры в разы).
+# 1. The project name. By default Compose takes the project name from the
+#    directory name, and a `dev` directory exists in many services at once — the
+#    containers of different stands end up in one `dev` project and hijack each
+#    other (compose treats someone else's container as its own service and
+#    recreates it). Here the project name is pinned by the `name:` directive and
+#    does not depend on the directory.
+# 2. The ports. The dev stand publishes 6379/5432/8082 — usually already taken by
+#    other local stands. Here the ports are shifted and have nothing to clash
+#    with.
+# 3. The contents. A measurement needs only the dependencies: the service itself
+#    is started from the host as a release build (the dev container is built for
+#    hot reload and is unfit for measurements — the debug profile distorts the
+#    numbers several times over).
 name: jwt-load
 
 services:
@@ -28,8 +31,8 @@ services:
       POSTGRES_DB: jwk_db
     ports:
       - "15432:5432"
-    # Данные намеренно без volume: стенд одноразовый, между прогонами его
-    # положено поднимать с нуля.
+    # The data deliberately has no volume: the stand is disposable and is meant
+    # to be brought up from scratch between runs.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d jwk_db"]
       interval: 2s
@@ -47,9 +50,10 @@ services:
       KEY_EXPIRATION_SECONDS: 172800
     ports:
       - "18082:8082"
-    # Именно `service_healthy`, а не простое `depends_on`: сервис ключей при
-    # старте применяет миграции и падает с паникой, если Postgres ещё не принимает
-    # соединения. Обычный `depends_on` дожидается только запуска контейнера.
+    # `service_healthy` specifically, not a plain `depends_on`: the key service
+    # applies migrations at startup and panics if Postgres is not accepting
+    # connections yet. An ordinary `depends_on` only waits for the container to
+    # start.
     depends_on:
       postgres:
         condition: service_healthy

@@ -7,9 +7,9 @@ on:
     paths:
       - Cargo.toml
 
-# Явный блок обнуляет всё неперечисленное, поэтому здесь оба права:
-# contents — создать тег и релиз, actions — дёрнуть docker.yml через
-# workflow_dispatch (без него шаг с curl получит 403).
+# An explicit block zeroes out everything not listed, so both permissions are
+# here: contents to create the tag and the release, actions to dispatch
+# docker.yml through workflow_dispatch (without it the curl step gets a 403).
 permissions:
   contents: write
   actions: write
@@ -19,10 +19,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # fetch-depth: 0 — нужна вся история и теги: описание релиза собирается по
-      # коммитам от предыдущего тега, а при обычном shallow-клоне их нет.
-      # persist-credentials: false — токен из `.git/config` ниже не нужен:
-      # в git по сети не ходит ни один шаг (см. ci.yml).
+      # fetch-depth: 0 — the full history and the tags are needed: the release
+      # description is assembled from the commits since the previous tag, and an
+      # ordinary shallow clone has neither.
+      # persist-credentials: false — the token in `.git/config` is not needed
+      # below: no step talks to git over the network (see ci.yml).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -34,14 +35,16 @@ jobs:
 
       - name: Build release notes
         run: |
-          # Тот же скрипт, что собирает CHANGELOG.md, — разделы и формулировки
-          # в описании релиза и в файле совпадают по построению.
+          # The same script that assembles CHANGELOG.md — the sections and the
+          # wording in the release description and in the file match by
+          # construction.
           scripts/changelog.sh > notes.md
           cat notes.md
 
-      # gh вместо actions/create-release@v1: тот заархивирован ещё в 2021-м и
-      # тело релиза принимает только строкой, а у нас многострочный markdown.
-      # gh есть на раннере из коробки и создаёт тег сам.
+      # gh instead of actions/create-release@v1: that one was archived back in
+      # 2021 and takes the release body as a plain string, while ours is
+      # multi-line markdown. gh ships with the runner and creates the tag
+      # itself.
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

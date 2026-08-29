@@ -1,37 +1,41 @@
-# Observability: логи, метрики, трейсы, ошибки
+# Observability: logs, metrics, traces, errors
 
-Единая точка входа: **что сервис отдаёт наружу, как это включить и куда оно течёт**.
+A single entry point: **what the service exposes, how to turn it on and where it
+flows**.
 
-Вся телеметрия построена на одной шине — `tracing`. Один и тот же span запроса и
-одно и то же событие расходятся по разным выходам: в stdout, в Prometheus, в
-OpenTelemetry Collector, в GlitchTip. Добавление выхода не меняет код обработчиков.
+All telemetry is built on one bus — `tracing`. The same request span and the same
+event fan out to different outputs: to stdout, to Prometheus, to an OpenTelemetry
+Collector, to GlitchTip. Adding an output does not change the handler code.
 
-## Карта сигналов
+## The map of signals
 
-| Сигнал | Модель доставки | Куда | Включение |
-|--------|-----------------|------|-----------|
-| **Логи** | stdout (всегда) | сборщик читает контейнерный лог | `LOG_FORMAT=json` для машинного разбора |
-| **Логи** | PUSH по OTLP (опц.) | OTel Collector → Monium | `OTEL_LOGS_ENABLED=true` |
-| **Метрики** | **PULL** — скрейп `GET /metrics` | Prometheus, Zabbix, Monium | `AUTH_METRICS_TOKEN` |
-| **Трейсы** | PUSH по OTLP | OTel Collector → Monium, Jaeger, Tempo | `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| **Ошибки / performance / логи** | PUSH (Sentry-envelope) | GlitchTip | `GLITCHTIP_DSN` |
+| Signal | Delivery model | Where | Enabled by |
+|--------|----------------|-------|------------|
+| **Logs** | stdout (always) | the collector reads the container log | `LOG_FORMAT=json` for machine parsing |
+| **Logs** | PUSH over OTLP (optional) | OTel Collector → Monium | `OTEL_LOGS_ENABLED=true` |
+| **Metrics** | **PULL** — a scrape of `GET /metrics` | Prometheus, Zabbix, Monium | `AUTH_METRICS_TOKEN` |
+| **Traces** | PUSH over OTLP | OTel Collector → Monium, Jaeger, Tempo | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| **Errors / performance / logs** | PUSH (a Sentry envelope) | GlitchTip | `GLITCHTIP_DSN` |
 
-**Важное следствие модели.** Для метрик нужен **входящий** доступ от скрейпера (и
-потому ручка закрыта Bearer-токеном). Для трейсов, OTLP-логов и GlitchTip нужен
-**исходящий** доступ из пода к коллектору и к GlitchTip — проверьте egress-правила.
+**An important consequence of the model.** Metrics need **inbound** access from
+the scraper (which is why the endpoint is behind a bearer token). Traces, OTLP
+logs and GlitchTip need **outbound** access from the pod to the collector and to
+GlitchTip — check the egress rules.
 
-## Быстрый старт
+## Quick start
 
-Минимум для прода с Monium (метрики + трейсы, логи собираются с stdout):
+The minimum for production with Monium (metrics plus traces, with logs collected
+from stdout):
 
 ```bash
 LOG_FORMAT=json
-AUTH_METRICS_TOKEN=<секрет>                        # включает GET /metrics
+AUTH_METRICS_TOKEN=<secret>                        # enables GET /metrics
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 OTEL_SERVICE_NAME=jwt-service-app
 ```
 
-Добавить логи по OTLP (вместо/вместе со сбором stdout) и ошибки в GlitchTip:
+To add logs over OTLP (instead of or alongside stdout collection) and errors to
+GlitchTip:
 
 ```bash
 OTEL_LOGS_ENABLED=true
@@ -39,65 +43,68 @@ GLITCHTIP_DSN=<dsn>
 GLITCHTIP_ENVIRONMENT=prod
 ```
 
-## Сводная таблица переменных
+## The summary table of variables
 
-| Переменная | Дефолт | Назначение |
-|-----------|--------|-----------|
-| `RUST_LOG` | `jwt_service_app=info` | Фильтр уровней (`EnvFilter`). Дефолт применяется, только если переменная не задана |
-| `LOG_FORMAT` | `pretty` | `json` — построчный JSON для сборщиков; иначе человекочитаемый вывод с ANSI |
-| `AUTH_METRICS_TOKEN` | — (нет) | Bearer-токен для `GET /metrics`. **Не задан → ручки нет (404)** |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (нет) | **Базовый** URL коллектора; к нему добавляется путь сигнала |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (нет) | **Полный** URL для трейсов, используется как есть |
-| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — (нет) | **Полный** URL для логов, используется как есть |
-| `OTEL_LOGS_ENABLED` | `false` | Слать ли логи по OTLP |
-| `OTEL_SERVICE_NAME` | `jwt-service-app` | Атрибут `service.name` в трейсах и логах |
-| `GLITCHTIP_DSN` | — (нет) | DSN GlitchTip (принимается и `SENTRY_DSN`). **Секрет** |
-| `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | Доля span-ов в Performance (0.0–1.0) |
-| `GLITCHTIP_ENABLE_LOGS` | `false` | Слать ли логи в канал Logs GlitchTip |
-| `GLITCHTIP_ENVIRONMENT` | — (нет) | Окружение (`prod`/`stage`) для группировки |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUST_LOG` | `jwt_service_app=info` | The level filter (`EnvFilter`). The default applies only when the variable is unset |
+| `LOG_FORMAT` | `pretty` | `json` gives line-delimited JSON for collectors; anything else gives human-readable output with ANSI |
+| `AUTH_METRICS_TOKEN` | — (none) | The bearer token for `GET /metrics`. **Unset → the endpoint does not exist (404)** |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (none) | The **base** URL of the collector; the signal path is appended to it |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — (none) | The **full** URL for traces, used as is |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — (none) | The **full** URL for logs, used as is |
+| `OTEL_LOGS_ENABLED` | `false` | Whether to send logs over OTLP |
+| `OTEL_SERVICE_NAME` | `jwt-service-app` | The `service.name` attribute in traces and logs |
+| `GLITCHTIP_DSN` | — (none) | The GlitchTip DSN (`SENTRY_DSN` is accepted too). **A secret** |
+| `GLITCHTIP_TRACES_SAMPLE_RATE` | `0.0` | The fraction of spans sent to Performance (0.0–1.0) |
+| `GLITCHTIP_ENABLE_LOGS` | `false` | Whether to send logs to the GlitchTip Logs channel |
+| `GLITCHTIP_ENVIRONMENT` | — (none) | The environment (`prod`/`stage`) for grouping |
 
-Полный список переменных сервиса (включая auth, rate limiting, CORS) — в
-[AGENTS.md](../AGENTS.md).
+The full list of the service's variables (auth, rate limiting and CORS included)
+is in [AGENTS.md](../AGENTS.md).
 
-## Логи
+## Logs
 
-Пишутся в stdout всегда. Каждый запрос оборачивается span-ом `http_request`.
+They always go to stdout. Every request is wrapped in an `http_request` span.
 
-**Поля span:** `request_id`, `method`, `path`, `client_ip`, `access_level`,
-`status`, `latency_ms`. По завершении — строка `request completed`.
+**The span fields:** `request_id`, `method`, `path`, `client_ip`, `access_level`,
+`status`, `latency_ms`. On completion there is a `request completed` line.
 
-**`request_id`** берётся из входящего заголовка `X-Request-Id` (если он валиден:
-ASCII `[A-Za-z0-9_-]`, ≤128 символов), иначе генерируется UUID. Значение
-возвращается в ответе тем же заголовком — удобно сшивать логи через прокси.
+**`request_id`** comes from the incoming `X-Request-Id` header (when it is valid:
+ASCII `[A-Za-z0-9_-]`, up to 128 characters), otherwise a UUID is generated. The
+value is returned in the response in the same header — handy for stitching logs
+across a proxy.
 
-### Уровни
+### Levels
 
-Выбираются **по виновнику**, а не по «серьёзности» текста. В `tracing` пять
-уровней (`TRACE < DEBUG < INFO < WARN < ERROR`); отдельного `CRITICAL`/`FATAL`
-**нет** — фатальное фиксируется паникой на старте (fail-fast по конфигурации).
+They are chosen **by who is at fault**, not by how "serious" the text sounds.
+`tracing` has five levels (`TRACE < DEBUG < INFO < WARN < ERROR`); there is **no**
+separate `CRITICAL`/`FATAL` — fatal is expressed as a panic at startup (fail-fast
+on configuration).
 
-| Уровень | Когда | Примеры |
-|--------:|-------|---------|
-| `ERROR` | сервис не смог выполнить работу; **годится для алертов** | Redis/JWKS недоступны, сбой крипты при подписи |
-| `WARN` | деградация или сигнал безопасности, запрос обработан | проблемы конфигурации, отказ в доступе (401), rate-limit (429) |
-| `INFO` | жизненный цикл и бизнес-события | старт, сводка конфигурации, `request completed`, отзыв токена |
-| `DEBUG` | вина клиента и детали работы | протухший/битый/подделанный токен, `ttl` вне границ, шаги к JWKS |
-| `TRACE` | не используется | — |
+| Level | When | Examples |
+|------:|------|----------|
+| `ERROR` | the service could not do its job; **suitable for alerts** | Redis/JWKS unavailable, a crypto failure while signing |
+| `WARN` | degradation or a security signal, request still handled | configuration problems, access denied (401), rate limit (429) |
+| `INFO` | lifecycle and business events | startup, the configuration summary, `request completed`, a token revoked |
+| `DEBUG` | the client's fault and internal detail | an expired, corrupt or forged token, a `ttl` out of bounds, the steps to the JWKS |
+| `TRACE` | unused | — |
 
-> **Клиентские ошибки — это `DEBUG`, а не `ERROR`.** Иначе каждый протухший токен
-> поднимал бы ложные алерты. Алертить имеет смысл именно на `ERROR`.
+> **Client errors are `DEBUG`, not `ERROR`.** Otherwise every expired token would
+> raise a false alert. Alerting makes sense on `ERROR` specifically.
 
-### Что НЕ логируется
+### What is NOT logged
 
-Заголовки и тело запроса/ответа не пишутся **никогда** — там секреты
-(`X-Proxy-Secret`, `X-TOTP-Code`) и сами токены. DSN GlitchTip тоже не логируется.
+Request and response headers and bodies are **never** written — they hold secrets
+(`X-Proxy-Secret`, `X-TOTP-Code`) and the tokens themselves. The GlitchTip DSN is
+not logged either.
 
-## Метрики (Prometheus)
+## Metrics (Prometheus)
 
-Экспозиция на `GET /metrics` — **уровень доступа 4**, Bearer-токен.
+The exposition is on `GET /metrics` — **access level 4**, a bearer token.
 
-| Метрика | Тип | Лейблы |
-|---------|-----|--------|
+| Metric | Type | Labels |
+|--------|------|--------|
 | `http_requests_total` | counter | `method`, `endpoint`, `status` |
 | `http_request_duration_seconds` | histogram | `method`, `endpoint` |
 | `jwt_tokens_issued_total` / `jwt_tokens_revoked_total` | counter | — |
@@ -108,9 +115,9 @@ ASCII `[A-Za-z0-9_-]`, ≤128 символов), иначе генерирует
 | `jwks_cache_total` | counter | `result` (`hit`/`miss`/`throttled`/`stale`) |
 | `redis_command_duration_seconds` | histogram | `command`, `success` |
 
-> **Кардинальность.** В лейбл `endpoint` идёт **шаблон роута** (`/tokens/{jti}`), а
-> не фактический путь — иначе каждый `jti` создавал бы отдельную серию. Не кладите
-> в лейблы клиентские данные.
+> **Cardinality.** The `endpoint` label carries the **route template**
+> (`/tokens/{jti}`), not the actual path — otherwise every `jti` would create its
+> own series. Do not put client data into labels.
 
 ### Prometheus / Managed Prometheus
 
@@ -125,8 +132,8 @@ scrape_configs:
 
 ### Zabbix
 
-Отдельный экспортёр не нужен — `agent2` с prometheus-плагином читает ту же ручку.
-Токен передаётся заголовком:
+No separate exporter is needed — `agent2` with the prometheus plugin reads the
+same endpoint. The token goes in a header:
 
 ```
 Authorization: Bearer <AUTH_METRICS_TOKEN>
@@ -134,32 +141,33 @@ Authorization: Bearer <AUTH_METRICS_TOKEN>
 
 ### Monium
 
-Через Prometheus-совместимость (Yandex Managed Service for Prometheus) — конфиг
-скрейпа такой же, как выше.
+Through Prometheus compatibility (Yandex Managed Service for Prometheus) — the
+scrape config is the same as above.
 
-> ⚠️ **`/metrics` не публикуют наружу.** Метрики раскрывают операционную картину:
-> объём трафика, доли отказов, латентности зависимостей. Прокси должен оставить
-> ручку доступной только из внутренней сети — токен это дополнение к сетевой
-> изоляции, а не замена.
+> ⚠️ **`/metrics` is not exposed publicly.** Metrics reveal the operational
+> picture: traffic volume, failure ratios, dependency latencies. The proxy must
+> keep the endpoint reachable from the internal network only — the token
+> complements network isolation rather than replacing it.
 
-## Трейсы (OpenTelemetry)
+## Traces (OpenTelemetry)
 
-Включаются при заданном `OTEL_EXPORTER_OTLP_ENDPOINT`. Транспорт — **OTLP поверх
-HTTP/protobuf** (у коллектора обычно порт **4318**), не gRPC.
+They are enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The transport is
+**OTLP over HTTP/protobuf** (usually port **4318** on the collector), not gRPC.
 
-**Span-ы:** `http_request` и вложенные `jwks.public_keys`,
+**The spans:** `http_request` and the nested `jwks.public_keys`,
 `redis.store_jti` / `check_jti` / `delete_jti` / `ping`.
 
-**Propagation (W3C Trace Context)** работает в обе стороны: входящий `traceparent`
-делает наш span потомком чужой трассы, а исходящие запросы к `jwks-service-app`
-несут свой `traceparent`. Трасса склеивается сквозь сервисы.
+**Propagation (W3C Trace Context)** works in both directions: an incoming
+`traceparent` makes our span a child of someone else's trace, and outgoing
+requests to `jwks-service-app` carry their own `traceparent`. The trace is
+stitched across services.
 
-> ⚠️ **Путь сигнала обязателен.** `OTEL_EXPORTER_OTLP_ENDPOINT` — это **базовый**
-> URL, к которому добавляется `/v1/traces` (или `/v1/logs`). Если передать
-> коллектору базовый URL как есть, он ответит `404`, и данные будут **молча
-> теряться** — без единой ошибки в логе сервиса.
+> ⚠️ **The signal path is mandatory.** `OTEL_EXPORTER_OTLP_ENDPOINT` is the
+> **base** URL, to which `/v1/traces` (or `/v1/logs`) is appended. Hand the
+> collector the base URL as is and it answers `404` while the data is **silently
+> lost** — without a single error in the service log.
 
-### Минимальный коллектор
+### A minimal collector
 
 ```yaml
 receivers:
@@ -170,9 +178,9 @@ receivers:
 
 exporters:
   otlphttp/monium:
-    endpoint: <endpoint Monium>
+    endpoint: <the Monium endpoint>
     headers:
-      Authorization: Bearer <токен Monium>
+      Authorization: Bearer <the Monium token>
 
 service:
   pipelines:
@@ -184,16 +192,16 @@ service:
       exporters: [otlphttp/monium]
 ```
 
-Документация Monium: <https://yandex.cloud/ru/docs/monium/>
+The Monium documentation: <https://yandex.cloud/en/docs/monium/>
 
-## Логи по OTLP
+## Logs over OTLP
 
-Опционально, отдельным флагом `OTEL_LOGS_ENABLED=true`. Включение трейсов логи
-**не** включает — они и так идут в stdout, и там, где их собирает агент с
-контейнерного лога, отправка по сети была бы дублированием.
+Optional, behind the separate `OTEL_LOGS_ENABLED=true` flag. Enabling traces does
+**not** enable logs — they go to stdout anyway, and where an agent collects them
+from the container log, sending them over the network would be duplication.
 
-**Зачем это нужно:** логи, записанные внутри запроса, несут `Trace ID` и `Span ID`,
-поэтому в бэкенде можно переходить от трассы к её логам и обратно:
+**Why it is useful:** logs written inside a request carry the `Trace ID` and the
+`Span ID`, so in the backend you can move from a trace to its logs and back:
 
 ```
 SeverityText: INFO
@@ -204,44 +212,46 @@ Span ID:  118851bb95cf37bb
 
 ## GlitchTip
 
-Sentry-совместимый бэкенд. Включается при заданном `GLITCHTIP_DSN` и закрывает
-**три** канала:
+A Sentry-compatible backend. It is enabled when `GLITCHTIP_DSN` is set and covers
+**three** channels:
 
-| Канал | Что уходит | Включение |
-|-------|-----------|-----------|
-| **Issues** | паники и события `ERROR` | всегда при DSN |
-| **Performance** | span-ы → транзакции | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
-| **Logs** | структурные логи `DEBUG`/`INFO`/`WARN` | `GLITCHTIP_ENABLE_LOGS=true` |
+| Channel | What goes there | Enabled by |
+|---------|-----------------|------------|
+| **Issues** | panics and `ERROR` events | always, given a DSN |
+| **Performance** | spans → transactions | `GLITCHTIP_TRACES_SAMPLE_RATE > 0` |
+| **Logs** | structured `DEBUG`/`INFO`/`WARN` logs | `GLITCHTIP_ENABLE_LOGS=true` |
 
-Раскладка по каналам: `ERROR` → issue, `WARN`/`INFO` → лог + breadcrumb,
-`DEBUG` → лог, `TRACE` → игнор.
+The split across channels: `ERROR` → issue, `WARN`/`INFO` → log plus breadcrumb,
+`DEBUG` → log, `TRACE` → ignored.
 
-- **Performance выключен по умолчанию** (`0.0`) — транзакции стоят объёма,
-  включайте осознанно.
-- **Логи батчатся** и досылаются пачкой (в том числе при остановке процесса) — в
-  UI появляются не мгновенно, в отличие от issues.
+- **Performance is off by default** (`0.0`) — transactions cost volume, so enable
+  them deliberately.
+- **Logs are batched** and flushed in bulk (including at process shutdown) — they
+  appear in the UI with a delay, unlike issues.
 
-## Принципы
+## Principles
 
-1. **Телеметрия не роняет сервис.** Все интеграции опциональны и **не fail-fast**:
-   недоступный коллектор, кривой DSN или ошибка экспортёра дают предупреждение в
-   лог, но запросы обслуживаются как обычно. Исключение — секреты уровней доступа
-   2 и 3, там fail-fast сохранён осознанно.
-2. **Секреты не попадают в телеметрию.** Заголовки и тела не логируются, DSN не
-   пишется в лог, в лейблы метрик не кладутся клиентские данные.
-3. **Отсутствие секрета ≠ открытый доступ.** Без `AUTH_METRICS_TOKEN` ручка
-   `/metrics` не публикуется вовсе (`404`), а не становится доступной всем.
-4. **Одна шина — много выходов.** Новый бэкенд подключается слоем к `tracing`, а
-   не правкой обработчиков.
-5. **Корректное завершение.** При остановке сервиса досылаются накопленные span-ы,
-   логи и события — провайдеры завершаются явно, guard GlitchTip живёт до конца
-   процесса.
+1. **Telemetry never brings the service down.** Every integration is optional and
+   **not fail-fast**: an unavailable collector, a malformed DSN or an exporter
+   error give a warning in the log while requests are served as usual. The
+   exception is the level 2 and level 3 secrets, where fail-fast is kept
+   deliberately.
+2. **Secrets do not reach telemetry.** Headers and bodies are not logged, the DSN
+   is not written to the log, and client data does not go into metric labels.
+3. **A missing secret ≠ open access.** Without `AUTH_METRICS_TOKEN` the `/metrics`
+   endpoint is not published at all (`404`) rather than becoming available to
+   everyone.
+4. **One bus, many outputs.** A new backend is attached as a layer over `tracing`
+   rather than by editing the handlers.
+5. **Clean shutdown.** When the service stops, the accumulated spans, logs and
+   events are flushed — the providers are shut down explicitly and the GlitchTip
+   guard lives until the end of the process.
 
-## Куда смотреть в коде
+## Where to look in the code
 
-| Файл | Что |
-|------|-----|
-| [`src/logging.rs`](../src/logging.rs) | Сборка subscriber-а из слоёв, middleware `RequestLog`, политика уровней |
-| [`src/metrics.rs`](../src/metrics.rs) | Метрики Prometheus, рендер экспозиции |
-| [`src/tracing_otel.rs`](../src/tracing_otel.rs) | OTLP: трейсы и логи, propagation, правило пути сигнала |
-| [`src/sentry_glitchtip.rs`](../src/sentry_glitchtip.rs) | GlitchTip: три канала, раскладка по уровням |
+| File | What |
+|------|------|
+| [`src/logging.rs`](../src/logging.rs) | Assembling the subscriber from layers, the `RequestLog` middleware, the level policy |
+| [`src/metrics.rs`](../src/metrics.rs) | The Prometheus metrics, rendering the exposition |
+| [`src/tracing_otel.rs`](../src/tracing_otel.rs) | OTLP: traces and logs, propagation, the signal path rule |
+| [`src/sentry_glitchtip.rs`](../src/sentry_glitchtip.rs) | GlitchTip: the three channels, the split by level |

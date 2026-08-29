@@ -1,53 +1,52 @@
-//! Многоуровневый контроль доступа к эндпоинтам.
+//! Multi-level access control for the endpoints.
 //!
-//! Реализует единый auth-middleware ([`Auth`]) с четырьмя уровнями
-//! ([`AuthLevel`]); уровень задаётся при регистрации роута в `main.rs`, а разница
-//! между уровнями — только в валидаторе:
+//! Implements a single auth middleware ([`Auth`]) with four levels
+//! ([`AuthLevel`]); the level is chosen when a route is registered in `main.rs`,
+//! and the only difference between levels is the validator:
 //!
-//! - **Уровень 1 — [`AuthLevel::Open`]**: без защиты (`/livez`, `/readyz`,
-//!   OpenAPI). Всегда пропускает.
-//! - **Уровень 2 — [`AuthLevel::ProxySecret`]**: статический секрет-заголовок,
-//!   который ставит только обратный прокси. Сравнение constant-time
-//!   ([`ProxyValidator`]).
-//! - **Уровень 3 — [`AuthLevel::Totp`]**: internal app-to-app по TOTP
+//! - **Level 1 — [`AuthLevel::Open`]**: no protection (`/livez`, `/readyz`, the
+//!   OpenAPI spec). Always lets requests through.
+//! - **Level 2 — [`AuthLevel::ProxySecret`]**: a static secret header set only
+//!   by the reverse proxy. Constant-time comparison ([`ProxyValidator`]).
+//! - **Level 3 — [`AuthLevel::Totp`]**: internal app-to-app over TOTP
 //!   (RFC 6238, [`TotpValidator`]).
-//! - **Уровень 4 — [`AuthLevel::MetricsToken`]**: скрейп `/metrics` по статическому
-//!   Bearer-токену ([`MetricsValidator`]).
+//! - **Level 4 — [`AuthLevel::MetricsToken`]**: scraping `/metrics` with a
+//!   static bearer token ([`MetricsValidator`]).
 //!
-//! Крипта (HMAC для TOTP, constant-time сравнение) — через `openssl`, уже
-//! присутствующий в зависимостях. Конфигурация целиком из окружения
-//! ([`AuthConfig::from_env`]).
+//! The crypto (HMAC for TOTP, the constant-time comparison) goes through
+//! `openssl`, already among the dependencies. The configuration comes entirely
+//! from the environment ([`AuthConfig::from_env`]).
 //!
-//! **Защиты основных ручек обязательны.** Секреты уровней 2 и 3
-//! (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) — обязательны: если хотя бы один не
-//! задан, [`AuthConfig::from_env`] возвращает ошибку и сервис **не стартует**
-//! (fail-fast на старте, как и с прочей критичной конфигурацией). Отключить эти
-//! уровни нельзя.
+//! **Protection of the main endpoints is mandatory.** The level 2 and level 3
+//! secrets (`AUTH_PROXY_SECRET`, `AUTH_TOTP_SECRET`) are required: when either
+//! is missing, [`AuthConfig::from_env`] returns an error and the service **does
+//! not start** (fail-fast at startup, as with the rest of the critical
+//! configuration). These levels cannot be turned off.
 //!
-//! **Уровень 4 — исключение: он опционален.** Метрики вспомогательны, и из-за их
-//! конфигурации не должен лежать весь сервис выдачи токенов. Без
-//! `AUTH_METRICS_TOKEN` сервис стартует, а роут `/metrics` не регистрируется
-//! вовсе — путь отдаёт `404`. Отсутствие токена при этом **никогда не означает
-//! открытый доступ**: [`MetricsValidator`] в таком состоянии отклоняет всё.
+//! **Level 4 is the exception: it is optional.** Metrics are auxiliary, and the
+//! whole token service should not go down over their configuration. Without
+//! `AUTH_METRICS_TOKEN` the service starts and the `/metrics` route is not
+//! registered at all — the path returns `404`. A missing token **never means
+//! open access**: in that state [`MetricsValidator`] rejects everything.
 //!
-//! ## Защита от replay (уровень 3)
+//! ## Replay protection (level 3)
 //!
-//! TOTP-код сам по себе переигрываем в пределах окна действия. Закрывается это
-//! флагом `AUTH_TOTP_REPLAY_PROTECTION`: отпечаток предъявленного кода
-//! резервируется в хранилище через `SET NX` с TTL, равным окну, и повторное
-//! предъявление получает `401`.
+//! A TOTP code is by itself replayable within its validity window. That is
+//! closed by the `AUTH_TOTP_REPLAY_PROTECTION` flag: a fingerprint of the
+//! presented code is reserved in the store with `SET NX` and a TTL equal to the
+//! window, and a second presentation gets `401`.
 //!
-//! - **По умолчанию выключено.** Включение добавляет auth-слою зависимость от
-//!   Redis, которой у него нет; молча менять поведение работающих деплоев
-//!   неправильно. В проде включать явно.
-//! - **В хранилище кладётся не код, а его HMAC** на первом активном секрете.
-//!   «Голый» хеш не скрыл бы ничего: код — это 6–8 цифр, они перебираются
-//!   мгновенно.
-//! - **Недоступность хранилища не закрывает вход** (fail-open). Обе ручки
-//!   уровня 3 и так ходят в Redis: без него выпуск падает на `store_jti`, а
-//!   отзыв — это и есть команда Redis. Переигранный код при лежащем хранилище
-//!   всё равно ничего не добьётся, а fail-closed лишь добавил бы ещё одну
-//!   причину отказа сервиса.
+//! - **Off by default.** Turning it on adds a Redis dependency to the auth layer
+//!   that it otherwise does not have; silently changing the behaviour of running
+//!   deployments would be wrong. Enable it explicitly in production.
+//! - **What goes into the store is not the code but its HMAC** under the first
+//!   active secret. A bare hash would hide nothing: a code is 6–8 digits and is
+//!   brute-forced instantly.
+//! - **An unavailable store does not close the door** (fail-open). Both level 3
+//!   endpoints go to Redis anyway: without it issuing fails at `store_jti`, and
+//!   revocation is a Redis command in itself. A replayed code achieves nothing
+//!   while the store is down, and failing closed would only add one more reason
+//!   for the service to refuse requests.
 
 use std::env;
 use std::future::{ready, Future, Ready};
@@ -67,27 +66,28 @@ use openssl::sign::Signer;
 use crate::models::jwt::JtiStore;
 use crate::models::ErrorResponse;
 
-/// Уровень доступа эндпоинта. Определяет, какой валидатор применяет middleware.
+/// The access level of an endpoint. It decides which validator the middleware applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthLevel {
-    /// Уровень 1 — без защиты. Пропускает любой запрос.
+    /// Level 1 — no protection. Lets any request through.
     Open,
-    /// Уровень 2 — статический proxy-secret заголовок.
+    /// Level 2 — the static proxy secret header.
     ProxySecret,
-    /// Уровень 3 — internal app-to-app по TOTP.
+    /// Level 3 — internal app-to-app over TOTP.
     Totp,
-    /// Уровень 4 — скрейп метрик по статическому Bearer-токену.
+    /// Level 4 — scraping the metrics with a static bearer token.
     ///
-    /// Отдельный уровень, а не переиспользование уровня 2/3: TOTP системам
-    /// мониторинга не по силам (они не считают одноразовые коды), а `X-Proxy-Secret`
-    /// по контракту затирается прокси. Bearer же нативно поддержан и Prometheus
-    /// (`authorization: {credentials_file}`), и Zabbix `agent2`, и OTel Collector
-    /// (через него метрики забирает Monium).
+    /// A separate level rather than a reuse of level 2 or 3: monitoring systems
+    /// cannot do TOTP (they do not compute one-time codes), and `X-Proxy-Secret`
+    /// is stripped by the proxy by contract. Bearer, on the other hand, is
+    /// natively supported by Prometheus (`authorization: {credentials_file}`),
+    /// by Zabbix `agent2` and by the OTel Collector (through which Monium
+    /// scrapes the metrics).
     MetricsToken,
 }
 
 impl AuthLevel {
-    /// Строковое имя уровня для логов/трейсинга (пишется в span запроса).
+    /// The string name of the level for logs and tracing (written into the request span).
     fn as_str(self) -> &'static str {
         match self {
             AuthLevel::Open => "open",
@@ -98,7 +98,7 @@ impl AuthLevel {
     }
 }
 
-/// Читает `u64` из переменной окружения с откатом на `default`.
+/// Reads a `u64` from an environment variable, falling back to `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -106,11 +106,11 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Декодирует строку base32 (RFC 4648, алфавит `A–Z2–7`) в байты.
+/// Decodes a base32 string (RFC 4648, the `A–Z2–7` alphabet) into bytes.
 ///
-/// Регистронезависимо; пробелы и паддинг `=` игнорируются. Возвращает `None`,
-/// если встретился символ вне алфавита. TOTP-секреты по соглашению кодируются
-/// именно в base32 (совместимо с Google Authenticator и большинством библиотек).
+/// Case-insensitive; whitespace and `=` padding are ignored. Returns `None` when
+/// a character outside the alphabet is found. TOTP secrets are base32 by
+/// convention (compatible with Google Authenticator and most libraries).
 fn base32_decode(input: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -135,7 +135,7 @@ fn base32_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Выбирает `MessageDigest` по имени хеша для TOTP (по умолчанию SHA-1).
+/// Picks the `MessageDigest` by the TOTP hash name (SHA-1 by default).
 fn digest_by_name(name: &str) -> MessageDigest {
     match name.trim().to_ascii_uppercase().as_str() {
         "SHA256" | "SHA-256" => MessageDigest::sha256(),
@@ -144,13 +144,13 @@ fn digest_by_name(name: &str) -> MessageDigest {
     }
 }
 
-/// Вычисляет HOTP-код (RFC 4226) для секрета и счётчика.
+/// Computes the HOTP code (RFC 4226) for a secret and a counter.
 ///
-/// Возвращает строку из `digits` десятичных знаков (с ведущими нулями). Основа
-/// для TOTP: счётчик — это номер временно́го окна.
+/// Returns a string of `digits` decimal digits (zero-padded). The basis for
+/// TOTP: the counter is the number of the time window.
 ///
 /// # Errors
-/// Проброс `openssl::error::ErrorStack`, если не удалось построить HMAC.
+/// Propagates an `openssl::error::ErrorStack` when the HMAC could not be built.
 fn hotp(
     secret: &[u8],
     counter: u64,
@@ -162,7 +162,7 @@ fn hotp(
     signer.update(&counter.to_be_bytes())?;
     let hs = signer.sign_to_vec()?;
 
-    // Динамическое усечение по RFC 4226 §5.3.
+    // Dynamic truncation per RFC 4226 §5.3.
     let offset = (hs[hs.len() - 1] & 0x0f) as usize;
     let bin = ((u32::from(hs[offset]) & 0x7f) << 24)
         | (u32::from(hs[offset + 1]) << 16)
@@ -173,27 +173,27 @@ fn hotp(
     Ok(format!("{otp:0width$}", width = digits as usize))
 }
 
-/// Валидатор уровня 2: статический секрет-заголовок от обратного прокси.
+/// The level 2 validator: a static secret header from the reverse proxy.
 ///
-/// Секрет обязателен и гарантированно задан (см. [`AuthConfig::from_env`], которая
-/// не даст сервису стартовать без него).
+/// The secret is mandatory and guaranteed to be set (see
+/// [`AuthConfig::from_env`], which does not let the service start without it).
 #[derive(Clone)]
 pub struct ProxyValidator {
-    /// Имя заголовка (по умолчанию `X-Proxy-Secret`).
+    /// The header name (`X-Proxy-Secret` by default).
     header: String,
-    /// Ожидаемый секрет.
+    /// The expected secret.
     secret: Vec<u8>,
 }
 
 impl ProxyValidator {
-    /// Проверяет заголовок запроса. Сравнение секрета — constant-time
-    /// (`openssl::memcmp::eq`, поверх предварительной проверки длины).
+    /// Checks the request header. The secret comparison is constant-time
+    /// (`openssl::memcmp::eq`, on top of a preliminary length check).
     pub fn validate(&self, headers: &HeaderMap) -> bool {
         match headers.get(self.header.as_str()) {
             Some(provided) => {
                 let provided = provided.as_bytes();
-                // `openssl::memcmp::eq` паникует на разной длине — сначала длина,
-                // затем constant-time сравнение содержимого.
+                // `openssl::memcmp::eq` panics on differing lengths — the length
+                // first, then a constant-time comparison of the contents.
                 provided.len() == self.secret.len() && openssl::memcmp::eq(provided, &self.secret)
             }
             None => false,
@@ -201,26 +201,27 @@ impl ProxyValidator {
     }
 }
 
-/// Валидатор уровня 4: статический Bearer-токен для скрейпа метрик.
+/// The level 4 validator: a static bearer token for scraping the metrics.
 ///
-/// Токен **опционален**, в отличие от секретов уровней 2 и 3: без него сервис
-/// стартует, а роут `/metrics` просто не регистрируется (см. `main.rs`) и путь
-/// отдаёт штатный `404`. Валидатор при этом всё равно отвечает `false` на любой
-/// запрос — страховка на случай, если роут зарегистрируют мимо этой проверки:
-/// **отсутствие секрета никогда не должно означать открытый доступ**.
+/// The token is **optional**, unlike the level 2 and level 3 secrets: without it
+/// the service starts and the `/metrics` route is simply not registered (see
+/// `main.rs`), so the path returns a plain `404`. The validator still answers
+/// `false` to every request — a safeguard in case the route is registered past
+/// this check: **a missing secret must never mean open access**.
 #[derive(Clone)]
 pub struct MetricsValidator {
-    /// Ожидаемый токен (без префикса `Bearer `); `None` — уровень недоступен.
+    /// The expected token (without the `Bearer ` prefix); `None` means the level is unavailable.
     token: Option<Vec<u8>>,
 }
 
 impl MetricsValidator {
-    /// Проверяет заголовок `Authorization: Bearer <токен>`.
+    /// Checks the `Authorization: Bearer <token>` header.
     ///
-    /// Схема (`Bearer`) сравнивается регистронезависимо — так требует RFC 7235;
-    /// сам токен — constant-time (`openssl::memcmp::eq` поверх проверки длины).
+    /// The scheme (`Bearer`) is compared case-insensitively, as RFC 7235
+    /// requires; the token itself constant-time (`openssl::memcmp::eq` on top of
+    /// a length check).
     pub fn validate(&self, headers: &HeaderMap) -> bool {
-        // Токен не настроен — уровень недоступен, пропускать нечего и некого.
+        // The token is not configured — the level is unavailable, there is nobody to let through.
         let Some(expected) = self.token.as_deref() else {
             return false;
         };
@@ -244,34 +245,36 @@ impl MetricsValidator {
     }
 }
 
-/// Валидатор уровня 3: TOTP (RFC 6238).
+/// The level 3 validator: TOTP (RFC 6238).
 ///
-/// Активные секреты обязательны и гарантированно непусты (см.
-/// [`AuthConfig::from_env`], которая не даст сервису стартовать без них).
+/// The active secrets are mandatory and guaranteed to be non-empty (see
+/// [`AuthConfig::from_env`], which does not let the service start without them).
 #[derive(Clone)]
 pub struct TotpValidator {
-    /// Имя заголовка с кодом (по умолчанию `X-TOTP-Code`).
+    /// The name of the header carrying the code (`X-TOTP-Code` by default).
     header: String,
-    /// Активные секреты (1 или 2 — второй нужен на время ротации).
+    /// The active secrets (1 or 2 — the second is needed during a rotation).
     secrets: Vec<Vec<u8>>,
-    /// Шаг окна в секундах (по умолчанию 30).
+    /// The window step in seconds (30 by default).
     step: u64,
-    /// Число знаков в коде (6–8, по умолчанию 6).
+    /// The number of digits in the code (6–8, 6 by default).
     digits: u32,
-    /// Допуск по окнам в обе стороны (по умолчанию 1) — компенсирует рассинхрон часов.
+    /// Tolerance in windows in both directions (1 by default) — it compensates for clock drift.
     skew: u64,
-    /// Хеш HMAC (SHA-1/256/512).
+    /// The HMAC hash (SHA-1/256/512).
     digest: MessageDigest,
 }
 
 impl TotpValidator {
-    /// Возвращает отпечаток предъявленного кода — ключ для защиты от повтора.
+    /// Returns the fingerprint of the presented code — the key for replay
+    /// protection.
     ///
-    /// Это HMAC на первом активном секрете, а не «голый» хеш: сам код всего
-    /// 6–8 цифр и перебирается мгновенно, поэтому SHA от него не скрыл бы
-    /// ничего. С HMAC содержимое Redis бесполезно тому, у кого нет секрета.
+    /// It is an HMAC under the first active secret rather than a bare hash: the
+    /// code itself is only 6–8 digits and is brute-forced instantly, so a SHA of
+    /// it would hide nothing. With an HMAC the contents of Redis are useless to
+    /// anyone without the secret.
     ///
-    /// `None`, если заголовка с кодом нет — проверять нечего.
+    /// `None` when there is no header with a code — there is nothing to check.
     pub fn code_fingerprint(&self, headers: &HeaderMap) -> Option<String> {
         let provided = headers.get(self.header.as_str())?.as_bytes();
         let secret = self.secrets.first()?;
@@ -284,21 +287,22 @@ impl TotpValidator {
         Some(digest.iter().map(|b| format!("{b:02x}")).collect())
     }
 
-    /// Сколько секунд отпечаток кода держится в хранилище.
+    /// How many seconds the fingerprint of a code is kept in the store.
     ///
-    /// Ровно то окно, в котором код ещё будет принят: текущий шаг плюс `skew` в
-    /// обе стороны. Держать дольше незачем — код и так перестанет проходить
-    /// проверку, а записи занимали бы память.
+    /// Exactly the window in which the code would still be accepted: the current
+    /// step plus `skew` in both directions. Keeping it longer is pointless — the
+    /// code stops passing validation anyway and the records would occupy memory.
     pub fn replay_window_seconds(&self) -> u64 {
         self.step * (2 * self.skew + 1)
     }
 
-    /// Проверяет TOTP-код из заголовка на момент `now` (Unix-время, секунды).
+    /// Validates the TOTP code from the header as of `now` (Unix time, seconds).
     ///
-    /// Код принимается, если совпал с ожидаемым хотя бы для одного активного
-    /// секрета в окне `[counter - skew, counter + skew]`. Перебор окон и секретов
-    /// идёт без раннего выхода — чтобы не давать таймингового сигнала о том, какое
-    /// окно/секрет совпали. Сравнение кодов — constant-time.
+    /// The code is accepted when it matches the expected one for at least one
+    /// active secret within the `[counter - skew, counter + skew]` window. The
+    /// windows and secrets are iterated without an early exit — so as not to
+    /// leak a timing signal about which window or secret matched. The codes are
+    /// compared in constant time.
     pub fn validate(&self, headers: &HeaderMap, now: u64) -> bool {
         let Some(provided) = headers.get(self.header.as_str()) else {
             return false;
@@ -324,86 +328,88 @@ impl TotpValidator {
     }
 }
 
-/// Полная конфигурация уровней доступа, собранная из окружения.
+/// The full access level configuration assembled from the environment.
 ///
-/// Дёшево клонируется (короткие строки/байтовые векторы) — в `main.rs` копия
-/// оборачивается в `Rc` внутри фабрики приложения на каждый worker-поток.
+/// Cheap to clone (short strings and byte vectors) — in `main.rs` a copy is
+/// wrapped in an `Rc` inside the application factory for each worker thread.
 #[derive(Clone)]
 pub struct AuthConfig {
     proxy: ProxyValidator,
     totp: TotpValidator,
     metrics: MetricsValidator,
-    /// Включена ли защита от переигрывания TOTP-кода
+    /// Whether TOTP replay protection is on
     /// (`AUTH_TOTP_REPLAY_PROTECTION`).
     totp_replay_protection: bool,
 }
 
 impl AuthConfig {
-    /// Включена ли защита от переигрывания TOTP-кода.
+    /// Whether TOTP replay protection is on.
     pub fn totp_replay_protection(&self) -> bool {
         self.totp_replay_protection
     }
 
-    /// Отпечаток предъявленного TOTP-кода и время его жизни в хранилище.
+    /// The fingerprint of the presented TOTP code and how long it lives in the store.
     ///
-    /// `None`, если заголовка с кодом нет или отпечаток не посчитался.
+    /// `None` when there is no header with a code or the fingerprint could not be computed.
     pub fn totp_replay_claim(&self, headers: &HeaderMap) -> Option<(String, u64)> {
         let fingerprint = self.totp.code_fingerprint(headers)?;
         Some((fingerprint, self.totp.replay_window_seconds()))
     }
-    /// Собирает конфигурацию из переменных окружения.
+    /// Assembles the configuration from environment variables.
     ///
-    /// Секреты уровней 2 и 3 **обязательны**: если `AUTH_PROXY_SECRET` или
-    /// `AUTH_TOTP_SECRET` не заданы (либо TOTP-секрет не парсится как base32),
-    /// возвращается `Err` с перечнем проблем, и сервис не должен стартовать
-    /// (см. вызов в `main.rs`). Отключить уровень нельзя.
+    /// The level 2 and level 3 secrets are **mandatory**: when
+    /// `AUTH_PROXY_SECRET` or `AUTH_TOTP_SECRET` is missing (or the TOTP secret
+    /// does not parse as base32), an `Err` with the list of problems is returned
+    /// and the service must not start (see the call site in `main.rs`). A level
+    /// cannot be turned off.
     ///
-    /// Переменные:
-    /// - `AUTH_PROXY_SECRET` — секрет уровня 2 (обязателен; сравнивается по байтам);
-    /// - `AUTH_PROXY_SECRET_HEADER` (дефолт `X-Proxy-Secret`);
-    /// - `AUTH_TOTP_SECRET` — base32-секрет уровня 3 (обязателен);
-    /// - `AUTH_TOTP_SECRET_NEXT` — второй base32-секрет на время ротации (опционально);
-    /// - `AUTH_TOTP_HEADER` (дефолт `X-TOTP-Code`);
-    /// - `AUTH_TOTP_STEP_SECONDS` (дефолт 30), `AUTH_TOTP_DIGITS` (6–8, дефолт 6),
-    ///   `AUTH_TOTP_ALGORITHM` (SHA1/SHA256/SHA512, дефолт SHA1),
-    ///   `AUTH_TOTP_SKEW_STEPS` (дефолт 1).
+    /// The variables:
+    /// - `AUTH_PROXY_SECRET` — the level 2 secret (mandatory; compared byte by byte);
+    /// - `AUTH_PROXY_SECRET_HEADER` (default `X-Proxy-Secret`);
+    /// - `AUTH_TOTP_SECRET` — the base32 level 3 secret (mandatory);
+    /// - `AUTH_TOTP_SECRET_NEXT` — a second base32 secret during a rotation (optional);
+    /// - `AUTH_TOTP_HEADER` (default `X-TOTP-Code`);
+    /// - `AUTH_TOTP_STEP_SECONDS` (default 30), `AUTH_TOTP_DIGITS` (6–8, default 6),
+    ///   `AUTH_TOTP_ALGORITHM` (SHA1/SHA256/SHA512, default SHA1),
+    ///   `AUTH_TOTP_SKEW_STEPS` (default 1).
     ///
     /// # Errors
-    /// Строка с перечислением всех проблем конфигурации (через `; `), если хотя бы
-    /// один обязательный секрет отсутствует или некорректен.
+    /// A string listing every configuration problem (joined by `; `) when at
+    /// least one mandatory secret is missing or invalid.
     pub fn from_env() -> Result<Self, String> {
         let mut errors: Vec<String> = Vec::new();
 
-        // --- Уровень 2: proxy-secret (обязателен) ---
+        // --- Level 2: the proxy secret (mandatory) ---
         let proxy_header =
             env::var("AUTH_PROXY_SECRET_HEADER").unwrap_or_else(|_| "X-Proxy-Secret".into());
         let proxy_secret = env::var("AUTH_PROXY_SECRET").ok().filter(|s| !s.is_empty());
         if proxy_secret.is_none() {
-            errors
-                .push("AUTH_PROXY_SECRET не задан (обязателен для уровня 2 — proxy-secret)".into());
+            errors.push(
+                "AUTH_PROXY_SECRET is not set (mandatory for level 2 — the proxy secret)".into(),
+            );
         }
 
-        // --- Уровень 3: TOTP (хотя бы один секрет обязателен) ---
+        // --- Level 3: TOTP (at least one secret is mandatory) ---
         let totp_header = env::var("AUTH_TOTP_HEADER").unwrap_or_else(|_| "X-TOTP-Code".into());
         let mut secrets = Vec::new();
         for var in ["AUTH_TOTP_SECRET", "AUTH_TOTP_SECRET_NEXT"] {
             match env::var(var) {
                 Ok(raw) if !raw.trim().is_empty() => match base32_decode(&raw) {
                     Some(bytes) if !bytes.is_empty() => secrets.push(bytes),
-                    _ => errors.push(format!("{var} не является корректным base32")),
+                    _ => errors.push(format!("{var} is not valid base32")),
                 },
                 _ => {}
             }
         }
         if secrets.is_empty() {
-            errors.push("AUTH_TOTP_SECRET не задан (обязателен для уровня 3 — TOTP)".into());
+            errors.push("AUTH_TOTP_SECRET is not set (mandatory for level 3 — TOTP)".into());
         }
 
-        // --- Уровень 4: токен метрик (ОПЦИОНАЛЕН) ---
-        // В отличие от уровней 2 и 3, отсутствие токена не фатально: метрики —
-        // вспомогательная функция, и из-за её конфигурации не должен лежать весь
-        // сервис выдачи токенов. Без токена роут `/metrics` не регистрируется
-        // (см. `main.rs`) и путь отдаёт `404`.
+        // --- Level 4: the metrics token (OPTIONAL) ---
+        // Unlike levels 2 and 3, a missing token is not fatal: metrics are an
+        // auxiliary function, and the whole token service should not go down over
+        // their configuration. Without the token the `/metrics` route is not
+        // registered (see `main.rs`) and the path returns `404`.
         let metrics_token = env::var("AUTH_METRICS_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
@@ -419,10 +425,10 @@ impl AuthConfig {
         let digest =
             digest_by_name(&env::var("AUTH_TOTP_ALGORITHM").unwrap_or_else(|_| "SHA1".into()));
 
-        // Защита от переигрывания TOTP-кода. По умолчанию ВЫКЛЮЧЕНА: включение
-        // добавляет auth-слою зависимость от Redis, которой у него нет, и молча
-        // менять этим поведение работающих деплоев неправильно. В проде включать
-        // явно.
+        // TOTP replay protection. OFF by default: turning it on adds a Redis
+        // dependency to the auth layer that it does not have, and silently
+        // changing the behaviour of running deployments that way would be wrong.
+        // Enable it explicitly in production.
         let totp_replay_protection = env::var("AUTH_TOTP_REPLAY_PROTECTION")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
@@ -430,7 +436,7 @@ impl AuthConfig {
         Ok(Self {
             proxy: ProxyValidator {
                 header: proxy_header,
-                // Проверено выше: при `None` мы бы уже вернули `Err`.
+                // Checked above: with `None` we would already have returned `Err`.
                 secret: proxy_secret.expect("proxy secret present").into_bytes(),
             },
             totp: TotpValidator {
@@ -448,11 +454,12 @@ impl AuthConfig {
         })
     }
 
-    /// Разрешает или отклоняет запрос для заданного уровня по его заголовкам.
-    /// Доступен ли уровень 4 (задан ли токен метрик).
+    /// Allows or rejects a request for the given level based on its headers.
+    /// Whether level 4 is available (whether the metrics token is set).
     ///
-    /// По нему `main.rs` решает, регистрировать ли роут `/metrics`: без токена
-    /// ручку не публикуем вовсе, и путь отдаёт `404`.
+    /// `main.rs` uses it to decide whether to register the `/metrics` route:
+    /// without a token the endpoint is not published at all and the path returns
+    /// `404`.
     pub fn metrics_enabled(&self) -> bool {
         self.metrics.token.is_some()
     }
@@ -469,12 +476,12 @@ impl AuthConfig {
     }
 }
 
-/// Middleware-фабрика: оборачивает роут проверкой заданного [`AuthLevel`].
+/// The middleware factory: it wraps a route in a check of the given [`AuthLevel`].
 ///
-/// Регистрируется через `.wrap(Auth::new(level, config))` на конкретном ресурсе.
-/// Параметризован типом хранилища: защита от переигрывания TOTP-кода
-/// (`AUTH_TOTP_REPLAY_PROTECTION`) достаёт его из `app_data` по этому типу.
-/// В тестах вместо Redis подставляется in-memory-мок.
+/// Registered through `.wrap(Auth::new(level, config))` on a specific resource.
+/// It is parameterised by the store type: TOTP replay protection
+/// (`AUTH_TOTP_REPLAY_PROTECTION`) pulls the store out of `app_data` by that
+/// type. In tests an in-memory mock is substituted for Redis.
 pub struct Auth<St> {
     level: AuthLevel,
     config: Rc<AuthConfig>,
@@ -482,7 +489,7 @@ pub struct Auth<St> {
 }
 
 impl<St> Auth<St> {
-    /// Создаёт middleware-фабрику для уровня `level` с общей конфигурацией.
+    /// Creates a middleware factory for level `level` with the shared configuration.
     pub fn new(level: AuthLevel, config: Rc<AuthConfig>) -> Self {
         Self {
             level,
@@ -514,7 +521,7 @@ where
     }
 }
 
-/// Собственно middleware: проверяет доступ до вызова внутреннего сервиса.
+/// The middleware itself: it checks access before calling the inner service.
 pub struct AuthMiddleware<S, St> {
     service: Rc<S>,
     level: AuthLevel,
@@ -535,17 +542,17 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        // Пишем уровень доступа в span запроса (поле объявлено в `RequestLog`;
-        // если span'а нет — no-op, безопасно в юнит-тестах).
+        // Write the access level into the request span (the field is declared in
+        // `RequestLog`; with no span it is a no-op, which is safe in unit tests).
         tracing::Span::current().record("access_level", self.level.as_str());
 
         let authorized = self.config.authorize(self.level, req.headers());
         let service = self.service.clone();
         let level = self.level;
 
-        // Защита от переигрывания кода: резервируем его отпечаток в хранилище.
-        // Только для уровня 3, только когда включена, и только если код вообще
-        // прошёл проверку — иначе мусорные коды забивали бы Redis.
+        // Replay protection: we reserve the fingerprint of the code in the store.
+        // Only for level 3, only when it is on, and only when the code actually
+        // passed validation — otherwise junk codes would fill Redis up.
         let replay_claim =
             if authorized && level == AuthLevel::Totp && self.config.totp_replay_protection() {
                 self.config
@@ -560,21 +567,21 @@ where
 
             if let Some(((fingerprint, ttl), store)) = replay_claim {
                 match store.claim_totp_code(&fingerprint, ttl).await {
-                    // Код предъявлен впервые — всё в порядке.
+                    // The code is presented for the first time — all good.
                     Ok(true) => {}
                     Ok(false) => {
-                        tracing::warn!("Повторное использование TOTP-кода");
+                        tracing::warn!("TOTP code reused");
                         authorized = false;
                     }
                     Err(e) => {
-                        // Fail-open, и это осознанно. Обе ручки уровня 3 и так
-                        // ходят в Redis: без него `POST /tokens` упадёт на
-                        // `store_jti`, а отзыв — это и есть команда Redis. То
-                        // есть переигранный код при лежащем хранилище всё равно
-                        // ничего не добьётся, а fail-closed лишь добавил бы ещё
-                        // одну причину отказа сервиса.
+                        // Fail-open, deliberately. Both level 3 endpoints go to
+                        // Redis anyway: without it `POST /tokens` fails at
+                        // `store_jti`, and revocation is a Redis command in
+                        // itself. So a replayed code achieves nothing while the
+                        // store is down, while failing closed would only add one
+                        // more reason for the service to refuse requests.
                         tracing::warn!(
-                            "Проверка повтора TOTP-кода недоступна ({e}), пропускаю запрос"
+                            "The TOTP replay check is unavailable ({e}), letting the request through"
                         );
                     }
                 }
@@ -584,13 +591,14 @@ where
                 let res = service.call(req).await?;
                 Ok(res.map_into_left_body())
             } else {
-                // Отказ доступа — сигнал безопасности (подбор секрета, неверный
-                // TOTP, забытый заголовок у клиента). Уровень WARN: не сбой
-                // сервиса, но повод смотреть. Сам секрет/код НЕ логируем.
-                tracing::warn!(access_level = level.as_str(), "Отказ в доступе");
+                // A denial is a security signal (secret guessing, a wrong TOTP,
+                // a client that forgot the header). WARN level: not a service
+                // failure, but worth looking at. The secret or code itself is NOT
+                // logged.
+                tracing::warn!(access_level = level.as_str(), "Access denied");
                 crate::metrics::record_auth_denied(level.as_str());
 
-                // Единый скупой ответ без деталей — как и на остальных ручках.
+                // One terse response with no details — as on the other endpoints.
                 let (req, _payload) = req.into_parts();
                 let response = HttpResponse::Unauthorized()
                     .json(ErrorResponse::new("Unauthorized"))
@@ -603,12 +611,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    //! Тесты валидаторов и TOTP-примитивов.
+    //! Tests of the validators and the TOTP primitives.
     //!
-    //! `hotp` проверяется контрольными векторами RFC 4226 (секрет
-    //! `"12345678901234567890"`), `base32_decode` — вектором RFC 4648, а
-    //! валидаторы — на успех/отказ, границы окна TOTP и поведение без секрета.
-    //! Тесты middleware-обёртки живут в `handlers.rs` (полный HTTP-стек).
+    //! `hotp` is checked against the RFC 4226 test vectors (the secret
+    //! `"12345678901234567890"`), `base32_decode` against an RFC 4648 vector,
+    //! and the validators for success and refusal, the TOTP window bounds and
+    //! the behaviour without a secret. The tests of the middleware wrapper live
+    //! in `handlers.rs` (the full HTTP stack).
 
     use super::*;
     use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -617,18 +626,18 @@ mod tests {
 
     use crate::models::jwt::{JtiError, RefreshRecord};
 
-    /// Секрет из контрольных векторов RFC 4226 (ASCII-строка).
+    /// The secret from the RFC 4226 test vectors (an ASCII string).
     const RFC_SECRET: &[u8] = b"12345678901234567890";
 
-    /// Хранилище для тестов middleware.
+    /// A store for the middleware tests.
     ///
-    /// Все операции, кроме резервирования TOTP-кода, — заглушки: auth-слой их не
-    /// вызывает. `claim_totp_code` работает по-настоящему, иначе тесты защиты от
-    /// повтора проверяли бы пустоту.
+    /// Every operation except reserving a TOTP code is a stub: the auth layer
+    /// never calls them. `claim_totp_code` works for real, or the replay
+    /// protection tests would be checking emptiness.
     #[derive(Default)]
     struct NoopStore {
         used_codes: Mutex<HashSet<String>>,
-        /// Имитировать недоступность хранилища (для проверки fail-open).
+        /// Simulate an unavailable store (to check fail-open).
         unavailable: bool,
     }
 
@@ -697,7 +706,7 @@ mod tests {
         }
     }
 
-    /// Собирает `HeaderMap` с одним заголовком.
+    /// Builds a `HeaderMap` with a single header.
     fn headers_with(name: &str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(
@@ -707,7 +716,7 @@ mod tests {
         h
     }
 
-    /// Валидатор уровня 4 с известным токеном.
+    /// A level 4 validator with a known token.
     fn metrics_validator() -> MetricsValidator {
         MetricsValidator {
             token: Some(b"scrape-token".to_vec()),
@@ -722,7 +731,7 @@ mod tests {
 
     #[test]
     fn metrics_scheme_is_case_insensitive() {
-        // RFC 7235: имя схемы регистронезависимо.
+        // RFC 7235: the scheme name is case-insensitive.
         let v = metrics_validator();
         assert!(v.validate(&headers_with("Authorization", "bearer scrape-token")));
         assert!(v.validate(&headers_with("Authorization", "BEARER scrape-token")));
@@ -733,7 +742,7 @@ mod tests {
         let v = metrics_validator();
         assert!(!v.validate(&HeaderMap::new()));
         assert!(!v.validate(&headers_with("Authorization", "Bearer wrong-token")));
-        // Верный префикс токена не должен проходить (сравнение по полной длине).
+        // A correct token prefix must not pass (the comparison is over the full length).
         assert!(!v.validate(&headers_with("Authorization", "Bearer scrape")));
         assert!(!v.validate(&headers_with("Authorization", "Bearer ")));
     }
@@ -741,12 +750,12 @@ mod tests {
     #[test]
     fn metrics_rejects_other_schemes_and_raw_token() {
         let v = metrics_validator();
-        // Basic-схема и «голый» токен без схемы не принимаются.
+        // The Basic scheme and a bare token without a scheme are not accepted.
         assert!(!v.validate(&headers_with("Authorization", "Basic scrape-token")));
         assert!(!v.validate(&headers_with("Authorization", "scrape-token")));
     }
 
-    // --- HOTP: контрольные векторы RFC 4226 (Appendix D) ---
+    // --- HOTP: the RFC 4226 test vectors (Appendix D) ---
 
     #[test]
     fn hotp_matches_rfc4226_vectors() {
@@ -758,7 +767,7 @@ mod tests {
             let got = hotp(RFC_SECRET, counter as u64, 6, MessageDigest::sha1()).unwrap();
             assert_eq!(
                 &got, want,
-                "HOTP расходится с RFC 4226 на counter={counter}"
+                "HOTP disagrees with RFC 4226 at counter={counter}"
             );
         }
     }
@@ -767,16 +776,16 @@ mod tests {
 
     #[test]
     fn base32_decodes_rfc4648_vector() {
-        // RFC 4648: "foo" => "MZXW6" (без паддинга).
+        // RFC 4648: "foo" => "MZXW6" (without padding).
         assert_eq!(base32_decode("MZXW6").unwrap(), b"foo");
-        // Регистронезависимо и с игнорированием паддинга/пробелов.
+        // Case-insensitive, ignoring padding and whitespace.
         assert_eq!(base32_decode("mzxw6===").unwrap(), b"foo");
         assert_eq!(base32_decode("MZ XW6").unwrap(), b"foo");
     }
 
     #[test]
     fn base32_rejects_invalid_alphabet() {
-        // '1', '8', '0' не входят в алфавит base32.
+        // '1', '8' and '0' are not in the base32 alphabet.
         assert!(base32_decode("1808").is_none());
     }
 
@@ -800,7 +809,7 @@ mod tests {
         let v = proxy("s3cr3t");
         assert!(!v.validate(&headers_with("X-Proxy-Secret", "nope")));
         assert!(!v.validate(&HeaderMap::new()));
-        // Другая длина — не должно паниковать в memcmp.
+        // A different length — memcmp must not panic.
         assert!(!v.validate(&headers_with("X-Proxy-Secret", "short")));
     }
 
@@ -817,7 +826,7 @@ mod tests {
         }
     }
 
-    /// Ожидаемый код для окна, в котором лежит момент `now`.
+    /// The expected code for the window containing the moment `now`.
     fn code_at(secret: &[u8], now: u64, step: u64) -> String {
         hotp(secret, now / step, 6, MessageDigest::sha1()).unwrap()
     }
@@ -827,7 +836,7 @@ mod tests {
         let v = totp(vec![RFC_SECRET], 1);
         let now = 1_700_000_000;
         let code = code_at(RFC_SECRET, now, 30);
-        // Валидатор берёт своё «сейчас», поэтому проверяем через прямой вызов с `now`.
+        // The validator takes its own "now", so we check through a direct call with `now`.
         assert!(v.validate(&headers_with("X-TOTP-Code", &code), now));
     }
 
@@ -843,17 +852,17 @@ mod tests {
     fn totp_accepts_within_skew_and_rejects_outside() {
         let v = totp(vec![RFC_SECRET], 1);
         let now = 1_700_000_000;
-        // Код предыдущего окна принимается при skew=1.
+        // The code of the previous window is accepted at skew=1.
         let prev = code_at(RFC_SECRET, now - 30, 30);
         assert!(v.validate(&headers_with("X-TOTP-Code", &prev), now));
-        // Код через два окна — за пределами skew=1, отклоняется.
+        // A code two windows away is outside skew=1 and is rejected.
         let far = code_at(RFC_SECRET, now + 60, 30);
         assert!(!v.validate(&headers_with("X-TOTP-Code", &far), now));
     }
 
     #[test]
     fn totp_supports_secret_rotation() {
-        // Два активных секрета: код от любого из них принимается.
+        // Two active secrets: a code from either is accepted.
         let old = b"old-secret-000000000".as_slice();
         let new = b"new-secret-111111111".as_slice();
         let v = totp(vec![old, new], 1);
@@ -863,10 +872,10 @@ mod tests {
         assert!(v.validate(&headers_with("X-TOTP-Code", &code_at(new, now, 30)), now));
     }
 
-    // --- AuthConfig::from_env: секреты обязательны ---
+    // --- AuthConfig::from_env: the secrets are mandatory ---
 
-    /// Сериализует тесты, трогающие процесс-глобальные `AUTH_*` переменные, и
-    /// вычищает их до и после (восстановление после «отравления» лока паникой).
+    /// Serialises the tests that touch the process-global `AUTH_*` variables and
+    /// clears them before and after (recovering from a lock poisoned by a panic).
     fn with_clean_auth_env<T>(f: impl FnOnce() -> T) -> T {
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -896,10 +905,10 @@ mod tests {
     #[test]
     fn from_env_errors_when_both_secrets_missing() {
         with_clean_auth_env(|| {
-            // `let-else` вместо `unwrap_err()`, чтобы не требовать `Debug` на
-            // `AuthConfig` (в нём лежат секреты — им не место в Debug-выводе).
+            // `let-else` rather than `unwrap_err()` so as not to require `Debug`
+            // on `AuthConfig` (it holds secrets — they have no place in Debug output).
             let Err(err) = AuthConfig::from_env() else {
-                panic!("ожидалась ошибка конфигурации");
+                panic!("a configuration error was expected");
             };
             assert!(err.contains("AUTH_PROXY_SECRET"), "{err}");
             assert!(err.contains("AUTH_TOTP_SECRET"), "{err}");
@@ -911,7 +920,7 @@ mod tests {
         with_clean_auth_env(|| {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             let Err(err) = AuthConfig::from_env() else {
-                panic!("ожидалась ошибка конфигурации");
+                panic!("a configuration error was expected");
             };
             assert!(err.contains("AUTH_TOTP_SECRET"), "{err}");
             assert!(!err.contains("AUTH_PROXY_SECRET"), "{err}");
@@ -920,20 +929,21 @@ mod tests {
 
     #[test]
     fn from_env_ok_without_metrics_token() {
-        // Уровень 4 ОПЦИОНАЛЕН, в отличие от уровней 2 и 3: без токена сервис
-        // стартует, просто уровень недоступен (роут `/metrics` не публикуется).
+        // Level 4 is OPTIONAL, unlike levels 2 and 3: without a token the service
+        // starts, the level is simply unavailable (the `/metrics` route is not published).
         with_clean_auth_env(|| {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             env::set_var("AUTH_TOTP_SECRET", "MZXW6");
-            let cfg = AuthConfig::from_env().expect("config должна собраться без токена метрик");
-            assert!(!cfg.metrics_enabled(), "уровень 4 должен быть недоступен");
+            let cfg =
+                AuthConfig::from_env().expect("the config must assemble without a metrics token");
+            assert!(!cfg.metrics_enabled(), "level 4 must be unavailable");
         });
     }
 
     #[test]
     fn metrics_validator_rejects_everything_without_token() {
-        // Отсутствие секрета НИКОГДА не означает открытый доступ: валидатор
-        // отклоняет всё, даже если роут окажется зарегистрирован.
+        // A missing secret NEVER means open access: the validator rejects
+        // everything even if the route ends up registered.
         let v = MetricsValidator { token: None };
         assert!(!v.validate(&HeaderMap::new()));
         assert!(!v.validate(&headers_with("Authorization", "Bearer whatever")));
@@ -946,7 +956,7 @@ mod tests {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
             env::set_var("AUTH_TOTP_SECRET", "MZXW6"); // base32("foo")
             env::set_var("AUTH_METRICS_TOKEN", "m3trics");
-            let cfg = AuthConfig::from_env().expect("config должна собраться");
+            let cfg = AuthConfig::from_env().expect("the config must assemble");
             assert_eq!(cfg.proxy.secret, b"s3cr3t");
             assert_eq!(cfg.totp.secrets, vec![b"foo".to_vec()]);
             assert_eq!(cfg.metrics.token.as_deref(), Some(b"m3trics".as_slice()));
@@ -957,9 +967,9 @@ mod tests {
     fn from_env_errors_on_invalid_base32() {
         with_clean_auth_env(|| {
             env::set_var("AUTH_PROXY_SECRET", "s3cr3t");
-            env::set_var("AUTH_TOTP_SECRET", "10108"); // 0,1,8 вне алфавита base32
+            env::set_var("AUTH_TOTP_SECRET", "10108"); // 0, 1 and 8 are outside the base32 alphabet
             let Err(err) = AuthConfig::from_env() else {
-                panic!("ожидалась ошибка конфигурации");
+                panic!("a configuration error was expected");
             };
             assert!(err.contains("base32"), "{err}");
         });
@@ -972,28 +982,28 @@ mod tests {
             env::set_var("AUTH_TOTP_SECRET", "MZXW6");
             env::set_var("AUTH_TOTP_SECRET_NEXT", "MZXW6");
             env::set_var("AUTH_METRICS_TOKEN", "m3trics");
-            let cfg = AuthConfig::from_env().expect("config должна собраться");
+            let cfg = AuthConfig::from_env().expect("the config must assemble");
             assert_eq!(cfg.totp.secrets.len(), 2);
         });
     }
 
-    // --- Интеграция: middleware поверх полного HTTP-стека actix ---
+    // --- Integration: the middleware over the full actix HTTP stack ---
 
     mod middleware {
-        //! Прогоняем каждый уровень через реальный actix-стек: тривиальный
-        //! обработчик, обёрнутый [`Auth`], должен отдавать `200` при валидном
-        //! креде и `401` — при отсутствующем/неверном. Так проверяется, что
-        //! middleware действительно перехватывает запрос до обработчика.
+        //! We run every level through the real actix stack: a trivial handler
+        //! wrapped in [`Auth`] must return `200` with a valid credential and
+        //! `401` with a missing or wrong one. That is how we check that the
+        //! middleware really does intercept the request before the handler.
 
         use super::*;
         use actix_web::http::StatusCode;
         use actix_web::{test, web, App, HttpResponse};
         use chrono::Utc;
 
-        /// Секрет TOTP для интеграционных прогонов.
+        /// The TOTP secret for the integration runs.
         const SECRET: &[u8] = b"12345678901234567890";
 
-        /// Конфигурация с явными валидаторами (env не задействуется).
+        /// A configuration with explicit validators (the environment is not involved).
         fn config(proxy_secret: &str, totp_secrets: Vec<&[u8]>) -> AuthConfig {
             AuthConfig {
                 proxy: ProxyValidator {
@@ -1015,7 +1025,7 @@ mod tests {
             }
         }
 
-        /// То же, но с включённой защитой от переигрывания TOTP-кода.
+        /// The same, but with TOTP replay protection enabled.
         fn config_with_replay_protection(
             proxy_secret: &str,
             totp_secrets: Vec<&[u8]>,
@@ -1026,7 +1036,7 @@ mod tests {
             }
         }
 
-        /// Приложение с хранилищем в `app_data` — нужно защите от повтора.
+        /// An application with a store in `app_data` — needed by replay protection.
         macro_rules! guarded_app_with_store {
             ($level:expr, $config:expr, $store:expr) => {
                 test::init_service(
@@ -1042,7 +1052,7 @@ mod tests {
             };
         }
 
-        /// Поднимает приложение с одним GET-роутом `/x`, обёрнутым уровнем `level`.
+        /// Brings up an application with a single GET route `/x` wrapped in level `level`.
         macro_rules! guarded_app {
             ($level:expr, $config:expr) => {
                 test::init_service(
@@ -1056,7 +1066,7 @@ mod tests {
             };
         }
 
-        /// TOTP-код для текущего окна и заданного секрета.
+        /// A TOTP code for the current window and the given secret.
         fn current_code(secret: &[u8]) -> String {
             let now = Utc::now().timestamp().max(0) as u64;
             hotp(secret, now / 30, 6, MessageDigest::sha1()).unwrap()
@@ -1138,14 +1148,14 @@ mod tests {
             );
             let code = current_code(SECRET);
 
-            // Первое предъявление кода проходит...
+            // The first presentation of the code goes through...
             let req = test::TestRequest::get()
                 .uri("/x")
                 .insert_header(("X-TOTP-Code", code.clone()))
                 .to_request();
             assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
 
-            // ...а повтор того же кода отклоняется, хотя окно ещё не закрылось.
+            // ...and a repeat of the same code is rejected, though the window is still open.
             let req = test::TestRequest::get()
                 .uri("/x")
                 .insert_header(("X-TOTP-Code", code))
@@ -1158,8 +1168,8 @@ mod tests {
 
         #[actix_web::test]
         async fn totp_replay_protection_is_off_by_default() {
-            // Дефолт не меняет поведение работающих деплоев: код переигрываем,
-            // как и было до появления защиты.
+            // The default does not change the behaviour of running deployments:
+            // the code is replayable, as it was before the protection appeared.
             let app = guarded_app_with_store!(
                 AuthLevel::Totp,
                 config("s3cr3t", vec![SECRET]),
@@ -1178,9 +1188,9 @@ mod tests {
 
         #[actix_web::test]
         async fn totp_replay_check_fails_open_when_store_unavailable() {
-            // Недоступное хранилище не должно закрывать вход: обе ручки уровня 3
-            // и так ходят в Redis, поэтому переигранный код при лежащем
-            // хранилище всё равно ничего не добьётся.
+            // An unavailable store must not close the door: both level 3
+            // endpoints go to Redis anyway, so a replayed code achieves nothing
+            // while the store is down.
             let app = guarded_app_with_store!(
                 AuthLevel::Totp,
                 config_with_replay_protection("s3cr3t", vec![SECRET]),
@@ -1199,8 +1209,8 @@ mod tests {
 
         #[actix_web::test]
         async fn totp_fingerprint_differs_per_code() {
-            // Отпечаток — HMAC на секрете, а не «голый» хеш: содержимое Redis
-            // бесполезно тому, у кого нет секрета.
+            // The fingerprint is an HMAC under the secret rather than a bare
+            // hash: the contents of Redis are useless to anyone without it.
             let cfg = config_with_replay_protection("s3cr3t", vec![SECRET]);
 
             let mut first = HeaderMap::new();
@@ -1218,8 +1228,8 @@ mod tests {
             let (b, _) = cfg.totp_replay_claim(&second).unwrap();
 
             assert_ne!(a, b);
-            assert_ne!(a, "111111", "код не должен попадать в ключ как есть");
-            // Окно: шаг 30 с и skew 1 в обе стороны — три шага.
+            assert_ne!(a, "111111", "the code must not end up in the key as is");
+            // The window: a step of 30 s and skew 1 in both directions — three steps.
             assert_eq!(ttl, 90);
         }
 

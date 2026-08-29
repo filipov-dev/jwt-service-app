@@ -1,43 +1,45 @@
-//! Описание OpenAPI-спецификации и её выгрузка в файл.
+//! The OpenAPI specification descriptor and its export to a file.
 //!
-//! Здесь живёт корневой описатель [`ApiDoc`], из которого `utoipa` собирает
-//! спеку, и код, который выгружает её в `docs/openapi.json`. Спека **лежит в
-//! репозитории** (JWT-59): в рантайме она доступна на
-//! `GET /api-docs/openapi.json`, но пока её не было в git, изменение контракта
-//! API не оставляло следа в диффе — ломающую правку нельзя было заметить на
-//! ревью.
+//! This is where the root [`ApiDoc`] descriptor lives, the one `utoipa` builds
+//! the spec from, together with the code that exports it to `docs/openapi.json`.
+//! The spec is **committed to the repository** (JWT-59): at runtime it is
+//! available at `GET /api-docs/openapi.json`, but while it was not in git a
+//! change of the API contract left no trace in the diff — a breaking change
+//! could not be spotted in review.
 //!
-//! Выгрузка живёт под `#[cfg(test)]` и делается тестом
-//! `spec_file_is_up_to_date`: `UPDATE_OPENAPI=1 cargo test openapi` переписывает
-//! файл, обычный прогон сверяет его с кодом. Отдельный бинарь-генератор
-//! пришлось бы ещё и не забывать запускать, а тест уже гоняет CI на каждый PR —
-//! разойтись со спекой файл не может.
+//! The export lives under `#[cfg(test)]` and is done by the
+//! `spec_file_is_up_to_date` test: `UPDATE_OPENAPI=1 cargo test openapi`
+//! rewrites the file, and an ordinary run compares it against the code. A
+//! separate generator binary would also have to be remembered, while the test is
+//! already run by CI on every pull request — the file cannot drift from the
+//! spec.
 
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-// Импортируется модулем, а не пофункционально: `utoipa` берёт **текст** пути из
-// `paths(...)` как имя тега, под которым ручки группируются в Swagger UI. С
-// `crate::handlers::create_token` тег стал бы `crate::handlers`.
+// Imported as a module rather than function by function: `utoipa` takes the
+// **text** of the path in `paths(...)` as the tag name that groups endpoints in
+// Swagger UI. With `crate::handlers::create_token` the tag would be
+// `crate::handlers`.
 use crate::handlers;
 use crate::models::{
     ErrorResponse, ReadinessResponse, RefreshRequest, RevokeGroupResponse, TokenRequest,
     TokenResponse,
 };
 
-/// Путь к выгруженной спеке относительно корня репозитория.
+/// Path to the exported spec, relative to the repository root.
 ///
-/// Вместе с хелперами выгрузки — только для тестов: в рантайме сервис отдаёт
-/// спеку из памяти и файл ему не нужен.
+/// Together with the export helpers it is test-only: at runtime the service
+/// serves the spec from memory and has no need for the file.
 #[cfg(test)]
 const SPEC_PATH: &str = "docs/openapi.json";
 
-/// Корневой описатель OpenAPI-документации.
+/// The root descriptor of the OpenAPI documentation.
 ///
-/// Перечисляет пути (эндпоинты) и компоненты-схемы, из которых `utoipa`
-/// генерирует OpenAPI-спецификацию. При добавлении нового эндпоинта его нужно
-/// зарегистрировать здесь в `paths(...)`, а новые DTO — в `components(schemas(...))`,
-/// иначе они не попадут в спеку. После правки перегенерируйте файл спеки:
+/// It lists the paths (endpoints) and the component schemas `utoipa` generates
+/// the OpenAPI specification from. A new endpoint has to be registered here in
+/// `paths(...)` and new DTOs in `components(schemas(...))`, or they will not
+/// reach the spec. After editing, regenerate the spec file:
 /// `UPDATE_OPENAPI=1 cargo test openapi`.
 #[derive(OpenApi)]
 #[openapi(
@@ -63,31 +65,32 @@ const SPEC_PATH: &str = "docs/openapi.json";
 )]
 pub struct ApiDoc;
 
-/// Регистрирует security-схемы для уровней доступа 2 и 3.
+/// Registers the security schemes for access levels 2 and 3.
 ///
-/// Уровень 2 (`proxy_secret`) и уровень 3 (`totp`) требуют заголовка-`apiKey`.
-/// Имена заголовков — дефолтные (`X-Proxy-Secret` / `X-TOTP-Code`); при их
-/// переопределении через env обновите и описание в OpenAPI. Уровень 1 (health,
-/// OpenAPI) защиты не требует и схем не имеет.
+/// Level 2 (`proxy_secret`) and level 3 (`totp`) require an `apiKey` header. The
+/// header names are the defaults (`X-Proxy-Secret` / `X-TOTP-Code`); when they
+/// are overridden through the environment, update the description in the
+/// OpenAPI spec too. Level 1 (health, OpenAPI) needs no protection and has no
+/// scheme.
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        // `components` уже создан, т.к. в схеме есть зарегистрированные DTO.
+        // `components` already exists because the schema has registered DTOs.
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "proxy_secret",
                 SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                     "X-Proxy-Secret",
-                    "Уровень 2: статический секрет, проставляемый обратным прокси. \
-                     Прокси ОБЯЗАН затирать клиентскую версию заголовка.",
+                    "Level 2: a static secret injected by the reverse proxy. \
+                     The proxy MUST strip the client-supplied version of the header.",
                 ))),
             );
             components.add_security_scheme(
                 "totp",
                 SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                     "X-TOTP-Code",
-                    "Уровень 3: текущий TOTP-код (RFC 6238) на общем секрете.",
+                    "Level 3: the current TOTP code (RFC 6238) over the shared secret.",
                 ))),
             );
             components.add_security_scheme(
@@ -96,7 +99,7 @@ impl Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .description(Some(
-                            "Уровень 4: статический Bearer-токен для скрейпа /metrics \
+                            "Level 4: a static bearer token for scraping /metrics \
                              (AUTH_METRICS_TOKEN).",
                         ))
                         .build(),
@@ -106,26 +109,26 @@ impl Modify for SecurityAddon {
     }
 }
 
-/// Абсолютный путь к [`SPEC_PATH`] в дереве исходников.
+/// The absolute path to [`SPEC_PATH`] in the source tree.
 ///
-/// Корень берётся из `CARGO_MANIFEST_DIR` — переменной времени компиляции, а не
-/// из текущего каталога процесса: тесты cargo запускает из корня, но полагаться
-/// на это не стоит.
+/// The root comes from `CARGO_MANIFEST_DIR` — a compile-time variable — rather
+/// than from the process working directory: cargo runs tests from the root, but
+/// relying on that would be unwise.
 #[cfg(test)]
 fn spec_file() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SPEC_PATH)
 }
 
-/// Спека в том виде, в каком она лежит в файле.
+/// The spec in the form it is stored in the file.
 ///
-/// Формат — pretty-JSON с переводом строки на конце: так дифф в PR читается
-/// построчно, а не одной длинной строкой, и файл не «безымянный» для утилит,
-/// ожидающих текст.
+/// The format is pretty JSON with a trailing newline: that way the diff in a
+/// pull request reads line by line rather than as one long line, and the file is
+/// not "nameless" to tools that expect text.
 #[cfg(test)]
 fn spec_json() -> String {
     let mut json = ApiDoc::openapi()
         .to_pretty_json()
-        .expect("OpenAPI-спека не сериализуется в JSON");
+        .expect("the OpenAPI spec does not serialise to JSON");
     json.push('\n');
     json
 }
@@ -135,51 +138,55 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Пути, которые зарегистрированы, но в спеке отсутствуют осознанно.
+    /// Paths that are registered but deliberately absent from the spec.
     ///
-    /// Спека не описывает саму себя: ручка выдачи документа — это транспорт, а
-    /// не часть контракта API. Список именно списком-исключением, а не «молча
-    /// не проверяем»: любая другая незадокументированная ручка обязана уронить
-    /// тест.
+    /// The spec does not describe itself: the endpoint serving the document is
+    /// transport, not part of the API contract. It is an explicit exclusion list
+    /// rather than "we silently do not check": any other undocumented endpoint
+    /// must fail the test.
     const ROUTES_OUTSIDE_SPEC: &[&str] = &["/api-docs/openapi.json"];
 
-    /// Пути, зарегистрированные в приложении, вычитанные из исходника.
+    /// The paths registered in the application, parsed out of the source.
     ///
-    /// Способ грубый, но честный: перечислить роуты у собранного actix-приложения
-    /// нельзя — `ResourceMap` наружу не отдаётся, а обход «дёрнем путь и
-    /// посмотрим, не 404 ли» требует заранее знать, что дёргать, то есть ровно
-    /// того списка, который мы и ищем. Поэтому читаем текст: роуты в этом сервисе
-    /// регистрируются вручную строковыми литералами в одном месте
-    /// (`configure_api`), см. «Соглашения и подводные камни» в `AGENTS.md`.
+    /// The approach is crude but honest: a built actix application cannot
+    /// enumerate its routes — `ResourceMap` is not exposed, and the "poke a path
+    /// and see whether it 404s" approach requires knowing in advance what to
+    /// poke, that is, exactly the list we are looking for. So we read the text:
+    /// routes in this service are registered by hand with string literals in one
+    /// place (`configure_api`), see "Conventions and pitfalls" in `AGENTS.md`.
     ///
-    /// Сканируется только тело `configure_api` и не-тестовая часть `handlers.rs`
-    /// — иначе в список попали бы роуты из тестовых приложений соседних модулей.
+    /// Only the body of `configure_api` and the non-test part of `handlers.rs`
+    /// are scanned — otherwise the list would pick up routes from the test
+    /// applications of neighbouring modules.
     fn registered_routes() -> BTreeSet<&'static str> {
-        // Тело `configure_api`: от сигнатуры до закрывающей скобки в нулевой
-        // колонке. Внутри функции такой скобки нет — вложенные блоки отбиты.
+        // The body of `configure_api`: from the signature to the closing brace in
+        // column zero. There is no such brace inside the function — the nested
+        // blocks are indented.
         let main_rs = include_str!("main.rs");
         let body_start = main_rs
             .find("fn configure_api")
-            .expect("configure_api не найдена в main.rs — тест отстал от кода");
+            .expect("configure_api not found in main.rs — the test has fallen behind the code");
         let body = &main_rs[body_start..];
-        let body = &body[..body.find("\n}\n").expect("не найден конец configure_api") + 1];
+        let body = &body[..body.find("\n}\n").expect("end of configure_api not found") + 1];
 
-        // `handlers.rs` — ради ручек на атрибут-макросах actix (`#[get("/livez")]`).
-        // Тестовый модуль отрезаем: там свои приложения со своими роутами.
+        // `handlers.rs` is scanned for the endpoints on actix attribute macros
+        // (`#[get("/livez")]`). The test module is cut off: it has its own
+        // applications with their own routes.
         let handlers_rs = include_str!("handlers.rs");
         let handlers_rs = &handlers_rs[..handlers_rs
             .find("#[cfg(test)]")
             .unwrap_or(handlers_rs.len())];
 
-        // Вложенный scope с непустым префиксом сломал бы плоский разбор: путь
-        // ручки собирался бы из префикса и литерала. Сейчас scope ровно один и
-        // пустой; появится другой — тест упадёт, а не соврёт.
+        // A nested scope with a non-empty prefix would break the flat parsing:
+        // the endpoint path would be assembled from the prefix and the literal.
+        // Right now there is exactly one scope and it is empty; should another
+        // appear, the test fails rather than lies.
         for prefix in literals_after(body, "web::scope(\"") {
             assert!(
                 prefix.is_empty(),
-                "web::scope(\"{prefix}\") — непустой префиксный scope. Разбор роутов \
-                 в этом тесте плоский и такой путь потеряет префикс; научите его \
-                 склейке или перепишите регистрацию"
+                "web::scope(\"{prefix}\") — a non-empty prefix scope. Route parsing \
+                 in this test is flat and such a path would lose the prefix; teach it \
+                 to concatenate or rewrite the registration"
             );
         }
 
@@ -196,21 +203,21 @@ mod tests {
             routes.extend(literals_after(source, marker).filter(|path| !path.is_empty()));
         }
 
-        // Страховка на случай, если разбор сломается о новый способ регистрации:
-        // пустой (или подозрительно короткий) список сделал бы тест зелёным
-        // всегда. Число — заведомо ниже текущего, чтобы не править его на каждую
-        // новую ручку.
+        // A safeguard in case the parsing breaks on a new way of registering
+        // routes: an empty (or suspiciously short) list would make the test green
+        // forever. The number is deliberately below the current count so that it
+        // does not need editing for every new endpoint.
         assert!(
             routes.len() >= 8,
-            "разбор роутов нашёл всего {} путей ({routes:?}) — похоже, роуты стали \
-             регистрировать иначе и тест ослеп",
+            "route parsing found only {} paths ({routes:?}) — it looks like routes are \
+             now registered differently and the test has gone blind",
             routes.len()
         );
 
         routes
     }
 
-    /// Строковые литералы, идущие сразу за каждым вхождением `marker`.
+    /// The string literals following each occurrence of `marker`.
     fn literals_after<'a>(
         source: &'a str,
         marker: &'a str,
@@ -221,18 +228,19 @@ mod tests {
             .filter_map(|rest| rest.split_once('"').map(|(literal, _)| literal))
     }
 
-    /// Спека перечисляет все опубликованные пути — и ровно их.
+    /// The spec lists every published path — and exactly those.
     ///
-    /// Аннотации `#[utoipa::path]` живут на **обобщённых** обработчиках (JWT-60):
-    /// потеряться при рефакторинге они могут молча — компилятор на это не ругается,
-    /// а Swagger UI просто недосчитается ручки.
+    /// The `#[utoipa::path]` annotations live on **generic** handlers (JWT-60):
+    /// they can go missing during a refactor silently — the compiler does not
+    /// complain, and Swagger UI simply comes up one endpoint short.
     ///
-    /// Список ожидаемых путей **не захардкожен**, а вычитан из исходника, где
-    /// роуты регистрируются. С ручным списком тест сторожил бы сам себя: новую
-    /// ручку забыли бы и в `ApiDoc`, и в списке — оба теста остались бы
-    /// зелёными, а файл спеки «актуальным» ровно в том смысле, что совпадает с
-    /// неполным `ApiDoc`. Сверка с файлом ловит правки спеки, эта — расхождение
-    /// спеки с приложением.
+    /// The list of expected paths is **not hard-coded** but parsed out of the
+    /// source where the routes are registered. With a manual list the test would
+    /// guard itself: a new endpoint would be forgotten both in `ApiDoc` and in
+    /// the list, both tests would stay green, and the spec file would be "up to
+    /// date" in exactly the sense that it matches an incomplete `ApiDoc`. The
+    /// comparison against the file catches edits to the spec; this one catches
+    /// the spec drifting from the application.
     #[test]
     fn openapi_spec_lists_all_endpoints() {
         let spec = ApiDoc::openapi();
@@ -245,8 +253,8 @@ mod tests {
             .collect();
         assert!(
             missing.is_empty(),
-            "ручки зарегистрированы, но не попали в OpenAPI-спеку: {missing:?}. \
-             Нужна аннотация #[utoipa::path] на обработчике и регистрация в paths(...) выше"
+            "endpoints are registered but did not reach the OpenAPI spec: {missing:?}. \
+             They need a #[utoipa::path] annotation on the handler and registration in paths(...) above"
         );
 
         let stale: Vec<&&str> = documented
@@ -255,26 +263,27 @@ mod tests {
             .collect();
         assert!(
             stale.is_empty(),
-            "в спеке есть пути, которых нет в приложении: {stale:?}. \
-             Ручку убрали или переименовали — уберите её и из paths(...) выше"
+            "the spec has paths the application does not: {stale:?}. \
+             The endpoint was removed or renamed — remove it from paths(...) above too"
         );
     }
 
-    /// Файл спеки в репозитории совпадает с тем, что генерирует код.
+    /// The spec file in the repository matches what the code generates.
     ///
-    /// Этот же тест и **выгружает** спеку: с `UPDATE_OPENAPI=1` он переписывает
-    /// файл вместо сравнения. Одна точка входа вместо пары «генератор + чекер»,
-    /// которые расходятся между собой; регенерация вызывается ровно тем же
-    /// кодом, который в CI сторожит актуальность.
+    /// This same test also **exports** the spec: with `UPDATE_OPENAPI=1` it
+    /// rewrites the file instead of comparing. One entry point instead of a
+    /// "generator plus checker" pair that drifts apart; regeneration is done by
+    /// exactly the code that guards freshness in CI.
     ///
-    /// Без такой проверки выгрузка мертва по построению: файл разошёлся бы со
-    /// спекой при первой же правке контракта, и дифф в PR перестал бы что-либо
-    /// значить.
+    /// Without such a check the export would be dead by construction: the file
+    /// would drift from the spec on the very first contract change and the diff
+    /// in a pull request would stop meaning anything.
     ///
-    /// Учтите: `info.version` в спеке — это версия из `Cargo.toml`, поэтому
-    /// подъём версии тоже требует регенерации. Специально исключать это поле не
-    /// стали: файл в репозитории должен быть ровно тем, что отдаёт сервис,
-    /// иначе это уже не снимок контракта, а его пересказ.
+    /// Note: `info.version` in the spec is the version from `Cargo.toml`, so a
+    /// version bump also requires regeneration. Excluding that field was
+    /// rejected deliberately: the file in the repository must be exactly what
+    /// the service serves, otherwise it is a retelling of the contract rather
+    /// than a snapshot of it.
     #[test]
     fn spec_file_is_up_to_date() {
         let path = spec_file();
@@ -282,25 +291,25 @@ mod tests {
 
         if std::env::var_os("UPDATE_OPENAPI").is_some() {
             std::fs::write(&path, &generated)
-                .unwrap_or_else(|e| panic!("не удалось записать {}: {e}", path.display()));
+                .unwrap_or_else(|e| panic!("could not write {}: {e}", path.display()));
             return;
         }
 
         let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!(
-                "{} не читается ({e}). Выгрузите спеку: UPDATE_OPENAPI=1 cargo test openapi",
+                "{} is unreadable ({e}). Export the spec: UPDATE_OPENAPI=1 cargo test openapi",
                 path.display()
             )
         });
 
-        // Не `assert_eq!`: он вывалил бы в отчёт обе спеки целиком (сотни строк),
-        // и настоящая разница в них утонула бы. Что именно поменялось, видно в
-        // `git diff` после регенерации.
+        // Not `assert_eq!`: it would dump both specs into the report in full
+        // (hundreds of lines) and the real difference would drown in them. What
+        // exactly changed is visible in `git diff` after regeneration.
         assert!(
             committed == generated,
-            "{SPEC_PATH} разошёлся с кодом. Если контракт API менялся осознанно \
-             (или поднята версия в Cargo.toml — она попадает в info.version), \
-             перегенерируйте файл: UPDATE_OPENAPI=1 cargo test openapi"
+            "{SPEC_PATH} has drifted from the code. If the API contract changed deliberately \
+             (or the version in Cargo.toml was bumped — it goes into info.version), \
+             regenerate the file: UPDATE_OPENAPI=1 cargo test openapi"
         );
     }
 }

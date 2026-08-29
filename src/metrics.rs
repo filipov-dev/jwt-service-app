@@ -1,62 +1,65 @@
-//! Метрики в формате Prometheus.
+//! Metrics in the Prometheus format.
 //!
-//! Фасад — crate `metrics`, рендерер — `metrics-exporter-prometheus`. Собственный
-//! HTTP-listener экспортёра не используется: текст экспозиции отдаём через actix
-//! на `GET /metrics` (см. `handlers::metrics`), чтобы не поднимать второй порт и
-//! не тянуть hyper/rustls.
+//! The facade is the `metrics` crate and the renderer is
+//! `metrics-exporter-prometheus`. The exporter's own HTTP listener is not used:
+//! the exposition text is served through actix on `GET /metrics` (see
+//! `handlers::metrics`) so that we neither open a second port nor pull in
+//! hyper/rustls.
 //!
-//! ## Кто это читает
+//! ## Who reads this
 //!
-//! - **Prometheus** / **Yandex Managed Prometheus** — прямой scrape `/metrics`.
-//! - **Zabbix** — тем же путём через `agent2` с prometheus-плагином; отдельный
-//!   экспортёр не нужен.
-//! - **Monium** (Yandex Cloud) — через Prometheus-совместимость.
+//! - **Prometheus** / **Yandex Managed Prometheus** — a direct scrape of
+//!   `/metrics`.
+//! - **Zabbix** — the same way through `agent2` with the prometheus plugin; no
+//!   separate exporter is needed.
+//! - **Monium** (Yandex Cloud) — through Prometheus compatibility.
 //!
-//! ## Кардинальность
+//! ## Cardinality
 //!
-//! В лейблы кладём **шаблон роута** (`/tokens/{jti}`), а не фактический путь:
-//! иначе каждый `jti` порождал бы отдельную серию и Prometheus распух бы. Ничего
-//! клиентского (токены, секреты, IP) в лейблы не попадает.
+//! Labels carry the **route template** (`/tokens/{jti}`), not the actual path:
+//! otherwise every `jti` would spawn its own series and Prometheus would
+//! balloon. Nothing client-supplied (tokens, secrets, IPs) ends up in a label.
 //!
-//! ## Именование
+//! ## Naming
 //!
-//! По соглашению Prometheus: счётчики — с суффиксом `_total`, гистограммы
-//! длительностей — в секундах с суффиксом `_seconds`.
+//! By Prometheus convention: counters carry the `_total` suffix and latency
+//! histograms are in seconds with the `_seconds` suffix.
 
 use std::time::Duration;
 
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
-/// Границы бакетов гистограмм латентности (секунды): от 1 мс до 10 с.
+/// Bucket bounds of the latency histograms (seconds): from 1 ms to 10 s.
 const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// Устанавливает глобальный recorder и возвращает handle для рендера экспозиции.
+/// Installs the global recorder and returns a handle for rendering the
+/// exposition.
 ///
-/// Handle кладётся в `app_data` и используется обработчиком `/metrics`. Вызывать
-/// один раз на старте.
+/// The handle goes into `app_data` and is used by the `/metrics` handler. Call
+/// it once at startup.
 ///
 /// # Panics
 ///
-/// Паникует, если recorder уже установлен (как и прочая конфигурация на старте —
-/// fail-fast).
+/// Panics if the recorder is already installed (like the rest of the startup
+/// configuration — fail-fast).
 pub fn init_recorder() -> PrometheusHandle {
     let builder = PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS)
-        .expect("непустой список бакетов");
+        .expect("a non-empty bucket list");
 
     builder
         .install_recorder()
-        .expect("не удалось установить Prometheus recorder")
+        .expect("failed to install the Prometheus recorder")
 }
 
-/// Фиксирует завершённый HTTP-запрос: счётчик по (метод, роут, статус) и
-/// гистограмма латентности.
+/// Records a completed HTTP request: a counter by (method, route, status) and a
+/// latency histogram.
 ///
-/// `endpoint` — шаблон роута (например `/tokens/{jti}`), см. замечание о
-/// кардинальности в описании модуля.
+/// `endpoint` is the route template (for example `/tokens/{jti}`), see the note
+/// on cardinality in the module documentation.
 pub fn record_http_request(method: &str, endpoint: &str, status: u16, latency: Duration) {
     let labels = [
         ("method", method.to_string()),
@@ -74,20 +77,21 @@ pub fn record_http_request(method: &str, endpoint: &str, status: u16, latency: D
     histogram!("http_request_duration_seconds", &labels).record(latency.as_secs_f64());
 }
 
-/// Выпущен токен (`POST /tokens`).
+/// A token was issued (`POST /tokens`).
 pub fn record_token_issued() {
     counter!("jwt_tokens_issued_total").increment(1);
 }
 
-/// Отозван токен (`DELETE /tokens/{jti}`).
+/// A token was revoked (`DELETE /tokens/{jti}`).
 pub fn record_token_revoked() {
     counter!("jwt_tokens_revoked_total").increment(1);
 }
 
-/// Результат проверки токена (`POST /tokens/verify`).
+/// The outcome of a token verification (`POST /tokens/verify`).
 ///
-/// `success = false` — штатный исход публичной ручки (протух/подделан), а не сбой
-/// сервиса; отделён лейблом, чтобы можно было строить долю отказов.
+/// `success = false` is a normal outcome of a public endpoint (expired or
+/// forged), not a service failure; it is split out by a label so that a failure
+/// ratio can be plotted.
 pub fn record_token_verified(success: bool) {
     counter!(
         "jwt_tokens_verified_total",
@@ -96,20 +100,20 @@ pub fn record_token_verified(success: bool) {
     .increment(1);
 }
 
-/// Отказ в доступе (401) на указанном уровне (`open`/`proxy_secret`/`totp`).
+/// Access denied (401) at the given level (`open`/`proxy_secret`/`totp`).
 pub fn record_auth_denied(level: &str) {
     counter!("jwt_auth_denied_total", "level" => level.to_string()).increment(1);
 }
 
-/// Сработал rate-limit (429).
+/// The rate limit fired (429).
 pub fn record_rate_limited() {
     counter!("jwt_rate_limit_exceeded_total").increment(1);
 }
 
-/// Длительность обращения к `jwks-service-app`.
+/// Duration of a call to `jwks-service-app`.
 ///
-/// `operation` — короткое имя операции (`public_keys`, `private_key`),
-/// `success` — удалось ли обращение.
+/// `operation` is the short name of the operation (`public_keys`,
+/// `private_key`), `success` is whether the call succeeded.
 pub fn record_jwks_request(operation: &str, success: bool, latency: Duration) {
     histogram!(
         "jwks_request_duration_seconds",
@@ -119,25 +123,26 @@ pub fn record_jwks_request(operation: &str, success: bool, latency: Duration) {
     .record(latency.as_secs_f64());
 }
 
-/// Обращение к кешу JWKS.
+/// A lookup in the JWKS cache.
 ///
-/// `result`:
-/// - `hit` — ключ отдан из памяти, в сеть не ходили;
-/// - `miss` — в кеше не нашлось, пошли в `jwks-service-app`;
-/// - `throttled` — `kid` неизвестен, но обновляться ещё рано (защита от флуда
-///   несуществующими `kid`), запрос отклонён без похода в сеть;
-/// - `stale` — сервис ключей недоступен, ключ отдан из устаревшего снимка
-///   (stale-while-revalidate).
+/// - `hit` — the key was served from memory, no network call;
+/// - `miss` — it was not in the cache, so we went to `jwks-service-app`;
+/// - `throttled` — the `kid` is unknown but it is too early to refresh
+///   (protection against a flood of non-existent `kid` values), the request was
+///   rejected without a network call;
+/// - `stale` — the key service is unavailable and the key was served from an
+///   outdated snapshot (stale-while-revalidate).
 ///
-/// Доля `hit` — главный показатель эффективности кеша; заметный поток
-/// `throttled` означает, что по сервису бьют мусорными `kid`, а любой `stale` —
-/// что `jwks-service-app` лежит и мы работаем на памяти: это повод для алерта,
-/// потому что за пределом `JWKS_CACHE_STALE_MAX_SECONDS` верификация откажет.
+/// The `hit` share is the main measure of cache efficiency; a noticeable stream
+/// of `throttled` means the service is being hit with junk `kid` values, and any
+/// `stale` means `jwks-service-app` is down and we are running on memory: that
+/// is worth an alert, because past `JWKS_CACHE_STALE_MAX_SECONDS` verification
+/// starts failing.
 pub fn record_jwks_cache(result: &str) {
     counter!("jwks_cache_total", "result" => result.to_string()).increment(1);
 }
 
-/// Длительность команды к Redis (`store_jti`, `check_jti`, `delete_jti`, `ping`).
+/// Duration of a Redis command (`store_jti`, `check_jti`, `delete_jti`, `ping`).
 pub fn record_redis_command(command: &str, success: bool, latency: Duration) {
     histogram!(
         "redis_command_duration_seconds",
@@ -151,13 +156,13 @@ pub fn record_redis_command(command: &str, success: bool, latency: Duration) {
 mod tests {
     use super::*;
 
-    /// Recorder глобален и ставится один раз на процесс; в тестах проверяем, что
-    /// рендер работает и метрики попадают в экспозицию.
+    /// The recorder is global and installed once per process; the tests check
+    /// that rendering works and that metrics reach the exposition.
     #[test]
     fn renders_recorded_metrics() {
-        // `install_recorder` мог уже отработать в другом тесте — используем
-        // локальный recorder через `PrometheusBuilder::build_recorder`, он не
-        // трогает глобальное состояние.
+        // `install_recorder` may have already run in another test — we use a
+        // local recorder through `PrometheusBuilder::build_recorder`, which does
+        // not touch global state.
         let recorder = PrometheusBuilder::new()
             .set_buckets(LATENCY_BUCKETS)
             .unwrap()

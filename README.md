@@ -5,61 +5,61 @@
 [![Docker Hub](https://img.shields.io/docker/v/filipov/jwt-service-app?sort=semver&label=docker%20hub)](https://hub.docker.com/r/filipov/jwt-service-app)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-HTTP-сервис на Rust (actix-web), который **выпускает, проверяет и отзывает
-JWT** — и делает только это.
+An HTTP service in Rust (actix-web) that **issues, verifies and revokes JWTs** —
+and does nothing else.
 
-Если у вас несколько сервисов и им нужен общий формат аутентификации, обычный
-путь — вкомпилировать библиотеку JWT в каждый и раздать всем приватный ключ.
-`jwt-service-app` — альтернатива: ключ не покидает инфраструктуру ключей,
-выпуск и проверка живут за HTTP-ручками, а отозвать конкретный токен можно, не
-дожидаясь истечения его срока.
+If you run several services and they need a shared authentication format, the
+usual path is to compile a JWT library into each of them and hand the private
+key to everyone. `jwt-service-app` is the alternative: the key never leaves the
+key infrastructure, issuing and verification live behind HTTP endpoints, and a
+single token can be revoked without waiting for it to expire.
 
-## Что он делает и чего не делает
+## What it does and what it does not
 
-**Делает:**
+**It does:**
 
-- выпускает JWT с произвольными claims и заданным TTL (`POST /tokens`);
-- проверяет подпись, срок и `iss`/`aud`, а заодно — не отозван ли токен
-  (`POST /tokens/verify`);
-- выдаёт refresh-токен и меняет его на новую пару с ротацией
+- issue JWTs with arbitrary claims and a chosen TTL (`POST /tokens`);
+- verify the signature, the expiry and `iss`/`aud`, and check whether the token
+  has been revoked (`POST /tokens/verify`);
+- hand out a refresh token and exchange it for a new pair, with rotation
   (`POST /tokens/refresh`);
-- отзывает токен по `jti` или все токены субъекта сразу
+- revoke a token by its `jti`, or every token of a subject at once
   (`DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens`);
-- подписывает через RS256/384/512, ES256/384/512 и EdDSA;
-- отдаёт метрики Prometheus, структурные логи, трейсы OpenTelemetry и ошибки в
+- sign with RS256/384/512, ES256/384/512 and EdDSA;
+- expose Prometheus metrics, structured logs, OpenTelemetry traces and errors to
   GlitchTip/Sentry.
 
-**Не делает:**
+**It does not:**
 
-- **не хранит и не генерирует ключи** — за это отвечает отдельный сервис
-  `jwks-service-app`, к которому этот ходит по HTTP;
-- **не терминирует TLS** — снаружи стоит обратный прокси, он же ставит секрет
-  уровня 2 (см. ниже);
-- **не заводит пользователей и не проверяет пароли** — это не сервис
-  идентификации, он только оформляет уже принятое кем-то решение «этому
-  субъекту токен выдать можно».
+- **store or generate keys** — that is the job of a separate service,
+  `jwks-service-app`, which this one talks to over HTTP;
+- **terminate TLS** — a reverse proxy sits in front, and it is also what injects
+  the level 2 secret (see below);
+- **manage users or check passwords** — this is not an identity service, it only
+  formalises a decision somebody else already made: "this subject may have a
+  token".
 
-## Как он стоит в системе
+## Where it sits in the system
 
 ```
-              ┌──────────────────┐        Host → iss
-   клиенты ──▶│ обратный   прокси│───────────────────┐
-              │ (TLS, X-Proxy-…) │                   │
-              └──────────────────┘                   ▼
+                ┌──────────────────┐        Host → iss
+      clients ─▶│  reverse   proxy │───────────────────┐
+                │ (TLS, X-Proxy-…) │                   │
+                └──────────────────┘                   ▼
                                             ┌──────────────────┐
-   ваши бэкенды ─── X-TOTP-Code ───────────▶│ jwt-service-app  │
+   your backends ─── X-TOTP-Code ──────────▶│ jwt-service-app  │
                                             └────────┬─────────┘
-                                       приватный ключ│  │ jti, refresh
-                                          и JWKS     ▼  ▼
+                                        private key  │  │ jti, refresh
+                                         and JWKS    ▼  ▼
                                  ┌──────────────────┐ ┌───────┐
                                  │ jwks-service-app │ │ Redis │
                                  └──────────────────┘ └───────┘
 ```
 
-Без Redis и `jwks-service-app` сервис стартует, но `GET /readyz` отдаёт `503`:
-слать на него трафик рано.
+Without Redis and `jwks-service-app` the service still starts, but `GET /readyz`
+returns `503`: it is too early to route traffic to it.
 
-## Быстрый старт
+## Quick start
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -71,124 +71,131 @@ docker run --rm -p 8080:8080 \
   filipov/jwt-service-app:latest
 ```
 
-`HOST=0.0.0.0` обязателен — дефолт `127.0.0.1` слушает только петлю внутри
-контейнера. `AUTH_PROXY_SECRET` и `AUTH_TOTP_SECRET` тоже обязательны: без них
-сервис **не стартует**, чтобы защиту нельзя было «забыть» включить. Образ
-multi-arch (`linux/amd64`, `linux/arm64`), публикуется в Docker Hub и
-`ghcr.io/filipov-dev/jwt-service-app`; для боевого стенда пинуйте версию, а не
-`latest`.
+`HOST=0.0.0.0` is required — the default `127.0.0.1` only listens on the
+loopback inside the container. `AUTH_PROXY_SECRET` and `AUTH_TOTP_SECRET` are
+required too: without them the service **refuses to start**, so that protection
+cannot be "forgotten". The image is multi-arch (`linux/amd64`, `linux/arm64`)
+and is published to Docker Hub and to `ghcr.io/filipov-dev/jwt-service-app`; pin
+a version rather than `latest` for a production deployment.
 
-Готовые манифесты Docker Compose и Kubernetes — в
-[`deployments/prod/`](deployments/prod/README.md). Стенд для разработки (сервис,
-Redis, Redis Commander, Postgres, `jwks-service-app`, Swagger UI) поднимается
-из [`deployments/dev/docker-compose.yml`](deployments/dev/docker-compose.yml):
+Ready-made Docker Compose and Kubernetes manifests live in
+[`deployments/prod/`](deployments/prod/README.md). The development stand (the
+service, Redis, Redis Commander, Postgres, `jwks-service-app`, Swagger UI) comes
+up from [`deployments/dev/docker-compose.yml`](deployments/dev/docker-compose.yml):
 
 ```bash
 docker compose -p jwt-dev -f deployments/dev/docker-compose.yml up -d
 ```
 
-Собрать и запустить без Docker (нужны Rust stable, Redis и `jwks-service-app`):
+To build and run without Docker (needs Rust stable, Redis and
+`jwks-service-app`):
 
 ```bash
 cargo run
 ```
 
-## Ручки и уровни доступа
+## Endpoints and access levels
 
-Доступ к эндпоинтам разграничен единым auth-middleware по четырём уровням;
-уровень задаётся при регистрации роута, разница — только в валидаторе.
+Access to the endpoints is split across four levels by a single auth
+middleware; the level is chosen when the route is registered, and the only
+difference between levels is the validator.
 
-| Уровень | Эндпоинты | Защита |
-|--------:|-----------|--------|
-| **1 — открыт** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | нет |
-| **2 — proxy-secret** | `POST /tokens/verify` | статический секрет-заголовок от обратного прокси (constant-time) |
+| Level | Endpoints | Protection |
+|------:|-----------|------------|
+| **1 — open** | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | none |
+| **2 — proxy secret** | `POST /tokens/verify` | a static secret header injected by the reverse proxy (constant-time compare) |
 | **3 — TOTP** | `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | TOTP (RFC 6238), internal app-to-app |
-| **4 — Bearer-токен** | `GET /metrics` (только если задан токен) | статический токен в `Authorization: Bearer` (constant-time) |
+| **4 — bearer token** | `GET /metrics` (only when a token is configured) | a static token in `Authorization: Bearer` (constant-time compare) |
 
-Невалидный или отсутствующий кред → `401`. Защиты основных ручек
-**обязательны**: секреты уровней 2 и 3 (`AUTH_PROXY_SECRET`,
-`AUTH_TOTP_SECRET`) должны быть заданы, иначе сервис **не стартует**. Уровень 4
-— исключение: без `AUTH_METRICS_TOKEN` сервис стартует, а ручка `/metrics`
-просто не публикуется (`404`).
+An invalid or missing credential gives `401`. Protection of the main endpoints
+is **mandatory**: the level 2 and level 3 secrets (`AUTH_PROXY_SECRET`,
+`AUTH_TOTP_SECRET`) must be set or the service **will not start**. Level 4 is
+the exception: without `AUTH_METRICS_TOKEN` the service starts and the
+`/metrics` endpoint is simply not published (`404`).
 
-**Уровень 2 держится на обратном прокси**: он ставит `X-Proxy-Secret` и
-**обязан затирать клиентскую версию заголовка**, иначе секрет подставят снаружи
-и уровень будет обойдён. Отсюда же следует, что порт контейнера не надо
-публиковать наружу напрямую.
+**Level 2 rests on the reverse proxy**: it injects `X-Proxy-Secret` and **must
+strip the client-supplied version of that header**, otherwise the secret can be
+set from the outside and the level is bypassed. It follows that the container
+port must not be published directly to the outside world.
 
-Полный контракт — OpenAPI-спека: `GET /api-docs/openapi.json` или
-[`docs/openapi.json`](docs/openapi.json) в репозитории.
+The full contract is the OpenAPI spec: `GET /api-docs/openapi.json`, or
+[`docs/openapi.json`](docs/openapi.json) in this repository.
 
-## Конфигурация
+## Configuration
 
-Всё настраивается переменными окружения; сводная таблица с дефолтами и
-пояснениями — [AGENTS.md → Конфигурация](AGENTS.md#конфигурация-переменные-окружения).
-Минимум для старта — пять переменных из «Быстрого старта» выше.
+Everything is configured through environment variables; the summary table with
+defaults and explanations is in
+[AGENTS.md → Configuration](AGENTS.md#configuration-environment-variables).
+The minimum needed to start is the five variables from "Quick start" above.
 
-## Документация
+## Documentation
 
-- **Клиентские примеры уровня 3 (TOTP) на 30 языках** —
-  [`docs/clients/`](docs/clients/README.md): генерация TOTP-кода из общего секрета
-  и вызов защищённой ручки с заголовком `X-TOTP-Code`.
-- **Конфиги reverse-proxy для уровня 2 (proxy-secret) на 10 прокси** —
-  [`docs/proxy/`](docs/proxy/README.md): как инжектить секрет-заголовок И
-  обязательно затирать клиентскую версию (nginx, Traefik, HAProxy, Envoy, Caddy,
-  Apache, Kong, AWS ALB/API Gateway, Cloudflare, NGINX Ingress).
-- **Observability: логи, метрики, трейсы, ошибки** —
-  [`docs/observability.md`](docs/observability.md): что сервис отдаёт наружу, как
-  включить и куда оно течёт (stdout/JSON, Prometheus и Zabbix, OpenTelemetry и
-  Monium, GlitchTip), сводная таблица переменных и готовые конфиги.
-- **OpenAPI** — `GET /api-docs/openapi.json` (security-схемы `proxy_secret`,
-  `totp` и `metrics_token` для уровней 2, 3 и 4). Тот же документ лежит в
-  репозитории — [`docs/openapi.json`](docs/openapi.json), поэтому изменения
-  контракта видно в диффе PR.
-- **Прод-деплой: Docker Compose и Kubernetes** —
-  [`deployments/prod/`](deployments/prod/README.md): манифесты с пробами на
-  `/livez` и `/readyz`, секреты из `.env`/`Secret`, заполненный
+- **Client examples for level 3 (TOTP) in 30 languages** —
+  [`docs/clients/`](docs/clients/README.md): generating a TOTP code from the
+  shared secret and calling a protected endpoint with the `X-TOTP-Code` header.
+- **Reverse-proxy configurations for level 2 (proxy secret), 10 proxies** —
+  [`docs/proxy/`](docs/proxy/README.md): how to inject the secret header AND,
+  crucially, strip the client-supplied one (nginx, Traefik, HAProxy, Envoy,
+  Caddy, Apache, Kong, AWS ALB/API Gateway, Cloudflare, NGINX Ingress).
+- **Observability: logs, metrics, traces, errors** —
+  [`docs/observability.md`](docs/observability.md): what the service exposes,
+  how to turn it on and where it flows (stdout/JSON, Prometheus and Zabbix,
+  OpenTelemetry and Monium, GlitchTip), a summary table of the variables and
+  ready-made configurations.
+- **OpenAPI** — `GET /api-docs/openapi.json` (security schemes `proxy_secret`,
+  `totp` and `metrics_token` for levels 2, 3 and 4). The same document is
+  committed as [`docs/openapi.json`](docs/openapi.json), so a contract change
+  shows up in the diff of a pull request.
+- **Production deployment: Docker Compose and Kubernetes** —
+  [`deployments/prod/`](deployments/prod/README.md): manifests with probes on
+  `/livez` and `/readyz`, secrets from `.env`/`Secret`, a filled-in
   `RATE_LIMIT_TRUSTED_PROXIES`.
-- **Архитектура, команды, соглашения и подводные камни** —
-  [AGENTS.md](AGENTS.md): карта модулей, устройство auth-middleware и rate
-  limiting, полный список переменных окружения и разбор принятых решений.
-- **Как сообщить об уязвимости** — [`SECURITY.md`](SECURITY.md): приватный
-  канал вместо публичного issue, сроки ответа и раскрытия, поддерживаемые
-  версии и что уязвимостью не считается.
-- **Аудит истории на секреты** —
-  [`docs/security/secret-audit.md`](docs/security/secret-audit.md): чем и по
-  каким ссылкам просканирована история, разбор находок и что делать, если
-  сканер нашёл настоящий секрет.
-- **Аудит CI на PR с форков** —
-  [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md): что
-  получает автор враждебного PR в публичном репозитории, почему секреты ему
-  недоступны и что проверять, добавляя workflow.
-- **Что изменилось между версиями образа** — [`CHANGELOG.md`](CHANGELOG.md):
-  разделы собираются из истории коммитов, те же тексты уходят в описание
-  каждого GitHub Release.
+- **Architecture, commands, conventions and pitfalls** —
+  [AGENTS.md](AGENTS.md): the module map, how the auth middleware and rate
+  limiting work, the full list of environment variables and the reasoning behind
+  the decisions taken.
+- **How to report a vulnerability** — [`SECURITY.md`](SECURITY.md): a private
+  channel instead of a public issue, response and disclosure timelines,
+  supported versions and what is not considered a vulnerability.
+- **History scan for secrets** —
+  [`docs/security/secret-audit.md`](docs/security/secret-audit.md): what scanned
+  the history and over which refs, the findings, and what to do when a scanner
+  finds a real secret.
+- **CI audit for pull requests from forks** —
+  [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md): what the
+  author of a hostile pull request gets in a public repository, why the secrets
+  are out of reach and what to check when adding a workflow.
+- **What changed between image versions** — [`CHANGELOG.md`](CHANGELOG.md): the
+  sections are assembled from the commit history, and the same texts go into the
+  description of every GitHub release.
 
-## Стек
+## Stack
 
-Rust (edition 2021, канал `stable` из `rust-toolchain.toml`), actix-web 4,
-`openssl` для подписи и проверки, Redis для `jti` и refresh-токенов, `utoipa`
-для OpenAPI, `tracing` + OpenTelemetry + Prometheus для телеметрии. Все
-зависимости — под permissive-лицензиями (MIT / Apache-2.0): copyleft-крейты не
-тянем, потому что образы раздаются публично.
+Rust (edition 2021, the `stable` channel pinned in `rust-toolchain.toml`),
+actix-web 4, `openssl` for signing and verification, Redis for `jti` and refresh
+tokens, `utoipa` for OpenAPI, `tracing` + OpenTelemetry + Prometheus for
+telemetry. Every dependency is permissively licensed (MIT / Apache-2.0):
+copyleft crates are kept out because the images are distributed publicly.
 
-## Участие
+## Contributing
 
-Баг-репорты, идеи и pull request'ы приветствуются. Как собрать, что прогнать
-перед PR и как оформить коммит — [CONTRIBUTING.md](CONTRIBUTING.md); правила
-общения — [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Bug reports, ideas and pull requests are welcome. How to build, what to run
+before opening a pull request and how to shape a commit —
+[CONTRIBUTING.md](CONTRIBUTING.md); the rules of engagement —
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
-## Безопасность
+## Security
 
-Нашли уязвимость — **не открывайте публичный issue**. Приватный адвайзори на
-GitHub (вкладка Security → Report a vulnerability) или письмо на
-[security@filipov.dev](mailto:security@filipov.dev). Подтверждение получения —
-за 72 часа, вердикт — за 7 дней, раскрытие — скоординированное. Полная политика
-со списком того, что уязвимостью не считается, — в [`SECURITY.md`](SECURITY.md).
+Found a vulnerability? **Do not open a public issue.** Use a private advisory on
+GitHub (the Security tab → Report a vulnerability) or write to
+[security@filipov.dev](mailto:security@filipov.dev). Acknowledgement within 72
+hours, a verdict within 7 days, coordinated disclosure. The full policy,
+including the list of what is not considered a vulnerability, is in
+[`SECURITY.md`](SECURITY.md).
 
-## Лицензия
+## License
 
-[Apache-2.0](LICENSE). Выбрана из-за явного патентного гранта (раздел 3
-лицензии): для криптографического сервиса он существеннее краткости MIT.
-Форкать, менять и использовать образ в коммерческих продуктах можно —
-сохраните текст лицензии и укажите, что файлы менялись.
+[Apache-2.0](LICENSE). Chosen for its explicit patent grant (section 3): for a
+cryptographic service that matters more than the brevity of MIT. You may fork
+it, change it and use the image in commercial products — keep the license text
+and state that the files were modified.

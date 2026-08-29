@@ -1,17 +1,17 @@
-# NetworkPolicy: кто вправе стучаться в поды сервиса.
+# NetworkPolicy: who may reach the pods of the service.
 #
-# Это то же правило, что README формулирует словами, но закреплённое в
-# кластере: порт наружу не публикуется, трафик приходит только через обратный
-# прокси. Уровень 2 (`X-Proxy-Secret`) держится на том, что заголовок ставит
-# прокси — любой под кластера, сходивший в ClusterIP напрямую, этот уровень
-# обходит. `type: ClusterIP` закрывает сервис только снаружи кластера, внутри
-# он доступен всем подам всех namespace'ов; вот этот зазор политика и убирает.
+# This is the same rule the README states in prose, but enforced in the cluster:
+# the port is not published outwards and traffic arrives only through the reverse
+# proxy. Level 2 (`X-Proxy-Secret`) rests on the header being set by the proxy —
+# any pod in the cluster that goes to the ClusterIP directly bypasses that level.
+# `type: ClusterIP` closes the service only from outside the cluster; inside it
+# is reachable by every pod of every namespace, and this policy removes that gap.
 #
-# ВНИМАНИЕ: NetworkPolicy исполняет CNI. Плагины без её поддержки (например,
-# голый flannel) принимают манифест молча и не делают ничего — защита окажется
-# только на бумаге. Проверьте, что ваш CNI её реализует (Calico, Cilium,
-# Antrea, Weave, сетевые плагины managed-кластеров), и убедитесь после
-# применения, что под из постороннего namespace до порта 8080 не достаёт.
+# WARNING: NetworkPolicy is enforced by the CNI. Plugins without support for it
+# (bare flannel, for example) accept the manifest silently and do nothing — the
+# protection exists on paper only. Check that your CNI implements it (Calico,
+# Cilium, Antrea, Weave, the network plugins of managed clusters) and verify
+# after applying that a pod from an unrelated namespace cannot reach port 8080.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -23,28 +23,29 @@ spec:
     matchLabels:
       app.kubernetes.io/name: jwt-service-app
 
-  # Отдельный манифест «default-deny» не нужен: как только политика выбрала
-  # под, для перечисленных policyTypes он переходит в режим «запрещено всё, что
-  # не разрешено явно». Правила ниже — исчерпывающий список источников.
+  # A separate "default-deny" manifest is not needed: as soon as a policy selects
+  # a pod, for the listed policyTypes it switches to "everything not explicitly
+  # allowed is forbidden". The rules below are the exhaustive list of sources.
   #
-  # Egress не ограничиваем намеренно. Сервис ходит в Redis, сервис ключей, а по
-  # желанию ещё в OTLP-коллектор и GlitchTip; адреса двух последних зависят от
-  # стенда, и политика с забытым исключением ломает не сеть, а телеметрию —
-  # молча. Ограничение исходящего трафика — это отдельное решение под конкретный
-  # кластер, а не то, что стоит зашивать в публичный образец.
+  # Egress is deliberately not restricted. The service talks to Redis, to the key
+  # service and optionally to an OTLP collector and GlitchTip; the addresses of
+  # the last two depend on the stand, and a policy with a forgotten exception
+  # breaks not the network but the telemetry — silently. Restricting outbound
+  # traffic is a decision for a specific cluster rather than something to bake
+  # into a public sample.
   policyTypes:
     - Ingress
 
   ingress:
     - from:
-        # 1. Ingress-контроллер — единственный штатный источник трафика.
-        #    Метка `kubernetes.io/metadata.name` проставляется API-сервером
-        #    каждому namespace автоматически (с Kubernetes 1.21), поэтому
-        #    размечать namespace вручную не нужно. Имена namespace и подов
-        #    контроллера уточняются под кластер:
+        # 1. The ingress controller is the only normal source of traffic.
+        #    The `kubernetes.io/metadata.name` label is applied by the API server
+        #    to every namespace automatically (since Kubernetes 1.21), so there is
+        #    no need to label namespaces by hand. The namespace and pod names of
+        #    the controller are cluster-specific:
         #      kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx
-        #    Тот же адрес должен быть в RATE_LIMIT_TRUSTED_PROXIES: обе
-        #    настройки описывают одного и того же соседа.
+        #    The same address must be in RATE_LIMIT_TRUSTED_PROXIES: both
+        #    settings describe one and the same neighbour.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
@@ -52,23 +53,24 @@ spec:
             matchLabels:
               app.kubernetes.io/name: ingress-nginx
 
-        # 2. Скрейпер метрик. `/metrics` живёт на том же порту, что и рабочие
-        #    ручки, и на уровне сети от них не отличается — поэтому источник
-        #    выделен отдельным правилом, а сама ручка закрыта уровнем 4
-        #    (Bearer-токен). Нет namespace `monitoring` — правило просто ни во
-        #    что не попадает, удалять его не обязательно.
+        # 2. The metrics scraper. `/metrics` lives on the same port as the
+        #    working endpoints and is indistinguishable from them at the network
+        #    level — which is why the source is a separate rule while the endpoint
+        #    itself is behind level 4 (a bearer token). With no `monitoring`
+        #    namespace the rule simply matches nothing; deleting it is optional.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring
 
-      # Именованный порт, а не 8080: имя берётся из `ports` контейнера, так
-      # политика не разъедется с Deployment'ом при смене номера порта.
+      # A named port rather than 8080: the name comes from the container's
+      # `ports`, so the policy does not drift from the Deployment when the port
+      # number changes.
       ports:
         - port: http
           protocol: TCP
 
-  # Пробы kubelet приходят с адреса узла, а не из пода, и под правила выше не
-  # попадают. Большинство CNI пропускают их отдельно (host-трафик у Calico и
-  # Cilium разрешён по умолчанию), но если после применения политики поды
-  # начали падать по liveness — добавьте сюда правило с ipBlock на подсеть
-  # узлов кластера.
+  # The kubelet probes come from the node address rather than from a pod and do
+  # not match the rules above. Most CNIs let them through separately (host traffic
+  # is allowed by default in Calico and Cilium), but if the pods start failing
+  # liveness after the policy is applied, add a rule here with an ipBlock for the
+  # cluster's node subnet.

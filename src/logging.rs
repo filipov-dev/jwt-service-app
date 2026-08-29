@@ -1,46 +1,52 @@
-//! Инициализация логирования и per-request middleware.
+//! Logging initialisation and the per-request middleware.
 //!
-//! Фундамент observability: единая настройка `tracing`-subscriber'а (формат
-//! выбирается через env) и middleware [`RequestLog`], который на каждый запрос
-//! заводит структурный span с `request_id` и по завершении пишет одну строку с
-//! методом, путём, статусом и латентностью.
+//! The foundation of observability: a single setup of the `tracing` subscriber
+//! (the format is picked through the environment) and the [`RequestLog`]
+//! middleware, which opens a structured span with a `request_id` for every
+//! request and, on completion, writes one line with the method, path, status and
+//! latency.
 //!
-//! ## Что НЕ логируется
+//! ## What is NOT logged
 //!
-//! Осознанно **не** пишем заголовки и тело запроса/ответа — там лежат секреты
-//! (`X-Proxy-Secret`, `X-TOTP-Code`) и сами токены. В лог идут только метод,
-//! путь, статус, латентность, `request_id` и best-effort IP клиента.
+//! We deliberately **do not** write request or response headers and bodies —
+//! they hold secrets (`X-Proxy-Secret`, `X-TOTP-Code`) and the tokens
+//! themselves. Only the method, path, status, latency, `request_id` and a
+//! best-effort client IP reach the log.
 //!
-//! ## Формат
+//! ## Format
 //!
-//! `LOG_FORMAT=json` — построчный JSON для машинного сбора (Monium/ELK и т.п.);
-//! любое другое значение (по умолчанию) — человекочитаемый `pretty` с ANSI.
-//! Уровни фильтруются через `RUST_LOG` (`EnvFilter`), плюс дефолт
-//! `jwt_service_app=info`.
+//! `LOG_FORMAT=json` gives line-delimited JSON for machine collection
+//! (Monium/ELK and the like); any other value (the default) gives the
+//! human-readable `pretty` format with ANSI. Levels are filtered through
+//! `RUST_LOG` (`EnvFilter`), with `jwt_service_app=info` as the default.
 //!
-//! ## Политика уровней
+//! ## Level policy
 //!
-//! В `tracing` пять уровней: `TRACE < DEBUG < INFO < WARN < ERROR`. Отдельного
-//! `CRITICAL`/`FATAL` нет — фатальные ситуации в этом сервисе фиксируются паникой
-//! на старте (fail-fast при некорректной конфигурации), а не уровнем лога.
+//! `tracing` has five levels: `TRACE < DEBUG < INFO < WARN < ERROR`. There is no
+//! separate `CRITICAL`/`FATAL` — fatal situations in this service are expressed
+//! as a panic at startup (fail-fast on invalid configuration), not as a log
+//! level.
 //!
-//! Уровень выбирается **по виновнику и последствию**, а не по «серьёзности» текста:
+//! The level is chosen **by who is at fault and what follows**, not by how
+//! "serious" the text sounds:
 //!
-//! - **ERROR** — сервис не смог выполнить работу: отказ зависимости (Redis, JWKS),
-//!   сбой крипты при подписи, некорректный материал ключа. Требует внимания
-//!   дежурного, годится как источник алертов.
-//! - **WARN** — деградация или сигнал безопасности, но запрос обработан: проблемы
-//!   конфигурации (с откатом на дефолт), отказ в доступе (401), срабатывание
-//!   rate-limit (429).
-//! - **INFO** — жизненный цикл и бизнес-события: старт сервера, сводка конфигурации,
-//!   завершение запроса (`request completed`), отзыв токена.
-//! - **DEBUG** — вина клиента и детали работы: битый/протухший/подделанный токен,
-//!   параметры вне границ, шаги обращения к JWKS. **Важно:** клиентские ошибки
-//!   намеренно НЕ на ERROR — иначе любой кривой запрос поднимал бы ложные алерты.
-//! - **TRACE** — не используется.
+//! - **ERROR** — the service could not do its job: a dependency failure (Redis,
+//!   JWKS), a crypto failure while signing, invalid key material. It needs the
+//!   on-call engineer's attention and is a suitable source of alerts.
+//! - **WARN** — degradation or a security signal, but the request was handled:
+//!   configuration problems (with a fallback to the default), access denied
+//!   (401), the rate limit firing (429).
+//! - **INFO** — lifecycle and business events: server start, the configuration
+//!   summary, request completion (`request completed`), a token revoked.
+//! - **DEBUG** — the client's fault and internal detail: a corrupt, expired or
+//!   forged token, parameters out of bounds, the steps of a JWKS call.
+//!   **Important:** client errors are deliberately NOT at ERROR — otherwise any
+//!   malformed request would raise false alerts.
+//! - **TRACE** — unused.
 //!
-//! Ошибку логирует тот слой, который знает **причину** (например `jwk.rs` — отказ
-//! JWKS на ERROR); вышестоящие слои пишут исход на DEBUG, чтобы не плодить дубли.
+//! An error is logged by the layer that knows the **cause** (for example
+//! `jwk.rs` logs a JWKS failure at ERROR); the layers above record the outcome
+//! at DEBUG so that duplicates are not multiplied.
 
 use std::env;
 use std::future::{ready, Future, Ready};
@@ -60,41 +66,42 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 use uuid::Uuid;
 
-/// Имя заголовка сквозного идентификатора запроса (в нижнем регистре — требование
-/// `HeaderName::from_static`).
+/// Name of the end-to-end request identifier header (lower case — a requirement
+/// of `HeaderName::from_static`).
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Максимальная длина принимаемого извне `X-Request-Id`.
+/// Maximum accepted length of an externally supplied `X-Request-Id`.
 const REQUEST_ID_MAX_LEN: usize = 128;
 
-/// Инициализирует глобальный `tracing`-subscriber.
+/// Initialises the global `tracing` subscriber.
 ///
-/// Собирается из слоёв поверх общего `Registry` — это и есть «единая шина»
-/// телеметрии:
-/// - фильтр уровней (`RUST_LOG`, дефолт `jwt_service_app=info`);
-/// - вывод логов (`LOG_FORMAT`: `json` → построчный JSON, иначе `pretty`);
-/// - опциональный слой OpenTelemetry, если задан `OTEL_EXPORTER_OTLP_ENDPOINT`
-///   (см. [`crate::tracing_otel`]);
-/// - опциональный слой GlitchTip, если задан `GLITCHTIP_DSN`
-///   (см. [`crate::sentry_glitchtip`]).
+/// It is assembled from layers over a shared `Registry` — that is the single
+/// telemetry bus:
+/// - the level filter (`RUST_LOG`, default `jwt_service_app=info`);
+/// - log output (`LOG_FORMAT`: `json` gives line-delimited JSON, otherwise
+///   `pretty`);
+/// - an optional OpenTelemetry layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+///   (see [`crate::tracing_otel`]);
+/// - an optional GlitchTip layer when `GLITCHTIP_DSN` is set
+///   (see [`crate::sentry_glitchtip`]).
 ///
-/// Возвращает [`Telemetry`] — живые ресурсы (провайдер трейсов и guard GlitchTip),
-/// которые нужно держать до конца работы процесса, иначе последние span'ы и
-/// события не досылаются.
+/// Returns a [`Telemetry`] — the live resources (the trace provider and the
+/// GlitchTip guard) that must be kept until the process ends, or the last spans
+/// and events are never flushed.
 ///
 /// # Panics
 ///
-/// Паникует, если глобальный subscriber уже установлен (вызывать один раз на
-/// старте — fail-fast).
+/// Panics when a global subscriber is already installed (call it once at
+/// startup — fail-fast).
 pub fn init_subscriber() -> Telemetry {
-    // ВАЖНО: дефолт применяется, только если `RUST_LOG` не задан. Нельзя делать
-    // `from_default_env().add_directive("jwt_service_app=info")` — добавленная
-    // директива перекрывает одноимённый таргет из `RUST_LOG`, и уровень крейта
-    // навсегда залипает на `info` (DEBUG становится недостижим).
+    // IMPORTANT: the default applies only when `RUST_LOG` is unset. Writing
+    // `from_default_env().add_directive("jwt_service_app=info")` is wrong — the
+    // added directive overrides the target of the same name from `RUST_LOG`, and
+    // the crate level sticks at `info` forever (DEBUG becomes unreachable).
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("jwt_service_app=info"));
 
-    // Слои json/pretty различаются по типу — приводим к общему через `.boxed()`.
+    // The json and pretty layers differ in type — unify them with `.boxed()`.
     let fmt_layer = match env::var("LOG_FORMAT")
         .unwrap_or_default()
         .to_lowercase()
@@ -110,15 +117,16 @@ pub fn init_subscriber() -> Telemetry {
     let (provider, otel_status) = crate::tracing_otel::init_tracer_provider();
     let otel_layer = provider.as_ref().map(crate::tracing_otel::layer);
 
-    // Логи по OTLP — отдельный сигнал и отдельный флаг: там, где stdout уже
-    // собирает агент, дублировать их по сети не нужно.
+    // Logs over OTLP are a separate signal with a separate flag: where an agent
+    // already collects stdout, duplicating them over the network is pointless.
     let (logger_provider, otel_logs_status) = crate::tracing_otel::init_logger_provider();
     let otel_logs_layer = logger_provider
         .as_ref()
         .map(crate::tracing_otel::logs_layer);
 
-    // GlitchTip: клиент ставится до subscriber'а, слой раскладывает события по
-    // каналам (issues / logs / performance) — см. `sentry_glitchtip`.
+    // GlitchTip: the client is installed before the subscriber, and the layer
+    // splits events across the channels (issues / logs / performance) — see
+    // `sentry_glitchtip`.
     let (sentry_guard, sentry_status) = crate::sentry_glitchtip::init();
     let sentry_layer = sentry_guard
         .as_ref()
@@ -132,7 +140,7 @@ pub fn init_subscriber() -> Telemetry {
         .with(sentry_layer)
         .init();
 
-    // Статусы печатаем только теперь: до `.init()` писать было некуда.
+    // The statuses are printed only now: before `.init()` there was nowhere to write.
     otel_status.log();
     otel_logs_status.log();
     sentry_status.log();
@@ -144,27 +152,27 @@ pub fn init_subscriber() -> Telemetry {
     }
 }
 
-/// Живые ресурсы телеметрии, которые нужно держать до конца работы процесса.
+/// The live telemetry resources that must be kept until the process ends.
 ///
-/// `sentry_guard` досылает накопленные события при уничтожении, поэтому его
-/// нельзя ронять сразу после инициализации; `tracer_provider` завершается явно
-/// через [`crate::tracing_otel::shutdown`].
+/// `sentry_guard` flushes the accumulated events when destroyed, so it must not
+/// be dropped right after initialisation; `tracer_provider` is shut down
+/// explicitly through [`crate::tracing_otel::shutdown`].
 pub struct Telemetry {
     pub tracer_provider: Option<SdkTracerProvider>,
-    /// Провайдер OTLP-логов; завершается через
-    /// [`crate::tracing_otel::shutdown_logs`], иначе последние логи не досылаются.
+    /// The OTLP log provider; shut down through
+    /// [`crate::tracing_otel::shutdown_logs`], or the last logs are never flushed.
     pub logger_provider: Option<SdkLoggerProvider>,
-    /// Читать это поле не нужно — оно живёт ради RAII: события GlitchTip
-    /// досылаются при уничтожении guard'а. Уроните его раньше времени — потеряете
-    /// накопленные события.
+    /// There is no need to read this field — it exists for RAII: GlitchTip
+    /// events are flushed when the guard is destroyed. Drop it early and the
+    /// accumulated events are lost.
     #[allow(dead_code)]
     pub sentry_guard: Option<sentry::ClientInitGuard>,
 }
 
-/// Проверяет, что пришедший извне `X-Request-Id` безопасен для повторного
-/// использования: непустой, не длиннее [`REQUEST_ID_MAX_LEN`] и состоит только из
-/// ASCII-букв/цифр и `-`/`_`. Иначе сгенерируем свой (защита от инъекций в лог и
-/// «мусорных» значений).
+/// Checks that an externally supplied `X-Request-Id` is safe to reuse: non-empty,
+/// no longer than [`REQUEST_ID_MAX_LEN`] and made only of ASCII letters, digits,
+/// `-` and `_`. Otherwise we generate our own (protection against log injection
+/// and junk values).
 fn is_valid_request_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= REQUEST_ID_MAX_LEN
@@ -173,8 +181,9 @@ fn is_valid_request_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Middleware-фабрика per-request логирования. Вешается один раз на уровне `App`
-/// (самый внешний слой), чтобы span покрывал auth/rate-limit/CORS и обработчик.
+/// The middleware factory for per-request logging. Installed once at the `App`
+/// level (the outermost layer) so that the span covers auth, rate limiting, CORS
+/// and the handler.
 pub struct RequestLog;
 
 impl<S, B> Transform<S, ServiceRequest> for RequestLog
@@ -195,7 +204,7 @@ where
     }
 }
 
-/// Собственно middleware: заводит span и логирует итог запроса.
+/// The middleware itself: it opens the span and logs the outcome of the request.
 pub struct RequestLogMiddleware<S> {
     service: Rc<S>,
 }
@@ -214,7 +223,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = self.service.clone();
 
-        // Берём пришедший `X-Request-Id`, если он валиден, иначе генерируем новый.
+        // Take the incoming `X-Request-Id` when it is valid, otherwise generate a new one.
         let request_id = req
             .headers()
             .get(REQUEST_ID_HEADER)
@@ -225,16 +234,17 @@ where
 
         let method = req.method().to_string();
         let path = req.path().to_string();
-        // best-effort IP клиента (с учётом realip actix); точный ключ rate-limit с
-        // доверенными прокси остаётся внутри `rate_limit.rs`.
+        // A best-effort client IP (honouring actix realip); the exact rate-limit
+        // key with trusted proxies stays inside `rate_limit.rs`.
         let client_ip = req
             .connection_info()
             .realip_remote_addr()
             .unwrap_or("-")
             .to_string();
 
-        // `access_level` заполняет auth-middleware изнутри (см. `auth.rs`),
-        // `status`/`latency_ms` — по завершении ниже. Объявляем их пустыми.
+        // `access_level` is filled in by the auth middleware from the inside
+        // (see `auth.rs`), and `status`/`latency_ms` on completion below. We
+        // declare them empty.
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
@@ -246,12 +256,13 @@ where
             latency_ms = tracing::field::Empty,
         );
 
-        // Если вызывающий сервис прислал `traceparent`, продолжаем его трассу —
-        // иначе span станет корнем новой (см. `tracing_otel`). Неудача склейки не
-        // повод отказывать в запросе: пишем в DEBUG и продолжаем без родителя.
+        // If the calling service sent a `traceparent`, we continue its trace —
+        // otherwise the span becomes the root of a new one (see `tracing_otel`).
+        // A failure to stitch is no reason to refuse the request: we write it at
+        // DEBUG and continue without a parent.
         if let Err(e) = span.set_parent(crate::tracing_otel::extract_parent_context(req.headers()))
         {
-            tracing::debug!("Не удалось связать span с входящей трассой: {e}");
+            tracing::debug!("Could not link the span to the incoming trace: {e}");
         }
 
         let response_id = request_id;
@@ -268,17 +279,18 @@ where
                 span.record("status", status);
                 span.record("latency_ms", latency_ms);
 
-                // Метрика запроса пишется здесь же: статус и латентность уже
-                // посчитаны, второй проход middleware не нужен. В лейбл идёт
-                // ШАБЛОН роута (`/tokens/{jti}`), а не фактический путь — иначе
-                // каждый `jti` порождал бы свою серию (см. `metrics.rs`).
+                // The request metric is written right here: the status and the
+                // latency are already computed and a second middleware pass is
+                // not needed. The label carries the route TEMPLATE
+                // (`/tokens/{jti}`), not the actual path — otherwise every `jti`
+                // would spawn its own series (see `metrics.rs`).
                 let endpoint = res
                     .request()
                     .match_pattern()
                     .unwrap_or_else(|| "unmatched".to_string());
                 crate::metrics::record_http_request(&method, &endpoint, status, elapsed);
 
-                // Эхо-заголовок `X-Request-Id` в ответ для сквозной трассировки.
+                // Echo the `X-Request-Id` header back for end-to-end tracing.
                 if let Ok(value) = HeaderValue::from_str(&response_id) {
                     res.response_mut()
                         .headers_mut()
@@ -323,8 +335,8 @@ mod tests {
         let rid = res
             .headers()
             .get(REQUEST_ID_HEADER)
-            .expect("X-Request-Id должен быть в ответе");
-        // Сгенерированный id — валидный UUID.
+            .expect("X-Request-Id must be present in the response");
+        // A generated id is a valid UUID.
         assert!(Uuid::parse_str(rid.to_str().unwrap()).is_ok());
     }
 

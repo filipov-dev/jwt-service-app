@@ -8,9 +8,9 @@ on:
   release:
     types: [published]
 
-# Собираем каждую платформу нативно (без QEMU): amd64 на обычном раннере,
-# arm64 — на ARM-раннере GitHub. Эмуляция QEMU давала segfault cc/collect2
-# при линковке openssl-* под aarch64 (JWT-5).
+# Every platform is built natively (no QEMU): amd64 on an ordinary runner and
+# arm64 on a GitHub ARM runner. QEMU emulation produced a cc/collect2 segfault
+# while linking openssl-* for aarch64 (JWT-5).
 env:
   DOCKERHUB_IMAGE: filipov/jwt-service-app
   GHCR_IMAGE: ghcr.io/filipov-dev/jwt-service-app
@@ -20,8 +20,8 @@ permissions:
   packages: write
 
 jobs:
-  # Шаг 1: собрать образ под каждую платформу на её нативном раннере и
-  # запушить его в оба реестра по digest (без тегов).
+  # Step 1: build the image for each platform on its native runner and push it
+  # to both registries by digest (without tags).
   build:
     strategy:
       fail-fast: false
@@ -39,8 +39,8 @@ jobs:
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
-      # persist-credentials: false — токен из `.git/config` ниже не нужен:
-      # в git по сети не ходит ни один шаг (см. ci.yml).
+      # persist-credentials: false — the token in `.git/config` is not needed
+      # below: no step talks to git over the network (see ci.yml).
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -68,16 +68,18 @@ jobs:
           platforms: ${{ matrix.platform }}
           file: ./deployments/prod/Dockerfile
           context: .
-          # Без аттестаций: иначе каждый образ заворачивается в manifest list,
-          # digest которого отличается между реестрами, и imagetools не находит
-          # его по общему digest при сборке multi-arch манифеста (JWT-5).
+          # No attestations: otherwise every image is wrapped in a manifest
+          # list whose digest differs between registries, and imagetools cannot
+          # find it by a shared digest when assembling the multi-arch manifest
+          # (JWT-5).
           provenance: false
           sbom: false
-          # Кеш слоёв между запусками CI через GitHub Actions cache. Слой с
-          # зависимостями (cargo chef cook) переиспользуется, пока не менялись
-          # Cargo.toml/Cargo.lock — повторная сборка не компилирует крейты заново.
-          # Scope разделён по платформам: amd64 и arm64 не должны затирать кеш
-          # друг друга. mode=max кеширует и промежуточные слои сборки.
+          # Layer cache between CI runs through the GitHub Actions cache. The
+          # dependency layer (cargo chef cook) is reused as long as
+          # Cargo.toml/Cargo.lock are unchanged — a rebuild does not compile the
+          # crates again. The scope is split per platform: amd64 and arm64 must
+          # not overwrite each other's cache. mode=max caches the intermediate
+          # build layers too.
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,scope=${{ env.PLATFORM_PAIR }},mode=max
           outputs: |
@@ -98,8 +100,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Шаг 2: собрать из пуш-нутых по digest образов multi-arch манифест и
-  # проставить теги (версия из Cargo.toml + latest) в обоих реестрах.
+  # Step 2: assemble a multi-arch manifest from the images pushed by digest and
+  # set the tags (the version from Cargo.toml plus latest) in both registries.
   merge:
     runs-on: ubuntu-latest
     needs:

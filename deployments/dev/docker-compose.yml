@@ -17,19 +17,20 @@ services:
       TOKEN_EXPIRATION_SECONDS: 3600
       REDIS_URL: redis://redis:6379
       JWKS_SERVICE_URL: http://jwks-service-app:8082
-      # Секреты уровней доступа обязательны — без них сервис не стартует.
-      # Значения ниже — ТОЛЬКО для локального dev-стенда, не для боевого окружения.
+      # The access level secrets are mandatory — without them the service does
+      # not start. The values below are ONLY for the local dev stand, never for
+      # production.
       AUTH_PROXY_SECRET: dev-proxy-secret
-      # Произвольный валидный base32-секрет для dev (замените в проде).
+      # An arbitrary valid base32 secret for dev (replace it in production).
       AUTH_TOTP_SECRET: MRSWGYLSMUQGO33WNFXGO4ZAOBWGKYLSFVRW63LOMNXW2ZI
-      # Уровень 4: Bearer-токен для скрейпа /metrics (замените в проде).
+      # Level 4: the bearer token for scraping /metrics (replace it in production).
       AUTH_METRICS_TOKEN: dev-metrics-token
     depends_on:
       - redis
       - jwks-service-app
     healthcheck:
-      # /livez — liveness; /readyz также доступен для проверки зависимостей.
-      # start_period даёт время на первую сборку/запуск (cargo watch).
+      # /livez is liveness; /readyz is also available to check the dependencies.
+      # start_period allows for the first build and start (cargo watch).
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/livez"]
       interval: 30s
       timeout: 5s

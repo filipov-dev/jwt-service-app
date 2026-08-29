@@ -1,17 +1,18 @@
-# Единый тулчейн для локальной разработки и CI. Без этого файла локальный clippy
-# мог быть любой версии: правка `manual_option_zip` в JWT-31 прошла на 1.94 и
-# упала в пайплайне на 1.97 — линт появился между версиями.
+# One toolchain for local development and CI. Without this file the local clippy
+# could be any version: the `manual_option_zip` fix in JWT-31 passed on 1.94 and
+# failed in the pipeline on 1.97 — the lint appeared between those versions.
 #
-# `stable` (а не фиксированная версия) — потому что CI ставит именно свежий
-# stable (`dtolnay/rust-toolchain@stable`), и пин здесь означал бы расхождение с
-# пайплайном ровно в обратную сторону.
+# `stable` (rather than a pinned version) because CI installs exactly the latest
+# stable (`dtolnay/rust-toolchain@stable`), and a pin here would mean a
+# divergence from the pipeline in the opposite direction.
 #
-# ВАЖНО: файл гарантирует канал и компоненты, но НЕ обновляет уже установленный
-# stable — rustup молча возьмёт локальную копию, даже если она полугодовой
-# давности. Перед прогоном линта: `rustup update stable`.
+# IMPORTANT: the file guarantees the channel and the components but does NOT
+# update an already installed stable — rustup silently takes the local copy even
+# if it is six months old. Before running the linter: `rustup update stable`.
 #
-# Docker-сборки этот файл намеренно обходят через `RUSTUP_TOOLCHAIN` (prod) или
-# заранее установленный stable в образе (dev) — см. `deployments/*/Dockerfile`.
+# Docker builds deliberately bypass this file through `RUSTUP_TOOLCHAIN` (prod)
+# or a stable installed in advance in the image (dev) — see
+# `deployments/*/Dockerfile`.
 [toolchain]
 channel = "stable"
 components = ["clippy", "rustfmt"]

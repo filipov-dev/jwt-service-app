@@ -1,61 +1,64 @@
-name: Предложение
-description: Не хватает возможности или хочется изменить поведение
+name: Proposal
+description: Something is missing, or the behaviour should change
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Полезнее всего описать **задачу**, а не только желаемую реализацию:
-        так у неё может найтись решение дешевле предложенного.
+        The most useful thing you can describe is the **problem**, not just the
+        implementation you have in mind: there may be a cheaper solution to it.
 
-        Учтите границы проекта: сервис выпускает, проверяет и отзывает JWT. Он
-        не генерирует и не хранит ключи (это `jwks-service-app`), не
-        терминирует TLS (это обратный прокси) и не заводит пользователей.
+        Keep the boundaries of the project in mind: the service issues, verifies
+        and revokes JWTs. It does not generate or store keys (that is
+        `jwks-service-app`), it does not terminate TLS (that is the reverse
+        proxy) and it does not manage users.
 
   - type: textarea
     id: problem
     attributes:
-      label: Какую задачу решаете
-      description: Что вы пытаетесь сделать и обо что упёрлись сейчас.
+      label: What problem are you solving
+      description: What you are trying to do and what you ran into.
     validations:
       required: true
 
   - type: textarea
     id: proposal
     attributes:
-      label: Что предлагаете
+      label: What you propose
       description: >-
-        Ручка, поле в теле запроса, переменная окружения — насколько конкретно
-        получается. Если меняется контракт API, покажите запрос и ответ.
+        An endpoint, a field in the request body, an environment variable — as
+        concretely as you can. If the API contract changes, show the request and
+        the response.
     validations:
       required: true
 
   - type: textarea
     id: alternatives
     attributes:
-      label: Что пробовали вместо этого
+      label: What you tried instead
       description: >-
-        Обходные пути, которые уже есть, и чем они не устроили. Пустой раздел —
-        частая причина отказа: возможно, решение уже существует.
+        The workarounds that already exist and why they did not do. An empty
+        section is a common reason for a rejection: the solution may exist
+        already.
     validations:
       required: false
 
   - type: dropdown
     id: compat
     attributes:
-      label: Совместимость
-      description: Ломает ли предложение существующее поведение.
+      label: Compatibility
+      description: Whether the proposal breaks existing behaviour.
       options:
-        - Обратно совместимо
-        - Ломает совместимость (API, формат токенов, конфигурация)
-        - Не знаю
+        - Backwards compatible
+        - Breaks compatibility (API, token format, configuration)
+        - Not sure
     validations:
       required: true
 
   - type: checkboxes
     id: contribution
     attributes:
-      label: Участие
+      label: Contribution
       options:
-        - label: Готов прислать pull request
+        - label: I am willing to send a pull request
           required: false

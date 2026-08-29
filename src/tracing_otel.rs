@@ -1,29 +1,31 @@
-//! Распределённый трейсинг через OpenTelemetry (OTLP).
+//! Distributed tracing through OpenTelemetry (OTLP).
 //!
-//! Слой поверх той же `tracing`-шины, что и логи (см. [`crate::logging`]): span'ы
-//! запросов и обращений к зависимостям уходят по OTLP в OpenTelemetry Collector,
-//! откуда их забирает Monium (или любой другой backend — Jaeger, Tempo).
+//! A layer over the same `tracing` bus as the logs (see [`crate::logging`]): the
+//! spans of requests and of calls to dependencies go over OTLP to an
+//! OpenTelemetry Collector, from which Monium (or any other backend — Jaeger,
+//! Tempo) picks them up.
 //!
-//! ## Включение
+//! ## Enabling
 //!
-//! Только при заданном `OTEL_EXPORTER_OTLP_ENDPOINT` (стандартная переменная
-//! OpenTelemetry, её же понимают агенты и коллекторы). Не задана — трейсинг
-//! выключен, сервис работает как прежде.
+//! Only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (the standard OpenTelemetry
+//! variable, understood by agents and collectors alike). Unset means tracing is
+//! off and the service works as before.
 //!
-//! **Не fail-fast.** В отличие от auth-секретов, ошибка настройки экспортёра не
-//! роняет сервис: пишем предупреждение и продолжаем без трейсинга. Телеметрия не
-//! должна быть причиной недоступности сервиса.
+//! **Not fail-fast.** Unlike the auth secrets, a misconfigured exporter does not
+//! bring the service down: we write a warning and continue without tracing.
+//! Telemetry must never be a cause of service unavailability.
 //!
 //! ## Propagation
 //!
-//! Входящий заголовок `traceparent` (W3C Trace Context) подхватывается в
-//! [`crate::logging::RequestLog`], исходящие запросы к `jwks-service-app`
-//! получают свой `traceparent` — так трасса продолжается сквозь сервисы.
+//! The incoming `traceparent` header (W3C Trace Context) is picked up in
+//! [`crate::logging::RequestLog`], and outgoing requests to `jwks-service-app`
+//! get their own `traceparent` — that is how a trace continues across services.
 //!
-//! ## Транспорт
+//! ## Transport
 //!
-//! OTLP поверх HTTP/protobuf (у коллектора это обычно порт **4318**), а не gRPC:
-//! `reqwest` уже есть в зависимостях, поэтому tonic/gRPC-стек не тянем.
+//! OTLP over HTTP/protobuf (usually port **4318** on the collector) rather than
+//! gRPC: `reqwest` is already among the dependencies, so we do not pull in the
+//! tonic/gRPC stack.
 
 use std::env;
 use std::time::Duration;
@@ -37,40 +39,40 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing::warn;
 
-/// Имя переменной с адресом OTLP-коллектора (стандарт OpenTelemetry).
+/// Name of the variable holding the OTLP collector address (an OpenTelemetry standard).
 const ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
-/// Имя сервиса в трейсах; переопределяется `OTEL_SERVICE_NAME`.
+/// Service name in traces; overridden by `OTEL_SERVICE_NAME`.
 const DEFAULT_SERVICE_NAME: &str = "jwt-service-app";
 
-/// Таймаут экспорта: коллектор не должен подвешивать сервис.
+/// Export timeout: the collector must not hang the service.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Переменная с полным URL именно для трейсов (стандарт OpenTelemetry).
+/// The variable holding the full URL specifically for traces (an OpenTelemetry standard).
 const TRACES_ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
-/// Переменная с полным URL именно для логов (стандарт OpenTelemetry).
+/// The variable holding the full URL specifically for logs (an OpenTelemetry standard).
 const LOGS_ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 
-/// Флаг включения отправки логов по OTLP.
+/// The flag enabling log export over OTLP.
 const LOGS_ENABLED_VAR: &str = "OTEL_LOGS_ENABLED";
 
-/// Путь сигнала трейсов в OTLP/HTTP.
+/// The traces signal path in OTLP/HTTP.
 const TRACES_PATH: &str = "/v1/traces";
 
-/// Путь сигнала логов в OTLP/HTTP.
+/// The logs signal path in OTLP/HTTP.
 const LOGS_PATH: &str = "/v1/logs";
 
-/// Вычисляет URL сигнала по правилам спецификации OpenTelemetry:
+/// Computes the signal URL by the rules of the OpenTelemetry specification:
 ///
-/// - переменная сигнала (`..._TRACES_ENDPOINT` / `..._LOGS_ENDPOINT`) — **полный**
-///   URL, используется как есть;
-/// - `OTEL_EXPORTER_OTLP_ENDPOINT` — **базовый** URL, к нему добавляется путь
-///   сигнала (`/v1/traces`, `/v1/logs`).
+/// - the signal variable (`..._TRACES_ENDPOINT` / `..._LOGS_ENDPOINT`) is the
+///   **full** URL and is used as is;
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT` is the **base** URL, to which the signal path
+///   is appended (`/v1/traces`, `/v1/logs`).
 ///
-/// Различие принципиально: в OTLP/HTTP запрос уходит по точному адресу, и если
-/// послать базовый URL как есть, коллектор ответит `404`, а данные будут молча
-/// теряться.
+/// The distinction matters: in OTLP/HTTP the request goes to an exact address,
+/// and sending the base URL as is makes the collector answer `404` while the
+/// data is silently lost.
 fn signal_endpoint(signal: Option<String>, base: Option<String>, path: &str) -> Option<String> {
     if let Some(signal) = signal
         .map(|s| s.trim().to_string())
@@ -85,7 +87,7 @@ fn signal_endpoint(signal: Option<String>, base: Option<String>, path: &str) -> 
     Some(format!("{}{path}", base.trim_end_matches('/')))
 }
 
-/// Читает булев флаг из окружения (`true`/`1`/`yes`).
+/// Reads a boolean flag from the environment (`true`/`1`/`yes`).
 fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
@@ -93,31 +95,32 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// Исход настройки трейсинга.
+/// The outcome of the tracing setup.
 ///
-/// Отдельный тип нужен, потому что [`init_tracer_provider`] вызывается **до**
-/// установки глобального `tracing`-subscriber'а: залогируй мы прямо там, сообщение
-/// было бы потеряно (писать ещё некуда). Поэтому статус возвращается наружу и
-/// печатается через [`Status::log`] уже после инициализации subscriber'а.
+/// A separate type is needed because [`init_tracer_provider`] is called
+/// **before** the global `tracing` subscriber is installed: logging right there
+/// would lose the message (there is nowhere to write yet). So the status is
+/// returned to the caller and printed through [`Status::log`] once the
+/// subscriber is initialised.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` не задан — трейсинг выключен.
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is unset — tracing is off.
     Disabled,
-    /// Экспорт настроен.
+    /// Export is configured.
     Enabled {
         endpoint: String,
         service_name: String,
     },
-    /// Экспортёр не построился; сервис продолжает работу без трейсинга.
+    /// The exporter could not be built; the service keeps running without tracing.
     Failed { endpoint: String, error: String },
 }
 
 impl Status {
-    /// Пишет статус в лог. Вызывать после установки subscriber'а.
+    /// Writes the status to the log. Call it after the subscriber is installed.
     pub fn log(&self) {
         match self {
             Status::Disabled => {
-                tracing::debug!("OpenTelemetry: трейсинг выключен ({ENDPOINT_VAR} не задан)");
+                tracing::debug!("OpenTelemetry: tracing disabled ({ENDPOINT_VAR} is not set)");
             }
             Status::Enabled {
                 endpoint,
@@ -126,24 +129,24 @@ impl Status {
                 tracing::info!(
                     endpoint = %endpoint,
                     service_name = %service_name,
-                    "OpenTelemetry: OTLP-экспорт трейсов включён"
+                    "OpenTelemetry: OTLP trace export enabled"
                 );
             }
             Status::Failed { endpoint, error } => {
-                warn!("OTLP-экспортёр не построен ({endpoint}), трейсинг выключен: {error}");
+                warn!("OTLP exporter not built ({endpoint}), tracing disabled: {error}");
             }
         }
     }
 }
 
-/// Настраивает OTLP-экспорт трейсов, если задан `OTEL_EXPORTER_OTLP_ENDPOINT`.
+/// Configures OTLP trace export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 ///
-/// Возвращает провайдер (его нужно держать живым до конца работы процесса и
-/// корректно завершить через [`shutdown`]) — либо `None`, если трейсинг выключен
-/// или экспортёр не построился.
+/// Returns the provider (which must be kept alive until the process ends and
+/// shut down properly through [`shutdown`]) — or `None` when tracing is off or
+/// the exporter could not be built.
 ///
-/// Побочный эффект: устанавливает глобальный W3C-propagator, чтобы работали
-/// `traceparent`-заголовки.
+/// Side effect: it installs the global W3C propagator so that `traceparent`
+/// headers work.
 pub fn init_tracer_provider() -> (Option<SdkTracerProvider>, Status) {
     let Some(endpoint) = signal_endpoint(
         env::var(TRACES_ENDPOINT_VAR).ok(),
@@ -164,7 +167,7 @@ pub fn init_tracer_provider() -> (Option<SdkTracerProvider>, Status) {
     {
         Ok(exporter) => exporter,
         Err(e) => {
-            // Не fail-fast: телеметрия не повод не стартовать.
+            // Not fail-fast: telemetry is no reason to refuse to start.
             return (
                 None,
                 Status::Failed {
@@ -187,7 +190,7 @@ pub fn init_tracer_provider() -> (Option<SdkTracerProvider>, Status) {
         .with_resource(resource)
         .build();
 
-    // W3C Trace Context: понимает `traceparent`/`tracestate`.
+    // W3C Trace Context: it understands `traceparent`/`tracestate`.
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     (
@@ -199,7 +202,7 @@ pub fn init_tracer_provider() -> (Option<SdkTracerProvider>, Status) {
     )
 }
 
-/// Строит `tracing`-слой поверх провайдера.
+/// Builds the `tracing` layer over the provider.
 pub fn layer<S>(
     provider: &SdkTracerProvider,
 ) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
@@ -209,17 +212,17 @@ where
     tracing_opentelemetry::layer().with_tracer(provider.tracer(DEFAULT_SERVICE_NAME))
 }
 
-/// Настраивает OTLP-экспорт **логов**, если он включён.
+/// Configures OTLP export of **logs** when it is enabled.
 ///
-/// Условия включения — оба сразу:
-/// - задан адрес коллектора (`OTEL_EXPORTER_OTLP_ENDPOINT` или
+/// Both conditions must hold:
+/// - a collector address is set (`OTEL_EXPORTER_OTLP_ENDPOINT` or
 ///   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`);
-/// - выставлен `OTEL_LOGS_ENABLED=true`.
+/// - `OTEL_LOGS_ENABLED=true` is set.
 ///
-/// Отдельный флаг нужен намеренно: логи и так пишутся в stdout, и там, где их уже
-/// собирает агент с контейнерного лога, отправка по OTLP была бы дублированием
-/// (и оплаченным трафиком). Поэтому включение трейсов **не** включает логи
-/// автоматически.
+/// The separate flag is deliberate: logs go to stdout anyway, and where an agent
+/// already collects them from the container log, sending them over OTLP would be
+/// duplication (and paid-for traffic). So enabling traces does **not** enable
+/// logs automatically.
 pub fn init_logger_provider() -> (Option<SdkLoggerProvider>, LogsStatus) {
     if !env_bool(LOGS_ENABLED_VAR, false) {
         return (None, LogsStatus::Disabled);
@@ -269,7 +272,7 @@ pub fn init_logger_provider() -> (Option<SdkLoggerProvider>, LogsStatus) {
     (Some(provider), LogsStatus::Enabled { endpoint })
 }
 
-/// Строит `tracing`-слой, отправляющий события в OTLP-логи.
+/// Builds the `tracing` layer that sends events to the OTLP logs.
 pub fn logs_layer(
     provider: &SdkLoggerProvider,
 ) -> opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<
@@ -279,53 +282,53 @@ pub fn logs_layer(
     opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(provider)
 }
 
-/// Досылает накопленные логи и корректно завершает провайдер.
+/// Flushes the accumulated logs and shuts the provider down properly.
 pub fn shutdown_logs(provider: SdkLoggerProvider) {
     if let Err(e) = provider.shutdown() {
-        warn!("OpenTelemetry: не удалось корректно завершить экспорт логов: {e}");
+        warn!("OpenTelemetry: could not shut log export down cleanly: {e}");
     }
 }
 
-/// Исход настройки OTLP-экспорта логов.
+/// The outcome of the OTLP log export setup.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LogsStatus {
-    /// `OTEL_LOGS_ENABLED` не выставлен — логи идут только в stdout.
+    /// `OTEL_LOGS_ENABLED` is unset — logs go to stdout only.
     Disabled,
-    /// Логи включены, но адрес коллектора не задан.
+    /// Logs are enabled but no collector address is set.
     NoEndpoint,
-    /// Экспорт настроен.
+    /// Export is configured.
     Enabled { endpoint: String },
-    /// Экспортёр не построился; сервис работает без OTLP-логов.
+    /// The exporter could not be built; the service runs without OTLP logs.
     Failed { endpoint: String, error: String },
 }
 
 impl LogsStatus {
-    /// Пишет статус в лог. Вызывать после установки subscriber'а.
+    /// Writes the status to the log. Call it after the subscriber is installed.
     pub fn log(&self) {
         match self {
             LogsStatus::Disabled => {
                 tracing::debug!(
-                    "OpenTelemetry: отправка логов по OTLP выключена \
-                     ({LOGS_ENABLED_VAR} не выставлен); логи идут в stdout"
+                    "OpenTelemetry: log export over OTLP disabled \
+                     ({LOGS_ENABLED_VAR} is not set); logs go to stdout"
                 );
             }
             LogsStatus::NoEndpoint => {
                 warn!(
-                    "{LOGS_ENABLED_VAR}=true, но адрес коллектора не задан \
-                     ({ENDPOINT_VAR}/{LOGS_ENDPOINT_VAR}) — логи по OTLP не отправляются"
+                    "{LOGS_ENABLED_VAR}=true but no collector address is set \
+                     ({ENDPOINT_VAR}/{LOGS_ENDPOINT_VAR}) — logs are not sent over OTLP"
                 );
             }
             LogsStatus::Enabled { endpoint } => {
-                tracing::info!(endpoint = %endpoint, "OpenTelemetry: OTLP-экспорт логов включён");
+                tracing::info!(endpoint = %endpoint, "OpenTelemetry: OTLP log export enabled");
             }
             LogsStatus::Failed { endpoint, error } => {
-                warn!("OTLP-экспортёр логов не построен ({endpoint}), логи по OTLP выключены: {error}");
+                warn!("OTLP log exporter not built ({endpoint}), OTLP logs disabled: {error}");
             }
         }
     }
 }
 
-/// Адаптер actix-заголовков для W3C-propagator'а (чтение `traceparent`).
+/// An adapter of actix headers for the W3C propagator (reading `traceparent`).
 struct HeaderExtractor<'a>(&'a actix_web::http::header::HeaderMap);
 
 impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
@@ -338,18 +341,18 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
     }
 }
 
-/// Достаёт родительский трейс-контекст из заголовков входящего запроса.
+/// Extracts the parent trace context from the headers of an incoming request.
 ///
-/// Если вызывающий сервис прислал `traceparent`, наш span станет его потомком —
-/// так трасса склеивается сквозь границы сервисов. Нет заголовка (или трейсинг
-/// выключен) — вернётся пустой контекст, и span будет корневым.
+/// If the calling service sent a `traceparent`, our span becomes its child —
+/// that is how a trace is stitched across service boundaries. Without the header
+/// (or with tracing off) an empty context is returned and the span is a root.
 pub fn extract_parent_context(
     headers: &actix_web::http::header::HeaderMap,
 ) -> opentelemetry::Context {
     global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)))
 }
 
-/// Адаптер `reqwest`-заголовков для записи `traceparent` в исходящий запрос.
+/// An adapter of `reqwest` headers for writing `traceparent` into an outgoing request.
 struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
 
 impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
@@ -363,11 +366,11 @@ impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
     }
 }
 
-/// Добавляет к исходящему запросу заголовки трейс-контекста текущего span'а.
+/// Adds the trace context headers of the current span to an outgoing request.
 ///
-/// Благодаря этому обращения к `jwks-service-app` попадают в ту же трассу, что и
-/// обслуживаемый HTTP-запрос. Если трейсинг выключен, propagator по умолчанию
-/// ничего не пишет — накладных расходов нет.
+/// Thanks to this, calls to `jwks-service-app` land in the same trace as the
+/// HTTP request being served. When tracing is off the default propagator writes
+/// nothing — there is no overhead.
 pub fn inject_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -380,12 +383,12 @@ pub fn inject_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuild
     builder.headers(headers)
 }
 
-/// Досылает накопленные span'ы и корректно завершает провайдер.
+/// Flushes the accumulated spans and shuts the provider down properly.
 ///
-/// Вызывать при остановке сервиса, иначе последние трейсы потеряются.
+/// Call it when the service stops, or the last traces are lost.
 pub fn shutdown(provider: SdkTracerProvider) {
     if let Err(e) = provider.shutdown() {
-        warn!("OpenTelemetry: не удалось корректно завершить экспорт трейсов: {e}");
+        warn!("OpenTelemetry: could not shut trace export down cleanly: {e}");
     }
 }
 
@@ -394,18 +397,18 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Тесты трогают глобальные env — сериализуем.
+    /// The tests touch global env vars — serialise them.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn appends_signal_path_to_base_endpoint() {
-        // Базовый URL: путь сигнала обязателен, иначе коллектор ответит 404 и
-        // трейсы будут молча теряться.
+        // A base URL: the signal path is mandatory, otherwise the collector
+        // answers 404 and the traces are silently lost.
         assert_eq!(
             signal_endpoint(None, Some("http://collector:4318".into()), TRACES_PATH),
             Some("http://collector:4318/v1/traces".into())
         );
-        // Хвостовой слэш не должен давать двойной.
+        // A trailing slash must not produce a double one.
         assert_eq!(
             signal_endpoint(None, Some("http://collector:4318/".into()), TRACES_PATH),
             Some("http://collector:4318/v1/traces".into())
@@ -414,8 +417,8 @@ mod tests {
 
     #[test]
     fn appends_logs_path_for_logs_signal() {
-        // Тот же механизм, другой путь сигнала: без `/v1/logs` коллектор ответит
-        // 404 и логи будут теряться молча.
+        // The same mechanism with a different signal path: without `/v1/logs`
+        // the collector answers 404 and the logs are silently lost.
         assert_eq!(
             signal_endpoint(None, Some("http://collector:4318".into()), LOGS_PATH),
             Some("http://collector:4318/v1/logs".into())
@@ -424,7 +427,7 @@ mod tests {
 
     #[test]
     fn signal_endpoint_is_used_as_is() {
-        // Полный URL сигнала имеет приоритет и не дополняется.
+        // The full signal URL takes precedence and is not appended to.
         assert_eq!(
             signal_endpoint(
                 Some("http://collector:4318/custom/traces".into()),
@@ -446,8 +449,9 @@ mod tests {
 
     #[test]
     fn logs_disabled_without_flag() {
-        // Включённые трейсы НЕ включают логи автоматически — нужен явный флаг,
-        // иначе дублировали бы stdout-логи там, где их собирает агент.
+        // Enabled traces do NOT enable logs automatically — an explicit flag is
+        // needed, otherwise we would duplicate stdout logs where an agent
+        // collects them.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::remove_var(LOGS_ENABLED_VAR);
         env::set_var(ENDPOINT_VAR, "http://collector:4318");
@@ -459,7 +463,7 @@ mod tests {
 
     #[test]
     fn logs_enabled_without_endpoint_warns() {
-        // Флаг есть, адреса нет — деградируем с предупреждением, а не молча.
+        // The flag is there but the address is not — degrade with a warning rather than silently.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::remove_var(ENDPOINT_VAR);
         env::remove_var(LOGS_ENDPOINT_VAR);
@@ -478,7 +482,7 @@ mod tests {
         let (provider, status) = init_tracer_provider();
         assert!(
             provider.is_none(),
-            "без {ENDPOINT_VAR} трейсинг должен быть выключен"
+            "without {ENDPOINT_VAR} tracing must be disabled"
         );
         assert_eq!(status, Status::Disabled);
     }
@@ -490,7 +494,7 @@ mod tests {
         env::set_var(ENDPOINT_VAR, "   ");
         let (provider, status) = init_tracer_provider();
         env::remove_var(ENDPOINT_VAR);
-        assert!(provider.is_none(), "пустое значение = трейсинг выключен");
+        assert!(provider.is_none(), "an empty value means tracing is off");
         assert_eq!(status, Status::Disabled);
     }
 }

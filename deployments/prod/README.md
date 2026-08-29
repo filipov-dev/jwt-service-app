@@ -1,50 +1,51 @@
 # jwt-service-app
 
-Сервис выпуска, проверки и отзыва JWT. Подпись — RS/ES/EdDSA или HMAC, ключи
-берутся из внешнего jwks-service-app, выданные `jti` и refresh-токены хранятся
-в Redis.
+A service that issues, verifies and revokes JWTs. Signing with RS/ES/EdDSA or
+HMAC, the keys come from an external jwks-service-app, and the issued `jti`
+values and refresh tokens are stored in Redis.
 
-Исходники и полная документация —
+The sources and the full documentation are at
 [github.com/filipov-dev/jwt-service-app](https://github.com/filipov-dev/jwt-service-app).
 
 ```
 docker pull filipov/jwt-service-app:1.13.4
 ```
 
-Образ multi-arch (`linux/amd64`, `linux/arm64`), публикуется в Docker Hub и
-`ghcr.io/filipov-dev/jwt-service-app`. Тег `latest` есть, но для боевого стенда
-пинуйте версию: откат с `latest` сводится к надежде, что реестр ещё помнит
-прошлый образ.
+The image is multi-arch (`linux/amd64`, `linux/arm64`) and is published to
+Docker Hub and to `ghcr.io/filipov-dev/jwt-service-app`. A `latest` tag exists,
+but pin a version for a production deployment: rolling back from `latest` comes
+down to hoping the registry still remembers the previous image.
 
-## Зависимости
+## Dependencies
 
-Сервису нужны **Redis** и **jwks-service-app**. Без них он стартует, но
-`GET /readyz` отдаёт `503` и трафик на под слать рано. Недоступность сервиса
-ключей проба считает отказом только тогда, когда в памяти нет и пригодного
-снимка JWKS: пока он есть, проверка токенов работает, а состояние отдаётся как
-`degraded`.
+The service needs **Redis** and **jwks-service-app**. Without them it still
+starts, but `GET /readyz` answers `503` and it is too early to route traffic to
+the pod. An unavailable key service counts as a failure only when there is no
+usable JWKS snapshot in memory either: while there is one, token verification
+works and the state is reported as `degraded`.
 
-## Ручки и уровни доступа
+## Endpoints and access levels
 
-| Уровень | Ручки | Чем закрыто |
+| Level | Endpoints | Protection |
 |---|---|---|
-| 1 — открыт | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | ничем |
-| 2 — proxy-secret | `POST /tokens/verify` | заголовок `X-Proxy-Secret` |
-| 3 — TOTP | `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | заголовок `X-TOTP-Code` |
-| 4 — Bearer | `GET /metrics` | `Authorization: Bearer` |
+| 1 — open | `GET /livez`, `GET /readyz`, `GET /api-docs/openapi.json` | none |
+| 2 — proxy secret | `POST /tokens/verify` | the `X-Proxy-Secret` header |
+| 3 — TOTP | `POST /tokens`, `POST /tokens/refresh`, `DELETE /tokens/{jti}`, `DELETE /subjects/{sub}/tokens` | the `X-TOTP-Code` header |
+| 4 — bearer | `GET /metrics` | `Authorization: Bearer` |
 
-**Уровень 2 держится на обратном прокси.** Прокси ставит `X-Proxy-Secret` и
-**обязан затирать клиентскую версию заголовка** — иначе секрет подставят снаружи
-и уровень будет обойдён. Готовые конфиги на 10 прокси (nginx, Traefik, HAProxy,
-Envoy, Caddy, Apache, Kong, AWS ALB, Cloudflare, NGINX Ingress) —
-в [docs/proxy/](https://github.com/filipov-dev/jwt-service-app/tree/master/docs/proxy).
-Отсюда же следует, что порт контейнера не надо публиковать наружу напрямую:
-прямой доступ обходит прокси, а значит и уровень 2.
+**Level 2 rests on the reverse proxy.** The proxy sets `X-Proxy-Secret` and
+**must strip the client-supplied version of the header** — otherwise the secret
+can be injected from the outside and the level is bypassed. Ready-made
+configurations for 10 proxies (nginx, Traefik, HAProxy, Envoy, Caddy, Apache,
+Kong, AWS ALB, Cloudflare, NGINX Ingress) are in
+[docs/proxy/](https://github.com/filipov-dev/jwt-service-app/tree/master/docs/proxy).
+It follows that the container port must not be published directly: direct access
+bypasses the proxy, and therefore level 2.
 
-Клиентские примеры для уровня 3 на 30 языках —
-в [docs/clients/](https://github.com/filipov-dev/jwt-service-app/tree/master/docs/clients).
+Client examples for level 3 in 30 languages are in
+[docs/clients/](https://github.com/filipov-dev/jwt-service-app/tree/master/docs/clients).
 
-## Быстрый старт
+## Quick start
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -56,54 +57,56 @@ docker run --rm -p 8080:8080 \
   filipov/jwt-service-app:1.13.4
 ```
 
-`HOST=0.0.0.0` обязателен: дефолт `127.0.0.1` слушает только петлю внутри
-контейнера и снаружи недоступен. `AUTH_PROXY_SECRET` и `AUTH_TOTP_SECRET`
-обязательны — без них сервис не стартует намеренно, чтобы защиты нельзя было
-«забыть» включить.
+`HOST=0.0.0.0` is required: the default `127.0.0.1` listens only on the loopback
+inside the container and is unreachable from outside. `AUTH_PROXY_SECRET` and
+`AUTH_TOTP_SECRET` are required — without them the service deliberately does not
+start, so that the protection cannot be "forgotten".
 
-`iss` в токене берётся из заголовка `Host` запроса, а не из конфига.
+The `iss` of a token comes from the `Host` header of the request, not from the
+configuration.
 
-## Готовые манифесты
+## Ready-made manifests
 
-Оба варианта лежат в
+Both options live in
 [deployments/prod/](https://github.com/filipov-dev/jwt-service-app/tree/master/deployments/prod):
 
-**Docker Compose** — сервис и Redis, секреты из `.env`:
+**Docker Compose** — the service and Redis, with the secrets from `.env`:
 
 ```bash
-cp .env.example .env   # заполнить секреты
+cp .env.example .env   # fill in the secrets
 docker compose -p jwt-prod --env-file .env up -d
 ```
 
-**Kubernetes** — Deployment (3 реплики), Service, PodDisruptionBudget,
-NetworkPolicy, образец Secret:
+**Kubernetes** — a Deployment (3 replicas), a Service, a PodDisruptionBudget, a
+NetworkPolicy and a sample Secret:
 
 ```bash
 kubectl apply -k deployments/prod/k8s/
 ```
 
-Пробы: `livenessProbe` на `/livez`, `readinessProbe` на `/readyz`. Разделение
-принципиальное — `/livez` не ходит в зависимости, поэтому недоступный Redis
-выводит под из балансировки, но не устраивает ему цикл перезапусков.
+The probes: `livenessProbe` on `/livez`, `readinessProbe` on `/readyz`. The split
+is fundamental — `/livez` does not touch the dependencies, so an unavailable
+Redis takes the pod out of the load balancer without putting it into a restart
+loop.
 
-Три реплики держатся живыми двумя настройками сразу:
-`topologySpreadConstraints` разносят поды по узлам и зонам, а PDB с
-`minAvailable: 2` заставляет drain узла отпускать их по одному. Жёсткий разнос
-по узлам ждёт кластера минимум из трёх узлов — на меньшем поменяйте
-`whenUnsatisfiable` на `ScheduleAnyway`, иначе лишние реплики зависнут в
-`Pending`. Меняете число реплик — пересчитайте и `minAvailable`.
+Three replicas are kept alive by two settings at once:
+`topologySpreadConstraints` spread the pods across nodes and zones, and the PDB
+with `minAvailable: 2` forces a node drain to release them one at a time. A hard
+spread across nodes expects a cluster of at least three nodes — on a smaller one
+change `whenUnsatisfiable` to `ScheduleAnyway`, or the extra replicas hang in
+`Pending`. Change the replica count and recompute `minAvailable` too.
 
-NetworkPolicy закрепляет то же, что сказано выше словами: до порта 8080
-достают только ingress-контроллер и скрейпер метрик, остальным подам кластера
-он недоступен. Имена namespace и меток там кластерозависимы — правьте под свой
-стенд. Учтите, что политику исполняет CNI: плагин без её поддержки примет
-манифест молча и не сделает ничего.
+The NetworkPolicy enforces what was said in prose above: only the ingress
+controller and the metrics scraper can reach port 8080, and the rest of the
+cluster's pods cannot. The namespace and label names there are cluster-specific —
+edit them for your stand. Note that the policy is enforced by the CNI: a plugin
+without support for it accepts the manifest silently and does nothing.
 
-## Healthcheck своими силами
+## Rolling your own healthcheck
 
-В образе **нет ни `curl`, ни `wget`** — только рантайм-библиотеки и `bash`.
-Готовый healthcheck для compose делает HTTP-запрос через встроенный в bash
-`/dev/tcp`:
+The image has **neither `curl` nor `wget`** — only the runtime libraries and
+`bash`. The ready-made healthcheck for Compose makes its HTTP request through
+bash's built-in `/dev/tcp`:
 
 ```yaml
 healthcheck:
@@ -114,51 +117,53 @@ healthcheck:
     - 'exec 3<>/dev/tcp/127.0.0.1/8080; printf "GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; grep -q "200 OK" <&3'
 ```
 
-В Kubernetes это не нужно: `httpGet`-пробы выполняет kubelet снаружи контейнера.
+In Kubernetes this is unnecessary: `httpGet` probes are executed by the kubelet
+outside the container.
 
-## Конфигурация
+## Configuration
 
-Полная таблица переменных окружения —
-в [AGENTS.md](https://github.com/filipov-dev/jwt-service-app/blob/master/AGENTS.md).
-Что важно не пропустить в проде:
+The full table of environment variables is in
+[AGENTS.md](https://github.com/filipov-dev/jwt-service-app/blob/master/AGENTS.md).
+What not to miss in production:
 
-| Переменная | Почему важна |
+| Variable | Why it matters |
 |---|---|
-| `AUTH_PROXY_SECRET` | уровень 2, обязательна |
-| `AUTH_TOTP_SECRET` | уровень 3, base32, обязательна |
-| `AUTH_TOTP_SECRET_NEXT` | второй активный секрет на время ротации |
-| `TOKEN_ISSUER_ALLOWLIST` | список доменов, допустимых в claim `iss`; не задана — `iss` берётся из `Host` без проверки, и при общем `jwks-service-app` можно выпустить токен от имени соседнего инстанса |
-| `RATE_LIMIT_TRUSTED_PROXIES` | без неё за прокси все клиенты делят один per-IP лимит: ключом становится адрес прокси |
-| `AUTH_TOTP_REPLAY_PROTECTION` | запрет переигрывания TOTP-кода; требует Redis |
-| `AUTH_METRICS_TOKEN` | уровень 4; не задана — `/metrics` не публикуется |
-| `LOG_FORMAT=json` | построчный JSON для сборщиков логов |
-| `SERVER_WORKERS` | число воркер-потоков; не задана — по квоте CPU контейнера, а без квоты — потолок по умолчанию. Задавайте явно, если лимит памяти рассчитан под конкретное число воркеров |
-| `SERVER_SHUTDOWN_TIMEOUT_SECONDS` | сколько сервер дослуживает запросы после сигнала остановки (по умолчанию 25 с). Держите строго меньше grace period оркестратора (`stop_grace_period` в compose, `terminationGracePeriodSeconds` в k8s), иначе контейнер убивают посреди дренажа |
+| `AUTH_PROXY_SECRET` | level 2, mandatory |
+| `AUTH_TOTP_SECRET` | level 3, base32, mandatory |
+| `AUTH_TOTP_SECRET_NEXT` | the second active secret during a rotation |
+| `TOKEN_ISSUER_ALLOWLIST` | the list of domains acceptable in the `iss` claim; unset means `iss` is taken from `Host` without validation, and with a shared `jwks-service-app` a token can be issued on behalf of a neighbouring instance |
+| `RATE_LIMIT_TRUSTED_PROXIES` | without it every client behind the proxy shares one per-IP limit: the key becomes the proxy address |
+| `AUTH_TOTP_REPLAY_PROTECTION` | forbids replaying a TOTP code; requires Redis |
+| `AUTH_METRICS_TOKEN` | level 4; unset means `/metrics` is not published |
+| `LOG_FORMAT=json` | line-delimited JSON for log collectors |
+| `SERVER_WORKERS` | the number of worker threads; unset means from the container's CPU quota, and without a quota the default ceiling. Set it explicitly when the memory limit is sized for a specific number of workers |
+| `SERVER_SHUTDOWN_TIMEOUT_SECONDS` | how long the server keeps serving requests after a stop signal (25 s by default). Keep it strictly below the orchestrator's grace period (`stop_grace_period` in Compose, `terminationGracePeriodSeconds` in Kubernetes), or the container is killed mid-drain |
 
-Секреты подставляйте из секрет-менеджера, а не из открытых env в манифесте.
+Inject the secrets from a secret manager rather than from plain env in the
+manifest.
 
-## Наблюдаемость
+## Observability
 
-Метрики Prometheus на `/metrics` (уровень 4), структурные логи в stdout,
-трейсы и логи по OTLP, ошибки в GlitchTip. Что включается какими переменными и
-куда течёт —
-в [docs/observability.md](https://github.com/filipov-dev/jwt-service-app/blob/master/docs/observability.md).
+Prometheus metrics on `/metrics` (level 4), structured logs to stdout, traces and
+logs over OTLP, errors to GlitchTip. Which variable turns what on and where it
+flows is in
+[docs/observability.md](https://github.com/filipov-dev/jwt-service-app/blob/master/docs/observability.md).
 
-## Изменения между версиями
+## Changes between versions
 
 [CHANGELOG.md](https://github.com/filipov-dev/jwt-service-app/blob/master/CHANGELOG.md).
 
-## Лицензия
+## License
 
 [Apache-2.0](https://github.com/filipov-dev/jwt-service-app/blob/master/LICENSE)
-— та же строка лежит в метке образа `org.opencontainers.image.licenses`:
+— the same string sits in the image label `org.opencontainers.image.licenses`:
 
 ```
 docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' filipov/jwt-service-app:latest
 ```
 
-Полный текст лежит и внутри образа —
+The full text is inside the image as well —
 `/usr/share/doc/jwt-service-app/LICENSE`.
 
-Образ можно использовать, в том числе коммерчески, форкать и менять; при
-распространении сохраните текст лицензии и отметьте внесённые изменения.
+The image may be used, including commercially, forked and modified; when
+redistributing it, keep the license text and state the changes you made.

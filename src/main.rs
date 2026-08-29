@@ -1,16 +1,16 @@
-//! Точка входа `jwt-service-app`.
+//! The entry point of `jwt-service-app`.
 //!
-//! HTTP-сервис на actix-web для выпуска, проверки и отзыва JWT. Сервис не
-//! хранит криптографические ключи сам — за них отвечает внешний
-//! `jwks-service-app` (см. [`jwk::JwkService`]). Идентификаторы токенов (`jti`)
-//! отслеживаются в Redis (см. [`redis::RedisClient`]).
+//! An actix-web HTTP service for issuing, verifying and revoking JWTs. The
+//! service does not store cryptographic keys itself — that is the job of the
+//! external `jwks-service-app` (see [`jwk::JwkService`]). Token identifiers
+//! (`jti`) are tracked in Redis (see [`redis::RedisClient`]).
 //!
-//! Здесь конфигурируется и запускается HTTP-сервер: логирование (`tracing`),
-//! CORS, общие данные приложения (Redis-клиент и менеджер ключей), маршруты и
-//! выдача OpenAPI-спецификации.
+//! This is where the HTTP server is configured and started: logging
+//! (`tracing`), CORS, the shared application data (the Redis client and the key
+//! manager), the routes and serving the OpenAPI specification.
 //!
-//! Конфигурация — через переменные окружения (`HOST`, `PORT`,
-//! `TOKEN_ALGORITHM`, и т.д.), полный список см. в `AGENTS.md`.
+//! Configuration goes through environment variables (`HOST`, `PORT`,
+//! `TOKEN_ALGORITHM` and so on); the full list is in `AGENTS.md`.
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
@@ -47,34 +47,35 @@ use crate::rate_limit::{RateLimit, RateLimitConfig};
 use crate::redis::RedisClient;
 use crate::server::ServerConfig;
 
-/// Рестриктивный CORS для НЕ-публичных ручек.
+/// Restrictive CORS for the NON-public endpoints.
 ///
-/// Не «отключённый», а именно запрещающий: список разрешённых origin'ов пуст,
-/// поэтому любой кросс-доменный запрос из браузера отклоняется CORS'ом (preflight
-/// `OPTIONS` получает отказ, у простых запросов нет `Access-Control-Allow-Origin`).
-/// Запросы без заголовка `Origin` (internal app-to-app, `curl`) проходят как
-/// обычно. Вешается на все ручки, кроме `POST /tokens/verify` — единственной
-/// публичной ручки под «разрешающим» CORS. `Cors` не `Clone`, поэтому строим
-/// свежий экземпляр на каждый `.wrap`.
+/// Not "disabled" but denying: the list of allowed origins is empty, so any
+/// cross-origin browser request is rejected by CORS (a preflight `OPTIONS` is
+/// refused, and simple requests get no `Access-Control-Allow-Origin`). Requests
+/// without an `Origin` header (internal app-to-app, `curl`) go through as usual.
+/// It is installed on every endpoint except `POST /tokens/verify`, the single
+/// public endpoint under "permissive" CORS. `Cors` is not `Clone`, so a fresh
+/// instance is built for each `.wrap`.
 fn deny_cors() -> Cors {
     Cors::default()
 }
 
-/// Регистрирует все ручки API с их уровнями доступа, CORS и rate-limit.
+/// Registers every API endpoint with its access level, CORS and rate limit.
 ///
-/// Вынесено из фабрики приложения не ради красоты: привязка ручки к уровню
-/// доступа — это то, что раньше проверялось только чтением кода глазами, и
-/// именно так в сервис однажды попал `POST /tokens/refresh` на уровне 2 вместо 3
-/// (JWT-28). Теперь ту же функцию вызывает тест и проверяет уровни на живом
-/// приложении.
+/// This was extracted from the application factory for a reason: the binding of
+/// an endpoint to an access level used to be verified only by reading the code,
+/// and that is how `POST /tokens/refresh` once ended up on level 2 instead of
+/// level 3 (JWT-28). Now the same function is called by a test that checks the
+/// levels against a live application.
 ///
-/// Обобщена по хранилищу, чтобы тест подставлял in-memory-мок вместо Redis.
+/// It is generic over the store so that the test can substitute an in-memory
+/// mock for Redis.
 ///
-/// **ВАЖНО о CORS.** «Разрешающий» CORS навешивается ТОЧЕЧНО только на
-/// `/tokens/verify` — это ЕДИНСТВЕННАЯ публичная ручка, которую имеет смысл
-/// дёргать из браузера. На все остальные вешается `deny_cors()`: он не отключён,
-/// а запрещает кросс-доменные запросы. При добавлении новых ручек НЕ вешайте на
-/// них разрешающий CORS без явного решения.
+/// **IMPORTANT about CORS.** Permissive CORS is installed SPECIFICALLY on
+/// `/tokens/verify` only — that is the ONLY public endpoint worth calling from a
+/// browser. Everything else gets `deny_cors()`: it is not disabled but forbids
+/// cross-origin requests. When adding new endpoints do NOT put permissive CORS
+/// on them without an explicit decision.
 fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
     cfg: &mut web::ServiceConfig,
     auth: Rc<AuthConfig>,
@@ -97,9 +98,9 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
     };
 
     cfg
-        // Уровень 3 (TOTP): выпуск токенов. Глобальный cap — внутри auth
-        // (последний `.wrap` — внешний), поэтому потолок расходуют только
-        // запросы, прошедшие TOTP: неаутентифицированный флуд не исчерпает cap.
+        // Level 3 (TOTP): issuing tokens. The global cap sits inside auth (the
+        // last `.wrap` is the outermost), so only requests that passed TOTP
+        // consume the ceiling: an unauthenticated flood cannot drain the cap.
         .service(
             web::resource("/tokens")
                 .wrap(RateLimit::global(internal_limiter.clone()))
@@ -107,12 +108,13 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(deny_cors())
                 .route(web::post().to(create_token::<S>)),
         )
-        // Уровень 2 (proxy-secret): проверка токена. Регистрируется до
-        // `/tokens/{jti}`, чтобы путь `/tokens/verify` не поглотился шаблоном.
-        // Per-IP лимит — снаружи auth (`.wrap` ниже — внешнее), чтобы флуд
-        // отсекался ещё до проверки proxy-secret. CORS — самый внешний слой:
-        // preflight-запрос `OPTIONS` (без proxy-secret) должен обработаться
-        // CORS'ом раньше, чем его отклонят auth или rate-limit.
+        // Level 2 (proxy secret): token verification. Registered before
+        // `/tokens/{jti}` so that the `/tokens/verify` path is not swallowed by
+        // the pattern. The per-IP limit sits outside auth (the `.wrap` below is
+        // the outer one) so that a flood is cut off before the proxy secret is
+        // checked. CORS is the outermost layer: a preflight `OPTIONS` (which
+        // carries no proxy secret) must be handled by CORS before auth or the
+        // rate limiter rejects it.
         .service(
             web::resource("/tokens/verify")
                 .wrap(Auth::<S>::new(AuthLevel::ProxySecret, auth.clone()))
@@ -120,12 +122,13 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(cors)
                 .route(web::post().to(verify_token::<S>)),
         )
-        // Уровень 3 (TOTP): обмен refresh-токена. Это операция ВЫПУСКА, просто
-        // с другим основанием — вместо «доверенный бэкенд попросил» действует
-        // «предъявлен валидный refresh». Раз `POST /tokens` закрыт TOTP,
-        // перевыпуск обязан быть там же: proxy-secret статичен и вызывающего
-        // не аутентифицирует, так что на уровне 2 украденный refresh давал бы
-        // вечную цепочку токенов любому, кто дотянулся через прокси.
+        // Level 3 (TOTP): the refresh token exchange. This is an ISSUING
+        // operation, just on different grounds — instead of "a trusted backend
+        // asked" it is "a valid refresh token was presented". Since
+        // `POST /tokens` is behind TOTP, re-issuing has to be there too: the
+        // proxy secret is static and does not authenticate the caller, so at
+        // level 2 a stolen refresh token would give anyone who can reach through
+        // the proxy an endless chain of tokens.
         .service(
             web::resource("/tokens/refresh")
                 .wrap(RateLimit::global(internal_limiter.clone()))
@@ -140,9 +143,10 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .wrap(deny_cors())
                 .route(web::delete().to(revoke_token::<S>)),
         )
-        // Уровень 3 (TOTP): массовый отзыв токенов субъекта. Обвязка та же,
-        // что у поштучного отзыва, — это операция того же класса, только
-        // разрушительнее, и внешнему миру её видеть незачем.
+        // Level 3 (TOTP): bulk revocation of a subject's tokens. The same
+        // wrapping as the single revocation — it is an operation of the same
+        // class, only more destructive, and the outside world has no reason to
+        // see it.
         .service(
             web::resource("/subjects/{sub}/tokens")
                 .wrap(RateLimit::global(internal_limiter.clone()))
@@ -151,13 +155,14 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
                 .route(web::delete().to(revoke_subject_tokens::<S>)),
         );
 
-    // Уровень 4 (Bearer-токен): скрейп метрик. Регистрируется до открытого
-    // scope, иначе тот перехватил бы путь.
+    // Level 4 (bearer token): scraping the metrics. Registered before the open
+    // scope, which would otherwise intercept the path.
     //
-    // Роут появляется ТОЛЬКО если задан `AUTH_METRICS_TOKEN`. Не задан —
-    // ручку не публикуем вовсе, и путь отдаёт штатный `404` (его подхватит
-    // открытый scope ниже). Отдавать `401` не стали намеренно: так наружу
-    // не виден даже факт существования ручки.
+    // The route appears ONLY when `AUTH_METRICS_TOKEN` is set. When it is not,
+    // the endpoint is not published at all and the path returns a plain `404`
+    // (picked up by the open scope below). Returning `401` was deliberately
+    // avoided: that way the very existence of the endpoint is invisible from the
+    // outside.
     if auth.metrics_enabled() {
         cfg.service(
             web::resource("/metrics")
@@ -167,10 +172,10 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
         );
     }
 
-    // Уровень 1 (открыто): health-пробы и OpenAPI. Тот же middleware, но
-    // валидатор `Open` пропускает всё. Регистрируется последним — scope с
-    // пустым префиксом матчит любой путь, поэтому ресурсы токенов выше
-    // имеют приоритет.
+    // Level 1 (open): the health probes and the OpenAPI spec. The same
+    // middleware, but the `Open` validator lets everything through. Registered
+    // last — a scope with an empty prefix matches any path, so the token
+    // resources above take precedence.
     cfg.service(
         web::scope("")
             .wrap(Auth::<S>::new(AuthLevel::Open, auth.clone()))
@@ -181,49 +186,49 @@ fn configure_api<S: crate::models::jwt::JtiStore + 'static>(
     );
 }
 
-/// Отдаёт OpenAPI-спецификацию в формате JSON.
+/// Serves the OpenAPI specification as JSON.
 ///
-/// Обслуживает `GET /api-docs/openapi.json`; используется внешним Swagger UI
-/// (см. `deployments/dev/docker-compose.yml`).
+/// Handles `GET /api-docs/openapi.json`; used by the external Swagger UI (see
+/// `deployments/dev/docker-compose.yml`).
 pub async fn openapi_spec() -> impl Responder {
     HttpResponse::Ok()
         .content_type("application/json")
         .body(crate::openapi::ApiDoc::openapi().to_json().unwrap())
 }
 
-/// Инициализирует и запускает HTTP-сервер.
+/// Initialises and starts the HTTP server.
 ///
-/// Порядок действий:
-/// 1. Читает алгоритм подписи из `TOKEN_ALGORITHM` (по умолчанию `RS256`).
-/// 2. Настраивает `tracing`-логирование (формат из `LOG_FORMAT`, фильтр из
-///    `RUST_LOG`; см. [`logging::init_subscriber`]).
-/// 3. Читает `HOST`/`PORT` для привязки.
-/// 4. Создаёт Redis-клиент и менеджер ключей (падает с паникой, если Redis
-///    недоступен на старте).
-/// 5. Поднимает `HttpServer`: на публичную ручку `/tokens/verify` навешивает
-///    разрешающий CORS, на остальные — запрещающий (`deny_cors`), и регистрирует
-///    маршруты, включая выдачу OpenAPI. Число воркеров, таймауты соединений и
-///    время дренажа при остановке берутся из [`ServerConfig`], а не из дефолтов
-///    actix (см. `server.rs`).
+/// The order of operations:
+/// 1. Read the signature algorithm from `TOKEN_ALGORITHM` (`RS256` by default).
+/// 2. Set up `tracing` logging (the format from `LOG_FORMAT`, the filter from
+///    `RUST_LOG`; see [`logging::init_subscriber`]).
+/// 3. Read `HOST`/`PORT` for binding.
+/// 4. Create the Redis client and the key manager (panics when Redis is
+///    unavailable at startup).
+/// 5. Start the `HttpServer`: install permissive CORS on the public
+///    `/tokens/verify` endpoint and denying CORS (`deny_cors`) on the rest, and
+///    register the routes, the OpenAPI endpoint included. The worker count, the
+///    connection timeouts and the drain period on shutdown come from
+///    [`ServerConfig`] rather than from the actix defaults (see `server.rs`).
 ///
 /// # Panics
 ///
-/// Паникует, если `PORT` не парсится в `u16`, если не удалось подключиться к
-/// Redis, установить глобальный subscriber `tracing` или если не заданы
-/// обязательные секреты уровней доступа (`AUTH_PROXY_SECRET`/`AUTH_TOTP_SECRET`,
-/// см. [`AuthConfig::from_env`]).
+/// Panics when `PORT` does not parse as a `u16`, when Redis cannot be reached,
+/// when the global `tracing` subscriber cannot be installed, or when the
+/// mandatory access level secrets are missing
+/// (`AUTH_PROXY_SECRET`/`AUTH_TOTP_SECRET`, see [`AuthConfig::from_env`]).
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let algorithm = env::var("TOKEN_ALGORITHM").unwrap_or("RS256".into());
 
-    // Логирование и трейсинг: формат (`LOG_FORMAT`), уровни (`RUST_LOG`) и
-    // опциональный OTLP-экспорт (`OTEL_EXPORTER_OTLP_ENDPOINT`). Провайдер держим
-    // живым до конца работы и завершаем после остановки сервера — иначе последние
-    // span'ы не досылаются.
+    // Logging and tracing: the format (`LOG_FORMAT`), the levels (`RUST_LOG`)
+    // and the optional OTLP export (`OTEL_EXPORTER_OTLP_ENDPOINT`). The provider
+    // is kept alive until the end and shut down after the server stops —
+    // otherwise the last spans are never flushed.
     let telemetry = init_subscriber();
 
-    // Prometheus-recorder ставится один раз на процесс; handle рендерит текст
-    // экспозиции в обработчике `/metrics` (см. `metrics.rs`).
+    // The Prometheus recorder is installed once per process; the handle renders
+    // the exposition text in the `/metrics` handler (see `metrics.rs`).
     let metrics_handle = crate::metrics::init_recorder();
 
     let host = env::var("HOST").unwrap_or("127.0.0.1".into());
@@ -232,45 +237,49 @@ async fn main() -> std::io::Result<()> {
         .parse::<u16>()
         .unwrap();
 
-    // Здесь только разбор `REDIS_URL`: само соединение открывается при первой
-    // команде и дальше переиспользуется (см. `RedisClient::connection`).
-    // Недоступный на старте Redis не роняет процесс — об этом сообщает `/readyz`.
+    // Only `REDIS_URL` is parsed here: the connection itself is opened on the
+    // first command and reused from then on (see `RedisClient::connection`).
+    // A Redis that is unavailable at startup does not bring the process down —
+    // `/readyz` reports it.
     let redis_client = RedisClient::new().expect("Invalid REDIS_URL");
     let key_manager = KeyManager::new(algorithm);
 
-    // Конфигурация уровней доступа собирается один раз. Секреты уровней 2 и 3
-    // обязательны: без них сервис не стартует (fail-fast). Копия оборачивается в
-    // `Rc` внутри фабрики приложения на каждый worker-поток.
+    // The access level configuration is assembled once. The level 2 and level 3
+    // secrets are mandatory: without them the service does not start
+    // (fail-fast). A copy is wrapped in an `Rc` inside the application factory
+    // for each worker thread.
     let auth_config =
-        AuthConfig::from_env().unwrap_or_else(|e| panic!("Некорректная конфигурация доступа: {e}"));
+        AuthConfig::from_env().unwrap_or_else(|e| panic!("Invalid access configuration: {e}"));
 
-    // Уровень 4 опционален (в отличие от 2 и 3): без токена метрики просто не
-    // публикуются. Предупреждаем, чтобы это не выглядело как «метрики сломались».
+    // Level 4 is optional (unlike 2 and 3): without a token the metrics are
+    // simply not published. We warn so that it does not look like "the metrics
+    // broke".
     if !auth_config.metrics_enabled() {
         tracing::warn!(
-            "AUTH_METRICS_TOKEN не задан: уровень 4 недоступен, ручка GET /metrics \
-             не опубликована (ответ 404). Задайте токен, чтобы включить скрейп метрик."
+            "AUTH_METRICS_TOKEN is not set: level 4 is unavailable and the GET /metrics endpoint \
+             is not published (it answers 404). Set the token to enable metrics scraping."
         );
     }
 
-    // Конфигурация rate limiting. В отличие от auth, ошибки не фатальны —
-    // деградируем к безопасным дефолтам с предупреждением (см. `rate_limit.rs`).
-    // Лимитеры строятся один раз и общие на все worker-потоки (внутри `Arc`).
+    // The rate limiting configuration. Unlike auth, errors here are not fatal —
+    // we degrade to safe defaults with a warning (see `rate_limit.rs`). The
+    // limiters are built once and shared by every worker thread (inside `Arc`).
     let rate_limit_config = RateLimitConfig::from_env();
     rate_limit_config.log_summary();
     let verify_limiter = rate_limit_config.build_verify();
     let internal_limiter = rate_limit_config.build_internal();
-    // Фоновая чистка устаревших per-IP записей — один поток на процесс.
+    // Background sweeping of stale per-IP entries — one thread per process.
     if let Some(limiter) = &verify_limiter {
         limiter.spawn_cleanup();
     }
 
-    // Аллоулист issuer'ов: пусто/не задано → любой `Host` (текущее поведение),
-    // задано → выпуск и проверка только для перечисленных значений.
+    // The issuer allowlist: empty or unset means any `Host` (the current
+    // behaviour), set means issuing and verification only for the listed values.
     crate::issuer::log_summary();
 
-    // Список origin'ов для CORS. Пусто/не задано → `allow_any_origin` (текущее
-    // поведение, чтобы не ломать деплои); задано → только перечисленные origin'ы.
+    // The list of CORS origins. Empty or unset means `allow_any_origin` (the
+    // current behaviour, so that deployments are not broken); set means only the
+    // listed origins.
     let cors_origins: Vec<String> = env::var("CORS_ALLOWED_ORIGINS")
         .unwrap_or_default()
         .split(',')
@@ -278,9 +287,9 @@ async fn main() -> std::io::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Число воркеров и таймауты соединений: на дефолтах actix воркеров было бы
-    // по числу ядер ХОСТА (см. `server.rs`), а медленный клиент мог удерживать
-    // воркер сколь угодно долго.
+    // The worker count and the connection timeouts: at the actix defaults there
+    // would be one worker per HOST core (see `server.rs`), and a slow client
+    // could hold a worker for as long as it liked.
     let server_config = ServerConfig::from_env();
     server_config.log_summary();
 
@@ -288,8 +297,9 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            // Per-request логирование — самый внешний слой: span с `request_id`
-            // покрывает auth/rate-limit/CORS и обработчик (см. `logging.rs`).
+            // Per-request logging is the outermost layer: the span with the
+            // `request_id` covers auth, rate limiting, CORS and the handler (see
+            // `logging.rs`).
             .wrap(RequestLog)
             .app_data(web::Data::new(redis_client.clone()))
             .app_data(web::Data::new(key_manager.clone()))
@@ -307,17 +317,17 @@ async fn main() -> std::io::Result<()> {
     .workers(server_config.workers)
     .client_request_timeout(server_config.client_request_timeout)
     .keep_alive(server_config.keep_alive)
-    // Дренаж соединений при остановке. Дефолт actix (30 с) совпадает с
-    // terminationGracePeriodSeconds в k8s-манифесте, то есть SIGKILL приходит
-    // ровно в момент истечения таймаута — здесь он заведомо короче, чтобы
-    // осталось время на досылку телеметрии ниже (см. `server.rs`).
+    // Draining connections on shutdown. The actix default (30 s) coincides with
+    // terminationGracePeriodSeconds in the k8s manifest, that is, SIGKILL
+    // arrives exactly as the timeout runs out — here it is deliberately shorter
+    // so that there is time to flush the telemetry below (see `server.rs`).
     .shutdown_timeout(server_config.shutdown_timeout.as_secs())
     .bind((host, port))?
     .run()
     .await?;
 
-    // Сервер остановлен — досылаем накопленные span'ы (если трейсинг включён).
-    // Guard GlitchTip досылает свои события сам при уничтожении `telemetry`.
+    // The server has stopped — flush the accumulated spans (when tracing is on).
+    // The GlitchTip guard flushes its own events when `telemetry` is destroyed.
     if let Some(provider) = telemetry.tracer_provider {
         crate::tracing_otel::shutdown(provider);
     }
@@ -330,22 +340,24 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! Тесты привязки ручек к уровням доступа.
+    //! Tests of the binding of endpoints to access levels.
     //!
-    //! Проверяется не «закрыта ли ручка вообще», а **каким именно уровнем** она
-    //! закрыта. Разница принципиальна: тест «без кредов → 401» проходит и для
-    //! уровня 2, и для уровня 3, поэтому в JWT-28 обмен refresh-токена доехал до
-    //! ревью на уровне 2 при полностью зелёном прогоне.
+    //! What is checked is not "is the endpoint protected at all" but **which
+    //! level** protects it. The difference is fundamental: a "no credentials →
+    //! 401" test passes for level 2 and level 3 alike, which is how in JWT-28
+    //! the refresh token exchange reached review on level 2 with a fully green
+    //! run.
     //!
-    //! Приём: на internal-ручки (уровень 3) шлём запрос с **валидным
-    //! proxy-secret, но без TOTP**. Если ручка стоит на уровне 2, такой запрос
-    //! пройдёт auth — и тест упадёт.
+    //! The technique: send the internal endpoints (level 3) a request with a
+    //! **valid proxy secret but no TOTP**. If an endpoint sits on level 2, such
+    //! a request passes auth — and the test fails.
 
-    // Обоснование то же, что и в `handlers.rs`: `env_guard` намеренно держит
-    // std-`MutexGuard` через `.await`. `#[actix_web::test]` запускает каждый тест
-    // на отдельном однопоточном рантайме, задача с потока не мигрирует и одна на
-    // рантайм — лок сериализует тесты по общим переменным окружения без риска
-    // дедлока. Async-Mutex здесь избыточен.
+    // The reasoning is the same as in `handlers.rs`: `env_guard` deliberately
+    // holds a std `MutexGuard` across `.await`. `#[actix_web::test]` runs every
+    // test on its own single-threaded runtime, the task does not migrate between
+    // threads and there is one per runtime — the lock serialises the tests over
+    // the shared environment variables without a risk of deadlock. An async
+    // Mutex would be overkill here.
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
@@ -360,20 +372,20 @@ mod tests {
     const PROXY_SECRET: &str = "test-proxy-secret";
     const TOTP_SECRET: &str = "MRSWGYLSMUQGO33WNFXGO4ZAOBWGKYLSFVRW63LOMNXW2ZI";
 
-    /// Глобальная блокировка окружения: `AuthConfig::from_env` читает переменные
-    /// процесса, а тесты бегут параллельно.
+    /// A global environment lock: `AuthConfig::from_env` reads process variables
+    /// while the tests run in parallel.
     ///
-    /// Guard берётся через функцию, как в `handlers.rs`: так он не «виден»
-    /// clippy как удерживаемый через `await`, и заодно снимается отравление
-    /// мьютекса паникой одного теста.
+    /// The guard is taken through a function, as in `handlers.rs`: that way
+    /// clippy does not "see" it as held across an `await`, and it also clears
+    /// the mutex poisoning left by a panicking test.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Хранилище-заглушка: до обработчиков в этих тестах дело не доходит, всё
-    /// решает auth-слой.
+    /// A stub store: these tests never reach the handlers, everything is decided
+    /// by the auth layer.
     #[derive(Default)]
     struct StubStore {
         jtis: PlMutex<HashSet<String>>,
@@ -439,7 +451,7 @@ mod tests {
         }
     }
 
-    /// Готовит окружение и собирает конфигурацию доступа.
+    /// Prepares the environment and assembles the access configuration.
     fn auth_config(with_metrics_token: bool) -> Rc<AuthConfig> {
         env::set_var("AUTH_PROXY_SECRET", PROXY_SECRET);
         env::set_var("AUTH_TOTP_SECRET", TOTP_SECRET);
@@ -452,23 +464,23 @@ mod tests {
             env::remove_var("AUTH_METRICS_TOKEN");
         }
 
-        Rc::new(AuthConfig::from_env().expect("конфигурация доступа собирается"))
+        Rc::new(AuthConfig::from_env().expect("the access configuration assembles"))
     }
 
-    /// Собирает приложение с теми же роутами, что и прод, поверх заглушки.
+    /// Assembles an application with the same routes as production over the stub.
     macro_rules! api_app {
         ($auth:expr) => {
             test::init_service(
                 App::new()
                     .app_data(web::Data::new(StubStore::default()))
                     .app_data(web::Data::new(KeyManager::new("RS256".to_string())))
-                    // Лимитеры выключены: здесь проверяется auth, а не 429.
+                    // The limiters are off: what is checked here is auth, not 429.
                     .configure(|cfg| configure_api::<StubStore>(cfg, $auth, None, None, &[])),
             )
         };
     }
 
-    /// Ручки уровня 3 и способ их дёрнуть.
+    /// The level 3 endpoints and how to call them.
     fn internal_endpoints() -> Vec<(&'static str, &'static str)> {
         vec![
             ("POST", "/tokens"),
@@ -485,7 +497,7 @@ mod tests {
         let app = api_app!(auth).await;
 
         for (method, path) in internal_endpoints() {
-            // Валидный proxy-secret, но без TOTP: для уровня 3 этого мало.
+            // A valid proxy secret but no TOTP: not enough for level 3.
             let req = match method {
                 "POST" => test::TestRequest::post(),
                 _ => test::TestRequest::delete(),
@@ -501,7 +513,7 @@ mod tests {
             assert_eq!(
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
-                "{method} {path} обязан требовать TOTP (уровень 3), а не proxy-secret"
+                "{method} {path} must require TOTP (level 3), not the proxy secret"
             );
         }
     }
@@ -533,10 +545,11 @@ mod tests {
         let auth = auth_config(false);
         let app = api_app!(auth).await;
 
-        // Тело намеренно неполное: пройдя auth, запрос упрётся в разбор JSON и
-        // получит 400. Отличить это от 401 важно — валидный по форме, но
-        // невалидный по сути токен обработчик тоже отвергает с 401, и такой
-        // ответ был бы неотличим от отказа auth.
+        // The body is deliberately incomplete: having passed auth, the request
+        // runs into JSON parsing and gets a 400. Telling that apart from a 401
+        // matters — a token that is well-formed but invalid in substance is also
+        // rejected by the handler with a 401, and such a response would be
+        // indistinguishable from an auth refusal.
         let req = test::TestRequest::post()
             .uri("/tokens/verify")
             .insert_header(("X-Proxy-Secret", PROXY_SECRET))
@@ -548,7 +561,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
-            "/tokens/verify должен принимать proxy-secret (уровень 2) и падать уже на разборе тела"
+            "/tokens/verify must accept the proxy secret (level 2) and fail on parsing the body"
         );
     }
 
@@ -577,7 +590,7 @@ mod tests {
         for path in ["/livez", "/api-docs/openapi.json"] {
             let req = test::TestRequest::get().uri(path).to_request();
             let resp = test::call_service(&app, req).await;
-            assert_eq!(resp.status(), StatusCode::OK, "{path} — уровень 1");
+            assert_eq!(resp.status(), StatusCode::OK, "{path} — level 1");
         }
     }
 
@@ -587,8 +600,9 @@ mod tests {
         let auth = auth_config(false);
         let app = api_app!(auth).await;
 
-        // Без `AUTH_METRICS_TOKEN` ручка не публикуется вовсе: 404, а не 401 —
-        // так наружу не виден даже факт её существования.
+        // Without `AUTH_METRICS_TOKEN` the endpoint is not published at all: 404
+        // rather than 401 — that way its very existence is invisible from the
+        // outside.
         let req = test::TestRequest::get().uri("/metrics").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -600,7 +614,7 @@ mod tests {
         let auth = auth_config(true);
         let app = api_app!(auth).await;
 
-        // Опубликована, но закрыта уровнем 4: proxy-secret и TOTP тут не подходят.
+        // Published but behind level 4: neither the proxy secret nor TOTP fits here.
         let req = test::TestRequest::get()
             .uri("/metrics")
             .insert_header(("X-Proxy-Secret", PROXY_SECRET))

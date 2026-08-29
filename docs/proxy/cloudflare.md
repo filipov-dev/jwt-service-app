@@ -1,26 +1,27 @@
-# Cloudflare — уровень 2 (proxy-secret)
+# Cloudflare — level 2 (the proxy secret)
 
-## Вариант A — Transform Rules (Modify Request Header)
-Создайте правило "Modify Request Header" с ДВУМЯ действиями по порядку:
+## Option A — Transform Rules (Modify Request Header)
+Create a "Modify Request Header" rule with TWO actions, in this order:
 
-1. **Remove** header `X-Proxy-Secret` — убирает клиентскую версию.
-2. **Set static** header `X-Proxy-Secret` = значение секрета.
+1. **Remove** the `X-Proxy-Secret` header — this drops the client-supplied
+   version.
+2. **Set static** header `X-Proxy-Secret` = the secret value.
 
-Значение секрета в Dashboard хранится как есть; для секрета предпочтителен
-Workers-вариант ниже (Transform Rules не читают Secrets Store).
+The secret value is stored in the Dashboard as it is; for a secret the Workers
+option below is preferable (Transform Rules do not read the Secrets Store).
 
-## Вариант B — Cloudflare Workers (секрет из Secret binding)
-Секрет кладётся в Worker Secret (`wrangler secret put PROXY_SECRET`) и никогда не
-попадает в код:
+## Option B — Cloudflare Workers (the secret from a Secret binding)
+The secret goes into a Worker Secret (`wrangler secret put PROXY_SECRET`) and
+never reaches the code:
 
 ```js
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const headers = new Headers(request.headers);
-    // (1) Удаляем клиентскую версию заголовка.
+    // (1) Delete the client-supplied version of the header.
     headers.delete("X-Proxy-Secret");
-    // (2) Ставим секрет из Secret binding.
+    // (2) Set the secret from the Secret binding.
     headers.set("X-Proxy-Secret", env.PROXY_SECRET);
     return fetch("http://jwt_service:8080" + url.pathname + url.search, {
       method: request.method, headers, body: request.body,

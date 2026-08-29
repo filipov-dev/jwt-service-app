@@ -1,48 +1,51 @@
-//! Параметры HTTP-сервера: число воркеров и таймауты соединений.
+//! HTTP server parameters: the worker count and the connection timeouts.
 //!
-//! Всё, что раньше оставалось на дефолтах actix, собрано здесь в
-//! [`ServerConfig::from_env`] и применяется в `main.rs` одним местом.
+//! Everything that used to be left at the actix defaults is gathered here in
+//! [`ServerConfig::from_env`] and applied from a single place in `main.rs`.
 //!
-//! ## Почему число воркеров нельзя оставлять на дефолте
+//! ## Why the worker count cannot be left at the default
 //!
-//! Дефолт actix — «сколько логических ядер видит процесс», то есть ядер
-//! **хоста**. В `deployments/prod/k8s/deployment.yaml` лимит CPU снят намеренно
-//! (throttling бьёт по хвостам задержек на криптографии), а `requests.cpu` на
-//! видимое число ядер не влияет вовсе. На 64-ядерном узле поднялось бы 64
-//! воркер-потока со своими стеками и пулами соединений — и всё это должно было
-//! уложиться в лимит памяти 256Mi, не считая лишних переключений контекста.
+//! The actix default is "as many logical cores as the process can see", that is,
+//! the cores of the **host**. In `deployments/prod/k8s/deployment.yaml` the CPU
+//! limit is deliberately absent (throttling hurts the latency tails of the
+//! cryptography), and `requests.cpu` has no effect on the visible core count at
+//! all. On a 64-core node that would start 64 worker threads with their own
+//! stacks and connection pools — all of which had to fit into a 256Mi memory
+//! limit, not counting the extra context switches.
 //!
-//! Поэтому дефолт считается **от квоты, а не от числа ядер**:
+//! So the default is computed **from the quota, not from the core count**:
 //!
-//! 1. есть квота CPU у cgroup (v2 `cpu.max`, v1 `cpu.cfs_quota_us`) — берём её,
-//!    округляя вверх до целого воркера;
-//! 2. квоты нет (или прочитать не удалось — не-Linux, доступ к cgroupfs закрыт)
-//!    — берём не число ядер, а [`DEFAULT_MAX_WORKERS`]: предсказуемое потребление
-//!    памяти важнее попытки угадать долю CPU по окружению.
+//! 1. there is a cgroup CPU quota (v2 `cpu.max`, v1 `cpu.cfs_quota_us`) — take
+//!    it, rounding up to a whole worker;
+//! 2. there is no quota (or it could not be read — not Linux, no access to
+//!    cgroupfs) — take [`DEFAULT_MAX_WORKERS`] rather than the core count:
+//!    predictable memory consumption matters more than guessing the CPU share
+//!    from the environment.
 //!
-//! Явное значение `SERVER_WORKERS` всегда сильнее автоопределения.
+//! An explicit `SERVER_WORKERS` always beats auto-detection.
 //!
-//! ## Почему таймауты задаются явно
+//! ## Why the timeouts are set explicitly
 //!
-//! За обратным прокси медленных клиентов отсекает прокси, но образ раздаётся
-//! публично и разворачивается в том числе напрямую, поэтому ограничение времени
-//! на приём заголовков запроса (`client_request_timeout`) и времени простоя
-//! keep-alive-соединения — не деталь тюнинга, а защита воркеров от удержания.
+//! Behind a reverse proxy it is the proxy that cuts slow clients off, but the
+//! image is distributed publicly and gets deployed directly too, so limiting the
+//! time to receive the request headers (`client_request_timeout`) and the idle
+//! time of a keep-alive connection is not a tuning detail but protection of the
+//! workers against being held.
 //!
-//! ## Почему shutdown_timeout меньше grace period
+//! ## Why shutdown_timeout is smaller than the grace period
 //!
-//! При остановке actix перестаёт принимать соединения и даёт воркерам
-//! `shutdown_timeout` на дослуживание запросов в полёте. Дефолт — 30 секунд, и
-//! ровно столько же стоит `terminationGracePeriodSeconds` в
-//! `deployments/prod/k8s/deployment.yaml`: SIGKILL прилетает в ту же секунду,
-//! когда дренаж только истекает. Запаса нет ни на добивание последнего
-//! запроса, ни на досылку телеметрии — а она отправляется уже **после**
-//! возврата из `run()` (OTel-провайдер и guard GlitchTip в `main.rs`).
+//! On shutdown actix stops accepting connections and gives the workers
+//! `shutdown_timeout` to finish the requests in flight. The default is 30
+//! seconds, and `terminationGracePeriodSeconds` in
+//! `deployments/prod/k8s/deployment.yaml` is exactly the same: SIGKILL arrives
+//! in the very second the drain runs out. There is no room left for finishing
+//! the last request or for flushing telemetry — and telemetry is sent **after**
+//! `run()` returns (the OTel provider and the GlitchTip guard in `main.rs`).
 //!
-//! Поэтому дефолт здесь — [`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`], заведомо
-//! меньше grace period. Значения связаны: меняете одно — пересчитайте другое,
-//! иначе таймаут бесполезен (pod убьют раньше) либо дренаж заканчивается
-//! мгновенным SIGKILL.
+//! So the default here is [`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`], comfortably
+//! below the grace period. The values are linked: change one and recompute the
+//! other, or the timeout is useless (the pod is killed earlier) or the drain
+//! ends in an immediate SIGKILL.
 
 use std::env;
 use std::fs;
@@ -50,63 +53,65 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-/// Потолок числа воркеров, когда квоту CPU определить не удалось.
+/// Ceiling on the worker count when the CPU quota could not be determined.
 ///
-/// Ровно тот случай, ради которого задача и заводилась: без лимита CPU в
-/// манифесте квоты нет, и дефолт actix развернулся бы по числу ядер узла.
+/// Exactly the case this work was started for: without a CPU limit in the
+/// manifest there is no quota, and the actix default would fan out to the node's
+/// core count.
 const DEFAULT_MAX_WORKERS: usize = 4;
 
-/// Таймаут приёма заголовков запроса по умолчанию (совпадает с дефолтом actix).
+/// Default timeout for receiving the request headers (matches the actix default).
 const DEFAULT_CLIENT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
-/// Таймаут простоя keep-alive-соединения по умолчанию (дефолт actix).
+/// Default idle timeout of a keep-alive connection (the actix default).
 const DEFAULT_KEEP_ALIVE_SECONDS: u64 = 5;
 
-/// Время на дренаж запросов при остановке, по умолчанию.
+/// Default time allowed to drain requests on shutdown.
 ///
-/// Меньше `terminationGracePeriodSeconds: 30` из k8s-манифеста намеренно:
-/// оставшиеся секунды уходят на досылку телеметрии после остановки сервера.
+/// Deliberately below the `terminationGracePeriodSeconds: 30` of the k8s
+/// manifest: the remaining seconds go to flushing telemetry after the server
+/// stops.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
-/// Путь к квоте CPU в cgroup v2 (`<квота|max> <период>` в микросекундах).
+/// Path to the CPU quota in cgroup v2 (`<quota|max> <period>` in microseconds).
 const CGROUP_V2_CPU_MAX: &str = "/sys/fs/cgroup/cpu.max";
-/// Путь к квоте CPU в cgroup v1 (микросекунды; `-1` — квоты нет).
+/// Path to the CPU quota in cgroup v1 (microseconds; `-1` means no quota).
 const CGROUP_V1_CPU_QUOTA: &str = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
-/// Путь к периоду планировщика в cgroup v1 (микросекунды).
+/// Path to the scheduler period in cgroup v1 (microseconds).
 const CGROUP_V1_CPU_PERIOD: &str = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
 
-/// Как выбрано число воркеров — только для сообщения в лог.
+/// How the worker count was chosen — for the log message only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkersSource {
-    /// Задано явно через `SERVER_WORKERS`.
+    /// Set explicitly through `SERVER_WORKERS`.
     Explicit,
-    /// Посчитано по квоте CPU cgroup.
+    /// Computed from the cgroup CPU quota.
     Quota,
-    /// Квоты нет — сработал потолок [`DEFAULT_MAX_WORKERS`].
+    /// There is no quota — the [`DEFAULT_MAX_WORKERS`] ceiling applied.
     Fallback,
 }
 
-/// Параметры HTTP-сервера, применяемые к [`actix_web::HttpServer`].
+/// HTTP server parameters applied to [`actix_web::HttpServer`].
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
-    /// Число воркер-потоков.
+    /// Number of worker threads.
     pub workers: usize,
-    /// Время на приём заголовков запроса; `Duration::ZERO` — без ограничения.
+    /// Time allowed to receive the request headers; `Duration::ZERO` means no limit.
     pub client_request_timeout: Duration,
-    /// Время простоя keep-alive-соединения; `Duration::ZERO` — keep-alive выключен.
+    /// Idle time of a keep-alive connection; `Duration::ZERO` disables keep-alive.
     pub keep_alive: Duration,
-    /// Время на дослуживание запросов при остановке; `Duration::ZERO` — сразу.
+    /// Time allowed to finish requests on shutdown; `Duration::ZERO` means immediately.
     pub shutdown_timeout: Duration,
-    /// Откуда взялось `workers` (для лога).
+    /// Where `workers` came from (for the log).
     source: WorkersSource,
 }
 
 impl ServerConfig {
-    /// Собирает конфигурацию из окружения.
+    /// Assembles the configuration from the environment.
     ///
-    /// Как и rate limiting (и в отличие от секретов auth), не fail-fast:
-    /// нераспознанное значение не роняет сервис, а откатывается к дефолту с
-    /// предупреждением в лог.
+    /// Like rate limiting (and unlike the auth secrets), it is not fail-fast: an
+    /// unrecognised value does not bring the service down but falls back to the
+    /// default with a warning in the log.
     pub fn from_env() -> Self {
         let (workers, source) = match parse_workers(env::var("SERVER_WORKERS").ok().as_deref()) {
             Some(n) => (n, WorkersSource::Explicit),
@@ -131,17 +136,17 @@ impl ServerConfig {
         }
     }
 
-    /// Пишет сводку в лог — чтобы выбранное число воркеров было видно в проде,
-    /// а не выводилось из чтения кода и манифеста.
+    /// Writes a summary to the log — so that the chosen worker count is visible
+    /// in production rather than inferred by reading the code and the manifest.
     pub fn log_summary(&self) {
         let source = match self.source {
-            WorkersSource::Explicit => "задано SERVER_WORKERS",
-            WorkersSource::Quota => "по квоте CPU cgroup",
-            WorkersSource::Fallback => "квота CPU не обнаружена, потолок по умолчанию",
+            WorkersSource::Explicit => "set by SERVER_WORKERS",
+            WorkersSource::Quota => "from the cgroup CPU quota",
+            WorkersSource::Fallback => "no CPU quota found, default ceiling",
         };
         info!(
-            "HTTP-сервер: воркеров {} ({}), client_request_timeout {} мс, keep-alive {} с, \
-             shutdown_timeout {} с",
+            "HTTP server: {} workers ({}), client_request_timeout {} ms, keep-alive {} s, \
+             shutdown_timeout {} s",
             self.workers,
             source,
             self.client_request_timeout.as_millis(),
@@ -151,15 +156,16 @@ impl ServerConfig {
     }
 }
 
-/// Читает `u64` из переменной окружения с откатом на `default`.
+/// Reads a `u64` from an environment variable, falling back to `default`.
 fn env_u64(key: &str, default: u64) -> u64 {
     parse_u64(env::var(key).ok().as_deref(), key, default)
 }
 
-/// Разбирает значение переменной окружения как `u64`.
+/// Parses the value of an environment variable as a `u64`.
 ///
-/// Отсутствие переменной, пустая строка и мусор — это `default` (последнее с
-/// предупреждением): конфигурация таймаутов, как и rate limiting, не fail-fast.
+/// A missing variable, an empty string and garbage all mean `default` (the last
+/// one with a warning): timeout configuration, like rate limiting, is not
+/// fail-fast.
 fn parse_u64(value: Option<&str>, key: &str, default: u64) -> u64 {
     let Some(raw) = value else {
         return default;
@@ -171,17 +177,17 @@ fn parse_u64(value: Option<&str>, key: &str, default: u64) -> u64 {
     match raw.parse() {
         Ok(n) => n,
         Err(_) => {
-            warn!("{key}: нераспознанное значение '{raw}', использую {default}");
+            warn!("{key}: unrecognised value '{raw}', using {default}");
             default
         }
     }
 }
 
-/// Разбирает `SERVER_WORKERS`.
+/// Parses `SERVER_WORKERS`.
 ///
-/// Явное положительное число — как есть; `auto`, `0`, пустая строка и
-/// отсутствие переменной — автоопределение (`None`). Мусор — тоже
-/// автоопределение, но с предупреждением.
+/// An explicit positive number is taken as is; `auto`, `0`, an empty string and
+/// a missing variable mean auto-detection (`None`). Garbage also means
+/// auto-detection, but with a warning.
 fn parse_workers(value: Option<&str>) -> Option<usize> {
     let raw = value?.trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
@@ -191,16 +197,20 @@ fn parse_workers(value: Option<&str>) -> Option<usize> {
         Ok(0) => None,
         Ok(n) => Some(n),
         Err(_) => {
-            warn!("SERVER_WORKERS: нераспознанное значение '{raw}', определяю число воркеров сам");
+            warn!(
+                "SERVER_WORKERS: unrecognised value '{raw}', determining the worker count myself"
+            );
             None
         }
     }
 }
 
-/// Выбирает число воркеров по квоте CPU (в ядрах) и доступному параллелизму.
+/// Chooses the worker count from the CPU quota (in cores) and the available
+/// parallelism.
 ///
-/// Квота округляется **вверх**: при `500m` один воркер всё же нужен. Сверху
-/// ограничивается параллелизмом — больше потоков, чем ядер, смысла не имеет.
+/// The quota is rounded **up**: at `500m` one worker is still needed. It is
+/// capped by the parallelism from above — more threads than cores makes no
+/// sense.
 fn auto_workers(quota: Option<f64>, parallelism: usize) -> (usize, WorkersSource) {
     let parallelism = parallelism.max(1);
     match quota {
@@ -215,18 +225,18 @@ fn auto_workers(quota: Option<f64>, parallelism: usize) -> (usize, WorkersSource
     }
 }
 
-/// Число логических ядер, доступных процессу.
+/// The number of logical cores available to the process.
 ///
-/// `available_parallelism` сам учитывает квоту cgroup, но по нему нельзя
-/// отличить «квота 4 ядра» от «ядер у хоста 4» — а различие тут решающее,
-/// поэтому квота читается отдельно ([`cpu_quota`]).
+/// `available_parallelism` accounts for the cgroup quota itself, but it cannot
+/// distinguish "a quota of 4 cores" from "the host has 4 cores" — and the
+/// difference is decisive here, so the quota is read separately ([`cpu_quota`]).
 fn available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
 }
 
-/// Квота CPU в ядрах: cgroup v2, затем v1. `None` — квоты нет или не прочитать.
+/// The CPU quota in cores: cgroup v2, then v1. `None` means no quota or unreadable.
 fn cpu_quota() -> Option<f64> {
     if let Some(cores) = fs::read_to_string(CGROUP_V2_CPU_MAX)
         .ok()
@@ -239,7 +249,7 @@ fn cpu_quota() -> Option<f64> {
     parse_cfs_quota(&quota, &period)
 }
 
-/// Разбирает `cpu.max` (cgroup v2): `"<квота|max> <период>"` в микросекундах.
+/// Parses `cpu.max` (cgroup v2): `"<quota|max> <period>"` in microseconds.
 fn parse_cpu_max(content: &str) -> Option<f64> {
     let mut parts = content.split_whitespace();
     let quota = parts.next()?;
@@ -250,9 +260,10 @@ fn parse_cpu_max(content: &str) -> Option<f64> {
     parse_cfs_quota(quota, period)
 }
 
-/// Считает квоту в ядрах по паре «квота/период» в микросекундах (cgroup v1 и v2).
+/// Computes the quota in cores from a quota/period pair in microseconds (cgroup
+/// v1 and v2).
 ///
-/// `-1` (v1) и неположительный период означают отсутствие квоты.
+/// `-1` (v1) and a non-positive period mean there is no quota.
 fn parse_cfs_quota(quota: &str, period: &str) -> Option<f64> {
     let quota: i64 = quota.trim().parse().ok()?;
     let period: i64 = period.trim().parse().ok()?;
@@ -274,20 +285,20 @@ mod tests {
 
     #[test]
     fn parse_workers_falls_back_to_auto() {
-        // Отсутствие переменной, пустое значение, явное `auto` и `0` — всё это
-        // просьба посчитать самим, а не ошибка конфигурации.
+        // A missing variable, an empty value, an explicit `auto` and `0` are all
+        // a request to compute it ourselves, not a configuration error.
         assert_eq!(parse_workers(None), None);
         assert_eq!(parse_workers(Some("")), None);
         assert_eq!(parse_workers(Some("auto")), None);
         assert_eq!(parse_workers(Some("AUTO")), None);
         assert_eq!(parse_workers(Some("0")), None);
-        assert_eq!(parse_workers(Some("две штуки")), None);
+        assert_eq!(parse_workers(Some("two of them")), None);
     }
 
     #[test]
     fn auto_workers_uses_quota() {
         assert_eq!(auto_workers(Some(2.0), 64), (2, WorkersSource::Quota));
-        // Дробная квота (500m, 1500m) округляется вверх: меньше воркера не бывает.
+        // A fractional quota (500m, 1500m) rounds up: there is no such thing as less than a worker.
         assert_eq!(auto_workers(Some(0.5), 64), (1, WorkersSource::Quota));
         assert_eq!(auto_workers(Some(1.5), 64), (2, WorkersSource::Quota));
     }
@@ -299,13 +310,13 @@ mod tests {
 
     #[test]
     fn auto_workers_without_quota_ignores_host_cores() {
-        // Главный сценарий задачи: лимит CPU снят, узел большой. Дефолт actix
-        // дал бы здесь 64 воркера.
+        // The main scenario behind this work: the CPU limit is absent and the
+        // node is large. The actix default would give 64 workers here.
         assert_eq!(
             auto_workers(None, 64),
             (DEFAULT_MAX_WORKERS, WorkersSource::Fallback)
         );
-        // На машине меньше потолка берётся её параллелизм.
+        // On a machine below the ceiling its own parallelism is taken.
         assert_eq!(auto_workers(None, 2), (2, WorkersSource::Fallback));
         assert_eq!(auto_workers(None, 0), (1, WorkersSource::Fallback));
     }
@@ -318,29 +329,29 @@ mod tests {
 
     #[test]
     fn parse_u64_falls_back_to_default() {
-        // Мусор и пустое значение не роняют сервис — берётся дефолт.
+        // Garbage and an empty value do not bring the service down — the default is taken.
         assert_eq!(parse_u64(None, "K", 25), 25);
         assert_eq!(parse_u64(Some(""), "K", 25), 25);
         assert_eq!(parse_u64(Some("   "), "K", 25), 25);
-        assert_eq!(parse_u64(Some("полминуты"), "K", 25), 25);
+        assert_eq!(parse_u64(Some("half a minute"), "K", 25), 25);
         assert_eq!(parse_u64(Some("-1"), "K", 25), 25);
     }
 
-    /// Достаёт значение простого YAML-ключа из манифеста: первая строка,
-    /// начинающаяся с `key:` (комментарии пропускаются).
+    /// Extracts the value of a simple YAML key from a manifest: the first line
+    /// starting with `key:` (comments are skipped).
     fn manifest_value<'a>(manifest: &'a str, key: &str) -> &'a str {
         manifest
             .lines()
             .map(str::trim)
             .filter(|line| !line.starts_with('#'))
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
-            .unwrap_or_else(|| panic!("в манифесте нет ключа {key}"))
+            .unwrap_or_else(|| panic!("the manifest has no key {key}"))
             .trim()
             .trim_matches('"')
     }
 
-    /// Достаёт значение переменной окружения из env-списка k8s-манифеста:
-    /// строка `value:` сразу за `- name: <KEY>`.
+    /// Extracts the value of an environment variable from the env list of a k8s
+    /// manifest: the `value:` line right after `- name: <KEY>`.
     fn env_value<'a>(manifest: &'a str, key: &str) -> &'a str {
         let mut lines = manifest
             .lines()
@@ -348,47 +359,49 @@ mod tests {
             .filter(|line| !line.starts_with('#'));
         lines
             .find(|line| line == &format!("- name: {key}"))
-            .unwrap_or_else(|| panic!("в манифесте нет переменной {key}"));
+            .unwrap_or_else(|| panic!("the manifest has no variable {key}"));
         lines
             .next()
             .and_then(|line| line.strip_prefix("value:"))
-            .unwrap_or_else(|| panic!("у переменной {key} в манифесте нет value"))
+            .unwrap_or_else(|| panic!("the variable {key} has no value in the manifest"))
             .trim()
             .trim_matches('"')
     }
 
     #[test]
     fn shutdown_timeout_fits_into_grace_periods() {
-        // Таймаут дренажа и grace period оркестратора — одна настройка на два
-        // файла, и связь между ними держится этим тестом, а не внимательностью:
-        // сравняйся они (как на дефолте actix в 30 с) — SIGKILL пришёл бы ровно
-        // в момент истечения дренажа, не оставив времени ни на последний запрос,
-        // ни на досылку телеметрии после возврата из `run()`.
+        // The drain timeout and the orchestrator grace period are one setting
+        // spread over two files, and the link between them is held by this test
+        // rather than by attentiveness: were they equal (as with the actix
+        // default of 30 s), SIGKILL would arrive exactly as the drain ran out,
+        // leaving time for neither the last request nor the telemetry flushed
+        // after `run()` returns.
         let k8s = include_str!("../deployments/prod/k8s/deployment.yaml");
         let compose = include_str!("../deployments/prod/docker-compose.yml");
 
         let grace: u64 = manifest_value(k8s, "terminationGracePeriodSeconds")
             .parse()
-            .expect("terminationGracePeriodSeconds — целое число секунд");
+            .expect("terminationGracePeriodSeconds is a whole number of seconds");
         let stop_grace: u64 = manifest_value(compose, "stop_grace_period")
             .trim_end_matches('s')
             .parse()
-            .expect("stop_grace_period — секунды вида '30s'");
+            .expect("stop_grace_period is seconds in the '30s' form");
 
         assert!(
             DEFAULT_SHUTDOWN_TIMEOUT_SECONDS < grace,
-            "дренаж {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} с не укладывается в grace period k8s {grace} с"
+            "a drain of {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} s does not fit into the k8s grace period of {grace} s"
         );
         assert!(
             DEFAULT_SHUTDOWN_TIMEOUT_SECONDS < stop_grace,
-            "дренаж {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} с не укладывается в stop_grace_period compose {stop_grace} с"
+            "a drain of {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS} s does not fit into the compose stop_grace_period of {stop_grace} s"
         );
 
-        // k8s-манифест задаёт переменную явно; значение должно совпадать с
-        // дефолтом, иначе расчёт запаса в его комментариях разойдётся с кодом.
+        // The k8s manifest sets the variable explicitly; the value must match the
+        // default, or the headroom calculation in its comments drifts from the
+        // code.
         let in_k8s: u64 = env_value(k8s, "SERVER_SHUTDOWN_TIMEOUT_SECONDS")
             .parse()
-            .expect("SERVER_SHUTDOWN_TIMEOUT_SECONDS в манифесте — целое число");
+            .expect("SERVER_SHUTDOWN_TIMEOUT_SECONDS in the manifest is a whole number");
         assert_eq!(in_k8s, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS);
     }
 
@@ -403,13 +416,13 @@ mod tests {
         assert_eq!(parse_cpu_max("max 100000\n"), None);
         assert_eq!(parse_cpu_max(""), None);
         assert_eq!(parse_cpu_max("100000"), None);
-        assert_eq!(parse_cpu_max("мусор 100000"), None);
+        assert_eq!(parse_cpu_max("garbage 100000"), None);
     }
 
     #[test]
     fn parse_cfs_quota_v1() {
         assert_eq!(parse_cfs_quota("100000\n", "100000\n"), Some(1.0));
-        // -1 в v1 означает «квоты нет».
+        // -1 in v1 means "there is no quota".
         assert_eq!(parse_cfs_quota("-1", "100000"), None);
         assert_eq!(parse_cfs_quota("100000", "0"), None);
     }

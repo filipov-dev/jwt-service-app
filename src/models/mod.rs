@@ -1,21 +1,21 @@
-//! Модели данных приложения.
+//! Application data models.
 //!
-//! Здесь собраны:
-//! - DTO публичного API ([`TokenRequest`], [`TokenVerifyRequest`],
-//!   [`TokenResponse`], [`ErrorResponse`]) — они помечены `ToSchema` и попадают
-//!   в OpenAPI;
-//! - структуры представления ключей ([`Jwk`], [`Jwks`], [`JwkData`]),
-//!   используемые при обмене с `jwks-service-app`.
+//! Gathered here are:
+//! - the public API DTOs ([`TokenRequest`], [`TokenVerifyRequest`],
+//!   [`TokenResponse`], [`ErrorResponse`]) — they carry `ToSchema` and reach the
+//!   OpenAPI spec;
+//! - the key representation structures ([`Jwk`], [`Jwks`], [`JwkData`]) used
+//!   when talking to `jwks-service-app`.
 //!
-//! Внутреннее представление самого токена (claims, заголовки, подпись) вынесено
-//! в подмодуль [`jwt`].
+//! The internal representation of the token itself (claims, headers, signature)
+//! lives in the [`jwt`] submodule.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub mod jwt;
 
-/// Тело запроса на выпуск токена (`POST /tokens`).
+/// Body of a token issue request (`POST /tokens`).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TokenRequest {
     #[schema(example = "user123")]
@@ -24,96 +24,99 @@ pub struct TokenRequest {
     #[schema(example = json!(["api1", "api2"]))]
     pub aud: Vec<String>,
 
-    /// Необязательное кастомное время жизни токена в секундах.
+    /// Optional custom token lifetime in seconds.
     ///
-    /// Если не задано, используется `TOKEN_EXPIRATION_SECONDS`. При наличии
-    /// значение проверяется на границы `TOKEN_TTL_MIN_SECONDS` /
-    /// `TOKEN_TTL_MAX_SECONDS`; выход за них — `422 Unprocessable Entity`.
+    /// When unset, `TOKEN_EXPIRATION_SECONDS` is used. When present, the value
+    /// is checked against the `TOKEN_TTL_MIN_SECONDS` /
+    /// `TOKEN_TTL_MAX_SECONDS` bounds; going outside them gives
+    /// `422 Unprocessable Entity`.
     #[schema(example = 3600, nullable = true)]
     #[serde(default)]
     pub ttl: Option<u64>,
 
-    /// Выдать вместе с токеном refresh-токен для продления сессии.
+    /// Issue a refresh token alongside the access token to renew the session.
     ///
-    /// По умолчанию `false` — контракт существующих клиентов не меняется, а
-    /// refresh появляется только у тех, кто его осознанно попросил.
+    /// `false` by default — the contract of existing clients does not change and
+    /// a refresh token only appears for those who deliberately asked for one.
     #[schema(example = false)]
     #[serde(default)]
     pub refresh: bool,
 
-    /// Произвольные claims, которые попадут в payload токена рядом с
-    /// зарегистрированными (роли, scope, tenant, внутренний id).
+    /// Arbitrary claims that end up in the token payload alongside the
+    /// registered ones (roles, scope, tenant, an internal id).
     ///
-    /// Служебные имена (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
-    /// переопределять **нельзя** — попытка даёт `422`. Иначе клиент подменил бы
-    /// `exp` и обошёл границы `TOKEN_TTL_MIN_SECONDS` / `TOKEN_TTL_MAX_SECONDS`.
+    /// The reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`)
+    /// **cannot** be overridden — an attempt gives `422`. Otherwise a client
+    /// could substitute `exp` and bypass the `TOKEN_TTL_MIN_SECONDS` /
+    /// `TOKEN_TTL_MAX_SECONDS` bounds.
     ///
-    /// Ограничения по числу ключей и суммарному объёму задают
-    /// `TOKEN_CLAIMS_MAX_COUNT` и `TOKEN_CLAIMS_MAX_BYTES`: токен ездит в
-    /// заголовках, и раздутый payload ломает прокси.
+    /// The limits on the number of keys and the total size come from
+    /// `TOKEN_CLAIMS_MAX_COUNT` and `TOKEN_CLAIMS_MAX_BYTES`: a token travels in
+    /// headers, and a bloated payload breaks proxies.
     #[schema(example = json!({"role": "admin", "scope": ["read", "write"]}))]
     #[serde(default)]
     pub claims: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Тело запроса на проверку токена (`POST /tokens/verify`).
+/// Body of a token verification request (`POST /tokens/verify`).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TokenVerifyRequest {
-    /// Проверяемый токен целиком (`header.payload.signature`).
+    /// The whole token being verified (`header.payload.signature`).
     #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
     pub token: String,
 
-    /// Ожидаемый получатель; должен присутствовать в claim `aud` токена.
+    /// The expected recipient; must be present in the token's `aud` claim.
     #[schema(example = "api1")]
     pub audience: String,
 }
 
-/// Успешный ответ на выпуск токена.
+/// A successful response to a token issue request.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TokenResponse {
-    /// Подписанный JWT.
+    /// The signed JWT.
     #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
     pub token: String,
 
-    /// Refresh-токен, если он запрашивался.
+    /// The refresh token, when one was requested.
     ///
-    /// Непрозрачная строка, а не JWT: разбирать её клиенту незачем, она лишь
-    /// предъявляется в `POST /tokens/refresh`. Отсутствует в ответе, когда
-    /// refresh не запрашивали.
+    /// An opaque string rather than a JWT: the client has no reason to parse it,
+    /// it is only presented to `POST /tokens/refresh`. Absent from the response
+    /// when no refresh token was requested.
     #[schema(nullable = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
 }
 
-/// Тело запроса на обмен refresh-токена (`POST /tokens/refresh`).
+/// Body of a refresh token exchange request (`POST /tokens/refresh`).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RefreshRequest {
-    /// Refresh-токен, полученный при выпуске или предыдущем обмене.
+    /// The refresh token received on issue or on a previous exchange.
     pub refresh_token: String,
 }
 
-/// Результат массового отзыва токенов субъекта.
+/// The result of a bulk revocation of a subject's tokens.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RevokeGroupResponse {
-    /// Сколько активных токенов было отозвано.
+    /// How many active tokens were revoked.
     ///
-    /// Уже истёкшие в счёт не идут: они и так невалидны, отзывать их незачем.
+    /// Already expired ones do not count: they are invalid anyway and there is
+    /// nothing to revoke.
     #[schema(example = 3)]
     pub revoked: u64,
 }
 
-/// Унифицированное тело ответа об ошибке.
+/// The unified body of an error response.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
-    /// Краткое сообщение об ошибке.
+    /// A short error message.
     pub error: String,
-    /// Необязательные детали.
+    /// Optional details.
     #[schema(nullable = true)]
     pub details: Option<String>,
 }
 
 impl ErrorResponse {
-    /// Создаёт тело ошибки только с сообщением, без деталей.
+    /// Builds an error body with a message only, without details.
     pub fn new(error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
@@ -122,33 +125,33 @@ impl ErrorResponse {
     }
 }
 
-/// Ответ readiness-проверки (`GET /readyz`).
+/// The response of the readiness check (`GET /readyz`).
 ///
-/// `status` — агрегированное состояние (`"ok"`/`"degraded"`/`"unavailable"`),
-/// поля `redis` и `jwks` отражают готовность обслуживать запросы по каждой
-/// зависимости.
+/// `status` is the aggregated state (`"ok"`/`"degraded"`/`"unavailable"`), and
+/// the `redis` and `jwks` fields report readiness to serve requests per
+/// dependency.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReadinessResponse {
-    /// Агрегированный статус: `"ok"` — все зависимости доступны, `"degraded"` —
-    /// обслуживать можем, но сервис ключей отвечает не сам (снимок из памяти),
-    /// `"unavailable"` — обслуживать не можем.
+    /// The aggregated status: `"ok"` — every dependency is available,
+    /// `"degraded"` — we can serve but the key service is not answering itself
+    /// (a snapshot from memory), `"unavailable"` — we cannot serve.
     #[schema(example = "ok")]
     pub status: String,
-    /// Доступность Redis.
+    /// Redis availability.
     pub redis: bool,
-    /// Готовность по сервису ключей: он ответил **или** в памяти есть пригодный
-    /// снимок JWKS, которым верификация обслуживается и без него.
+    /// Readiness with respect to the key service: it answered **or** memory
+    /// holds a usable JWKS snapshot that verification is served from without it.
     pub jwks: bool,
-    /// Сервис ключей не ответил, и `jwks` держится на устаревшем снимке. Это
-    /// временная деградация: когда снимок перестанет быть пригодным, `jwks`
-    /// станет `false`.
+    /// The key service did not answer and `jwks` rests on a stale snapshot.
+    /// This is temporary degradation: once the snapshot stops being usable,
+    /// `jwks` turns `false`.
     pub jwks_stale: bool,
 }
 
-/// Полное представление ключа, включая приватную часть.
+/// The full representation of a key, including its private part.
 ///
-/// Возвращается сервисом `jwks-service-app` при запросе/создании ключа и
-/// используется для подписи токенов. **Не** отдаётся наружу клиентам API.
+/// Returned by `jwks-service-app` when a key is requested or created, and used
+/// to sign tokens. **Never** exposed to API clients.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwkData {
     /// Unique key identifier.
@@ -172,12 +175,12 @@ pub struct JwkData {
     pub private_key: String,
 }
 
-/// Публичное представление ключа (JSON Web Key), без приватной части.
+/// The public representation of a key (a JSON Web Key), without the private part.
 ///
-/// Набор полей зависит от типа ключа: для RSA заполнены `n`/`e`, для EC —
-/// `crv`/`x`/`y`, для OKP (EdDSA) — `crv`/`x`.
-// `Clone` нужен кешу JWKS: ключ отдаётся наружу копией, чтобы не держать
-// блокировку кеша на время сборки `PKey` (см. `jwk.rs`).
+/// Which fields are populated depends on the key type: RSA fills `n`/`e`, EC
+/// fills `crv`/`x`/`y`, OKP (EdDSA) fills `crv`/`x`.
+// `Clone` is needed by the JWKS cache: the key is handed out as a copy so that
+// the cache lock is not held while a `PKey` is assembled (see `jwk.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwk {
     /// Key type (e.g., "RSA").
@@ -197,19 +200,20 @@ pub struct Jwk {
     pub e: Option<String>,
 }
 
-/// Набор публичных ключей — ответ эндпоинта `.well-known/jwks.json`.
+/// A set of public keys — the response of the `.well-known/jwks.json` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwks {
-    /// Список доступных публичных ключей.
+    /// The list of available public keys.
     pub keys: Vec<Jwk>,
 }
 
 #[cfg(test)]
 mod tests {
-    //! Тесты сериализации DTO.
+    //! DTO serialisation tests.
     //!
-    //! Проверяется то, что видит клиент: форма JSON и поведение дефолтов.
-    //! Обе вещи — часть публичного контракта, а не деталь реализации.
+    //! What is checked is what the client sees: the shape of the JSON and the
+    //! behaviour of the defaults. Both are part of the public contract rather
+    //! than an implementation detail.
 
     use super::*;
     use serde_json::json;
@@ -223,8 +227,9 @@ mod tests {
 
         let value = serde_json::to_value(&response).unwrap();
 
-        // Ключа быть не должно вовсе — не `null`. Иначе прежние клиенты увидели
-        // бы в ответе новое поле, которого не ждали (см. `skip_serializing_if`).
+        // The key must be absent entirely — not `null`. Otherwise existing
+        // clients would see a new field in the response they did not expect (see
+        // `skip_serializing_if`).
         assert_eq!(value, json!({ "token": "header.payload.signature" }));
         assert!(!value.as_object().unwrap().contains_key("refresh_token"));
     }
@@ -243,14 +248,14 @@ mod tests {
 
     #[test]
     fn token_request_defaults_are_optional() {
-        // Минимальное тело: ни `ttl`, ни `refresh` клиент присылать не обязан.
+        // A minimal body: the client need not send either `ttl` or `refresh`.
         let request: TokenRequest =
             serde_json::from_value(json!({ "sub": "user1", "aud": ["api1"] })).unwrap();
 
         assert_eq!(request.sub, "user1");
         assert_eq!(request.aud, vec!["api1".to_string()]);
         assert!(request.ttl.is_none());
-        assert!(!request.refresh, "refresh по умолчанию выключен");
+        assert!(!request.refresh, "refresh is off by default");
     }
 
     #[test]
@@ -266,7 +271,7 @@ mod tests {
 
     #[test]
     fn jwk_keeps_unset_components_as_none() {
-        // OKP-ключ (EdDSA): заполнены `crv`/`x`, компоненты RSA отсутствуют.
+        // An OKP key (EdDSA): `crv`/`x` are filled and the RSA components are absent.
         let jwk: Jwk = serde_json::from_value(json!({
             "kty": "OKP", "alg": "EdDSA", "kid": "kid-1",
             "crv": "Ed25519", "x": "AAAA",
@@ -281,7 +286,7 @@ mod tests {
 
     #[test]
     fn jwks_parses_empty_key_list() {
-        // Пустой список — штатный ответ сервиса ключей до выпуска первого ключа.
+        // An empty list is the normal response of the key service before the first key is issued.
         let jwks: Jwks = serde_json::from_value(json!({ "keys": [] })).unwrap();
         assert!(jwks.keys.is_empty());
     }

@@ -1,40 +1,41 @@
-//! Аллоулист issuer'ов (`TOKEN_ISSUER_ALLOWLIST`).
+//! The issuer allowlist (`TOKEN_ISSUER_ALLOWLIST`).
 //!
-//! Значение claim `iss` берётся из заголовка `Host` запроса, а не из конфига
-//! (см. [`crate::handlers`]). Это удобно — один образ обслуживает несколько
-//! доменов, — но без ограничений клиент выбирает `iss` сам. Когда два инстанса
-//! делят один `jwks-service-app`, у инстанса `A` можно выпустить токен с
-//! `Host: b.example.com`: подпись сделана общим ключом, и инстанс `B` такой
-//! токен примет как свой.
+//! The value of the `iss` claim comes from the `Host` header of the request
+//! rather than from the configuration (see [`crate::handlers`]). That is
+//! convenient — one image serves several domains — but without constraints the
+//! client picks `iss` itself. When two instances share one `jwks-service-app`,
+//! instance `A` can be made to issue a token with `Host: b.example.com`: the
+//! signature is made with the shared key, and instance `B` accepts such a token
+//! as its own.
 //!
-//! Аллоулист закрывает это: если список задан, `Host` вне него отвергается.
-//! Пустой/незаданный список — прежнее поведение (любой `Host`), чтобы
-//! обновление не ломало текущие деплои.
+//! The allowlist closes that: when the list is set, a `Host` outside it is
+//! rejected. An empty or unset list means the previous behaviour (any `Host`),
+//! so that an upgrade does not break existing deployments.
 //!
-//! Сравнение регистронезависимое (имена хостов регистронезависимы), но в
-//! остальном точное: порт — часть значения (`example.com` и `example.com:8443`
-//! различны), так как именно строка `Host` целиком уезжает в `iss` и с ней же
-//! сверяется при проверке токена.
+//! The comparison is case-insensitive (host names are case-insensitive) but
+//! exact otherwise: the port is part of the value (`example.com` and
+//! `example.com:8443` differ), because it is the whole `Host` string that goes
+//! into `iss` and is compared against during verification.
 
 use std::env;
 
 use tracing::{info, warn};
 
-/// Имя переменной окружения со списком разрешённых `iss`.
+/// Name of the environment variable holding the list of allowed `iss` values.
 pub const ALLOWLIST_VAR: &str = "TOKEN_ISSUER_ALLOWLIST";
 
-/// Разбирает аллоулист из окружения: значения через запятую, пустые элементы
-/// пропускаются, регистр нормализуется к нижнему.
+/// Parses the allowlist from the environment: comma-separated values, empty
+/// elements skipped, case normalised to lower.
 ///
-/// Читается на каждый запрос, как и остальная конфигурация токенов
-/// (`TOKEN_EXPIRATION_SECONDS` и соседи): список короткий, а лишнего состояния
-/// в обработчиках не заводим.
+/// It is read on every request, like the rest of the token configuration
+/// (`TOKEN_EXPIRATION_SECONDS` and its neighbours): the list is short, and we do
+/// not keep extra state in the handlers.
 fn allowlist() -> Vec<String> {
     parse(&env::var(ALLOWLIST_VAR).unwrap_or_default())
 }
 
-/// Разбирает сырое значение аллоулиста (вынесено из [`allowlist`], чтобы тесты
-/// не трогали процесс-глобальное окружение).
+/// Parses a raw allowlist value (extracted from [`allowlist`] so that tests do
+/// not touch the process-global environment).
 fn parse(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_ascii_lowercase())
@@ -42,39 +43,40 @@ fn parse(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Разрешён ли `host` в качестве `iss`.
+/// Whether `host` is allowed as an `iss`.
 ///
-/// Пустой или незаданный аллоулист разрешает любой `Host`.
+/// An empty or unset allowlist permits any `Host`.
 pub fn is_allowed(host: &str) -> bool {
     allowed_by(&allowlist(), host)
 }
 
-/// Проверка по уже разобранному списку.
+/// Check against an already parsed list.
 fn allowed_by(allowed: &[String], host: &str) -> bool {
     allowed.is_empty() || allowed.iter().any(|a| a == &host.to_ascii_lowercase())
 }
 
-/// Пишет в лог сводку конфигурации на старте.
+/// Writes a summary of the configuration to the log at startup.
 ///
-/// Незаданный список — не ошибка, но о нём предупреждаем: в конфигурации с
-/// общим `jwks-service-app` это открытый выпуск токенов от чужого имени.
+/// An unset list is not an error, but it is worth a warning: in a setup with a
+/// shared `jwks-service-app` it means tokens can be issued under someone else's
+/// name.
 pub fn log_summary() {
     let allowed = allowlist();
     if allowed.is_empty() {
         warn!(
-            "{ALLOWLIST_VAR} не задан: claim iss берётся из заголовка Host без проверки. \
-             Если инстансы делят один jwks-service-app, задайте список разрешённых issuer'ов."
+            "{ALLOWLIST_VAR} is not set: the iss claim is taken from the Host header without \
+             validation. If instances share one jwks-service-app, set the list of allowed issuers."
         );
     } else {
-        info!("Разрешённые issuer (iss): {}", allowed.join(", "));
+        info!("Allowed issuers (iss): {}", allowed.join(", "));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Разбор и сверка проверяются на чистых функциях: процесс-глобальную
-    //! переменную окружения тесты не трогают, иначе они конфликтовали бы с
-    //! тестами HTTP-слоя, бегущими параллельно.
+    //! Parsing and matching are checked on pure functions: the tests never touch
+    //! the process-global environment variable, which would otherwise clash with
+    //! the HTTP layer tests running in parallel.
 
     use super::*;
 
@@ -83,8 +85,9 @@ mod tests {
         assert!(allowed_by(&parse(""), "example.com"));
         assert!(allowed_by(&parse(""), "evil.example.net"));
 
-        // Заданный, но пустой по содержанию список — тоже «без ограничений»:
-        // иначе лишняя запятая в конфиге молча закрывала бы выпуск целиком.
+        // A list that is set but empty in substance also means "no constraint":
+        // otherwise a stray comma in the configuration would silently shut
+        // issuing down entirely.
         assert!(allowed_by(&parse(" , ,"), "example.com"));
     }
 
@@ -102,7 +105,7 @@ mod tests {
         assert!(allowed_by(&allowed, "a.example.com"));
         assert!(allowed_by(&allowed, "A.EXAMPLE.COM"));
         assert!(allowed_by(&allowed, "b.example.com:8443"));
-        // Порт — часть значения `Host`, а значит и `iss`.
+        // The port is part of the `Host` value, and therefore of `iss`.
         assert!(!allowed_by(&allowed, "a.example.com:8443"));
         assert!(!allowed_by(&allowed, "b.example.com"));
     }

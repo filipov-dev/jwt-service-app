@@ -1,16 +1,26 @@
 # Changelog
 
-Все заметные изменения этого проекта. Формат основан на
-[Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по
-[семантическому версионированию](https://semver.org/lang/ru/).
+All notable changes to this project. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
+[semantic versioning](https://semver.org/).
 
-Файл собран из истории коммитов и перегенерируется командой
-`scripts/changelog.sh --all`; тело каждого релиза на GitHub собирает тот же
-скрипт. Записи — это subject'ы коммитов дословно, в скобках указан ключ задачи.
+The file is assembled from the commit history and regenerated with
+`scripts/changelog.sh --all`; the body of every GitHub release is built by the
+same script. The entries are commit subjects verbatim, with the task key in
+parentheses.
 
-К шести разделам Keep a Changelog добавлены «Документация» (клиентские примеры
-и инструкции по эксплуатации — изменения для потребителя сервиса) и
-«Внутреннее» (CI, тесты, форматирование).
+Two sections are added to the six of Keep a Changelog: "Documentation" (client
+examples and operating instructions — changes for the consumer of the service)
+and "Internal" (CI, tests, formatting).
+
+Entries before 1.17.13 are in Russian: the repository switched to English in
+JWT-114 and the commit history was deliberately left as it was.
+
+## [1.17.13] - 2026-08-29
+
+### Documentation
+
+- switch the repository to English, with a CI language gate (JWT-114)
 
 ## [1.17.12] - 2026-08-28
 
@@ -388,7 +398,8 @@
 
 - Init
 
-[Не выпущено]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.13]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.12...v1.17.13
 [1.17.12]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.11...v1.17.12
 [1.17.11]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.10...v1.17.11
 [1.17.10]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.9...v1.17.10

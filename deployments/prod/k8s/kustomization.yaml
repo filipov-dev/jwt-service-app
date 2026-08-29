@@ -1,8 +1,8 @@
-# Применение: kubectl apply -k deployments/prod/k8s/
+# Applying it: kubectl apply -k deployments/prod/k8s/
 #
-# secret.example.yaml здесь намеренно НЕ перечислен: он образец, а не манифест
-# для применения. Заведите Secret через секрет-менеджер кластера либо скопируйте
-# образец в secret.yaml, заполните и добавьте его в resources локально.
+# secret.example.yaml is deliberately NOT listed here: it is a sample, not a
+# manifest to apply. Create the Secret through the cluster's secret manager, or
+# copy the sample to secret.yaml, fill it in and add it to resources locally.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -12,9 +12,10 @@ resources:
   - pdb.yaml
   - networkpolicy.yaml
 
-# `labels` (без includeSelectors), а не `commonLabels`: последний дописывает
-# метки и в selector Deployment'а, а selector после создания неизменяем — такой
-# манифест применился бы один раз, а на обновлении упал бы с ошибкой поля
+# `labels` (without includeSelectors) rather than `commonLabels`: the latter also
+# writes the labels into the Deployment's selector, and a selector is immutable
+# after creation — such a manifest would apply once and fail on the next update
+# with a field error
 # spec.selector.
 labels:
   - pairs:

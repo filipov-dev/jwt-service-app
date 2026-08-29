@@ -4,17 +4,17 @@ on:
   pull_request:
     branches:
       - master
-  # Мерж-коммиты и прямые пуши в master тоже должны проверяться: без этого
-  # ветка по умолчанию остаётся единственным местом, где код не проходит CI.
+  # Merge commits and direct pushes to master must be checked too: without this
+  # the default branch stays the one place where code never goes through CI.
   push:
     branches:
       - master
   workflow_dispatch:
 
-# Публичный репозиторий: PR открывает кто угодно, и каждый пуш в его ветку
-# запускает полный прогон. Новый пуш отменяет предыдущий прогон того же PR,
-# чтобы серия пушей не держала очередь раннеров. Прогоны на `master` не
-# отменяются никогда — там `cancel-in-progress` выключен условием.
+# A public repository: anyone can open a pull request, and every push to its
+# branch starts a full run. A new push cancels the previous run of the same pull
+# request so that a series of pushes does not hog the runner queue. Runs on
+# `master` are never cancelled — the condition turns `cancel-in-progress` off.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -27,10 +27,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # persist-credentials: false — checkout по умолчанию оставляет токен
-      # в `.git/config` до конца job'ы, а следующие шаги собирают и запускают
-      # код из PR, то есть чужой код с доступом к рабочему каталогу. Ни один
-      # шаг ниже в git по сети не ходит, поэтому токену там делать нечего.
+      # persist-credentials: false — by default checkout leaves the token in
+      # `.git/config` for the rest of the job, while the steps below build and
+      # run the code from the pull request, that is, someone else's code with
+      # access to the working directory. No step below talks to git over the
+      # network, so the token has no business being there.
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -38,10 +39,11 @@ jobs:
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
-      # Канал совпадает с `rust-toolchain.toml` в корне (channel = "stable"),
-      # поэтому cargo, который читает toolchain-файл, получает ровно тот
-      # тулчейн, который поставил этот шаг. Компоненты продублированы намеренно:
-      # так они ставятся сразу, а не догружаются при первом вызове clippy.
+      # The channel matches `rust-toolchain.toml` in the root
+      # (channel = "stable"), so cargo, which reads the toolchain file, gets
+      # exactly the toolchain this step installed. The components are duplicated
+      # on purpose: that way they are installed up front rather than pulled in
+      # on the first clippy invocation.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,18 +52,24 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Скрипты релиза — тоже код, и ломаются они молча уже в CI. shellcheck
-      # предустановлен на раннере, шаг занимает секунду.
+      # Release scripts are code too, and they break silently once in CI.
+      # shellcheck is preinstalled on the runner and the step takes a second.
       - name: Shellcheck
         run: shellcheck scripts/*.sh
 
-      # Форматирование проверяется первым: шаг быстрый и не требует сборки,
-      # поэтому даёт обратную связь раньше остальных.
+      # The language gate: this repository is English (see AGENTS.md,
+      # "Repository language"). It runs before the build for the same reason as
+      # the formatting check — it is instant and needs no toolchain.
+      - name: Language
+        run: scripts/check-language.sh
+
+      # Formatting is checked first: the step is fast and needs no build, so it
+      # gives feedback before the others.
       - name: Format
         run: cargo fmt --all -- --check
 
-      # `-D warnings` делает предупреждения ошибками: без него шаг оставался
-      # зелёным при любых замечаниях и ничего не гарантировал.
+      # `-D warnings` turns warnings into errors: without it the step stayed
+      # green whatever the linter said and guaranteed nothing.
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

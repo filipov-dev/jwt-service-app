@@ -1,9 +1,10 @@
-# NGINX Ingress Controller (Kubernetes). Секрет монтируется из Kubernetes Secret
-# в переменную окружения контроллера НЕ напрямую — configuration-snippet не читает
-# env пода. Практика: рендерить snippet из Secret через шаблон (Helm/Kustomize),
-# либо использовать более безопасный auth-snippet. Ниже — configuration-snippet.
+# NGINX Ingress Controller (Kubernetes). A secret is NOT mounted from a
+# Kubernetes Secret into a controller environment variable directly —
+# configuration-snippet does not read the pod's env. The practice: render the
+# snippet from the Secret through a template (Helm/Kustomize), or use the safer
+# auth-snippet. Below: configuration-snippet.
 #
-# ВАЖНО: snippets должны быть разрешены (allow-snippet-annotations: "true").
+# IMPORTANT: snippets must be allowed (allow-snippet-annotations: "true").
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -11,10 +12,11 @@ metadata:
   name: jwt-service
   annotations:
     nginx.ingress.kubernetes.io/configuration-snippet: |
-      # (1) Затираем клиентскую версию заголовка.
+      # (1) Strip the client-supplied version of the header.
       proxy_set_header X-Proxy-Secret "";
-      # (2) Ставим секрет. Значение подставляется при рендере манифеста из
-      # Kubernetes Secret (Helm: {{ .Values.proxySecret }} / Kustomize secretGenerator).
+      # (2) Set the secret. The value is substituted when the manifest is
+      # rendered, from a Kubernetes Secret (Helm: {{ .Values.proxySecret }} /
+      # Kustomize secretGenerator).
       proxy_set_header X-Proxy-Secret "REPLACE_WITH_SECRET_AT_RENDER";
 spec:
   rules:

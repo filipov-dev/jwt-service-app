@@ -1,9 +1,10 @@
-//! Реализация хранилища `jti` поверх Redis.
+//! The `jti` store implemented on top of Redis.
 //!
-//! [`RedisClient`] реализует трейт [`JtiStore`]: каждый активный токен
-//! представлен ключом-`jti` со значением-заглушкой и TTL, равным времени жизни
-//! токена. Наличие ключа = токен активен, удаление = отзыв, истечение TTL =
-//! естественное «протухание».
+//! [`RedisClient`] implements the [`JtiStore`] trait: every active token is
+//! represented by a `jti` key with a placeholder value and a TTL equal to the
+//! token lifetime. The presence of the key means the token is active, deleting
+//! it means revocation, and the TTL expiring is the natural way a token goes
+//! stale.
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{AsyncCommands, ExistenceCheck, RedisError, SetExpiry, SetOptions};
@@ -18,42 +19,42 @@ use tracing::error;
 use crate::metrics::record_redis_command;
 use crate::models::jwt::{refresh_key, totp_code_key, JtiError, JtiStore, RefreshRecord};
 
-/// Таймаут ожидания ответа на команду (`REDIS_RESPONSE_TIMEOUT_MS`).
+/// Timeout waiting for a command response (`REDIS_RESPONSE_TIMEOUT_MS`).
 ///
-/// Redis отвечает за доли миллисекунды, так что секунда — это уже явная
-/// аномалия. Без таймаута зависший (не упавший) Redis удерживал бы обработчик
-/// неограниченно долго.
+/// Redis answers in fractions of a millisecond, so a whole second is already a
+/// clear anomaly. Without a timeout a hung (not crashed) Redis would hold a
+/// handler indefinitely.
 const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 1000;
 
-/// Таймаут установки соединения (`REDIS_CONNECT_TIMEOUT_MS`).
+/// Connection timeout (`REDIS_CONNECT_TIMEOUT_MS`).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 500;
 
-/// Потолок паузы между попытками переподключения.
+/// Upper bound on the pause between reconnection attempts.
 const REFRESH_MAX_DELAY_MS: u64 = 200;
 
-/// Читает миллисекунды из переменной окружения, откатываясь на `default`.
+/// Reads milliseconds from an environment variable, falling back to `default`.
 ///
-/// Не fail-fast: кривое значение даёт предупреждение и дефолт — опечатка в
-/// таймауте не должна ронять сервис.
+/// Not fail-fast: a malformed value gives a warning and the default — a typo in
+/// a timeout must not bring the service down.
 fn env_millis(name: &str, default: u64) -> u64 {
     match env::var(name) {
         Err(_) => default,
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(value) => value,
             Err(_) => {
-                tracing::warn!("{name}: некорректное значение {raw:?}, беру дефолт {default}");
+                tracing::warn!("{name}: invalid value {raw:?}, using the default {default}");
                 default
             }
         },
     }
 }
 
-/// Различает отказ соединения и прочие ошибки команды.
+/// Distinguishes a connection failure from other command errors.
 ///
-/// Прежде это различие давала отдельная стадия открытия соединения; теперь
-/// соединение постоянное, и тип сбоя виден только по самой ошибке. Деление
-/// сохраняем: [`JtiError::BadConnection`] означает «хранилище недоступно», и по
-/// нему видно, что дело не в самой команде.
+/// This distinction used to come from a separate connection-opening stage; the
+/// connection is now permanent and the kind of failure is only visible from the
+/// error itself. The split is kept: [`JtiError::BadConnection`] means "the store
+/// is unavailable", and it makes clear that the command itself is not at fault.
 fn classify(error: &RedisError) -> JtiError {
     if error.is_timeout() || error.is_connection_dropped() || error.is_connection_refusal() {
         JtiError::BadConnection
@@ -62,38 +63,38 @@ fn classify(error: &RedisError) -> JtiError {
     }
 }
 
-/// Клиент Redis поверх [`ConnectionManager`].
+/// The Redis client on top of a [`ConnectionManager`].
 ///
-/// Менеджер держит **одно** мультиплексированное соединение на процесс и сам
-/// восстанавливает его после обрыва. Клонирование дёшево (внутри `Arc`) — все
-/// копии работают через это соединение.
+/// The manager holds **one** multiplexed connection per process and restores it
+/// itself after a drop. Cloning is cheap (an `Arc` inside) — every copy works
+/// through that connection.
 ///
-/// Раньше здесь на каждую команду открывалось новое соединение: под нагрузкой
-/// это исчерпывало эфемерные порты (`os error 49`), и валидные токены получали
-/// `401`, потому что `check_jti` не мог достучаться до хранилища.
+/// This used to open a new connection per command: under load that exhausted the
+/// ephemeral ports (`os error 49`), and valid tokens got a `401` because
+/// `check_jti` could not reach the store.
 #[derive(Clone)]
 pub struct RedisClient {
     client: redis::Client,
     config: ConnectionManagerConfig,
-    /// Менеджер соединения, создаваемый при первом обращении.
+    /// The connection manager, created on first use.
     manager: Arc<OnceCell<ConnectionManager>>,
 }
 
 impl RedisClient {
-    /// Создаёт клиент по строке подключения из `REDIS_URL`
-    /// (по умолчанию `redis://redis:6379`).
+    /// Creates a client from the connection string in `REDIS_URL`
+    /// (`redis://redis:6379` by default).
     ///
     /// # Errors
-    /// [`RedisError`], если URL некорректен. Соединение здесь не открывается —
-    /// см. [`RedisClient::connection`].
+    /// A [`RedisError`] when the URL is invalid. No connection is opened here —
+    /// see [`RedisClient::connection`].
     pub fn new() -> Result<Self, RedisError> {
         let url = env::var("REDIS_URL").unwrap_or("redis://redis:6379".into());
 
         let client = redis::Client::open(url)?;
 
-        // `Option` у таймаутов — с redis 1.0: `None` означает «без таймаута»,
-        // и раз он выражается явно, значение стало опциональным. У нас таймаут
-        // есть всегда, поэтому оба — `Some`.
+        // The timeouts became `Option` in redis 1.0: `None` means "no timeout",
+        // and since that is now expressed explicitly the value became optional.
+        // We always have a timeout, so both are `Some`.
         let config = ConnectionManagerConfig::new()
             .set_response_timeout(Some(Duration::from_millis(env_millis(
                 "REDIS_RESPONSE_TIMEOUT_MS",
@@ -103,12 +104,12 @@ impl RedisClient {
                 "REDIS_CONNECT_TIMEOUT_MS",
                 DEFAULT_CONNECT_TIMEOUT_MS,
             ))))
-            // Дефолт — 6 попыток с экспоненциальной задержкой, суммарно больше
-            // шести секунд. Для нас это неприемлемо: пока идут ретраи, висит
-            // обработчик запроса (в том числе `/readyz`, который обязан отвечать
-            // быстро). Одной повторной попытки достаточно, чтобы пережить
-            // мгновенный обрыв, а более долгую недоступность правильнее показать
-            // в readiness, чем прятать за ожиданием.
+            // The default is 6 attempts with exponential backoff, more than six
+            // seconds in total. That is unacceptable for us: while the retries
+            // run, a request handler is blocked (`/readyz` included, which must
+            // answer quickly). One retry is enough to survive an instantaneous
+            // drop, and a longer outage is better shown in readiness than hidden
+            // behind waiting.
             .set_number_of_retries(1)
             .set_max_delay(Duration::from_millis(REFRESH_MAX_DELAY_MS));
 
@@ -119,21 +120,21 @@ impl RedisClient {
         })
     }
 
-    /// Возвращает соединение для выполнения команды, создавая его при первом
-    /// обращении.
+    /// Returns a connection for running a command, creating it on first use.
     ///
-    /// Менеджер инициализируется **лениво и один раз на процесс**: дальше все
-    /// команды идут по одному мультиплексированному соединению, которое он сам
-    /// восстанавливает после обрыва.
+    /// The manager is initialised **lazily and once per process**: from then on
+    /// every command goes over one multiplexed connection, which it restores
+    /// itself after a drop.
     ///
-    /// Ленивость здесь принципиальна, а не унаследована: недоступный на старте
-    /// Redis не должен ронять процесс. Сервис поднимается, `GET /readyz` честно
-    /// отвечает `503`, трафик на под не идёт — а когда хранилище появится,
-    /// соединение установится само, без рестарта. При неудачной попытке ячейка
-    /// остаётся пустой, поэтому следующий запрос попробует снова.
+    /// The laziness here is a principle rather than an inheritance: a Redis that
+    /// is unavailable at startup must not bring the process down. The service
+    /// comes up, `GET /readyz` honestly answers `503`, no traffic is routed to
+    /// the pod — and once the store appears the connection establishes itself
+    /// without a restart. A failed attempt leaves the cell empty, so the next
+    /// request tries again.
     ///
     /// # Errors
-    /// [`JtiError::BadConnection`], если подключиться не удалось.
+    /// [`JtiError::BadConnection`] when the connection could not be established.
     async fn connection(&self) -> Result<ConnectionManager, JtiError> {
         self.manager
             .get_or_try_init(|| {
@@ -142,22 +143,22 @@ impl RedisClient {
             .await
             .cloned()
             .map_err(|e| {
-                // Отказ хранилища — ERROR.
-                error!("Redis: не удалось открыть соединение: {}", e);
+                // A store failure — ERROR.
+                error!("Redis: could not open a connection: {}", e);
                 JtiError::BadConnection
             })
     }
 }
 
 impl JtiStore for RedisClient {
-    /// Проверяет доступность Redis командой `PING`.
+    /// Checks that Redis is available with a `PING` command.
     ///
-    /// Используется в readiness-проверке (`GET /readyz`): открывает соединение и
-    /// выполняет `PING`, ожидая ответ `PONG`.
+    /// Used by the readiness check (`GET /readyz`): it opens a connection and
+    /// runs `PING`, expecting a `PONG` back.
     ///
     /// # Errors
-    /// - [`JtiError::BadConnection`] — не удалось открыть соединение;
-    /// - [`JtiError::WrongOperation`] — команда `PING` не выполнилась.
+    /// - [`JtiError::BadConnection`] — the connection could not be opened;
+    /// - [`JtiError::WrongOperation`] — the `PING` command failed.
     #[tracing::instrument(name = "redis.ping", skip_all, err(level = "debug"))]
     async fn ping(&self) -> Result<(), JtiError> {
         let mut conn = self.connection().await?;
@@ -170,14 +171,14 @@ impl JtiStore for RedisClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Redis: PING не выполнился: {}", e);
+                error!("Redis: PING failed: {}", e);
                 record_redis_command("ping", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Записывает `jti` со значением-заглушкой `1` и TTL `ttl` секунд (`SETEX`).
+    /// Writes the `jti` with the placeholder value `1` and a TTL of `ttl` seconds (`SETEX`).
     #[tracing::instrument(name = "redis.store_jti", skip_all, err(level = "debug"))]
     async fn store_jti(&self, jti: &str, ttl: u64) -> Result<(), JtiError> {
         let mut conn = self.connection().await?;
@@ -189,14 +190,14 @@ impl JtiStore for RedisClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Redis: SETEX не выполнился: {}", e);
+                error!("Redis: SETEX failed: {}", e);
                 record_redis_command("store_jti", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Проверяет существование ключа `jti` (`EXISTS`).
+    /// Checks whether the `jti` key exists (`EXISTS`).
     #[tracing::instrument(name = "redis.check_jti", skip_all, err(level = "debug"))]
     async fn check_jti(&self, jti: &str) -> Result<bool, JtiError> {
         let mut conn = self.connection().await?;
@@ -208,22 +209,24 @@ impl JtiStore for RedisClient {
                 Ok(v)
             }
             Err(e) => {
-                error!("Redis: EXISTS не выполнился: {}", e);
+                error!("Redis: EXISTS failed: {}", e);
                 record_redis_command("check_jti", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Добавляет `jti` в ZSET группы со score, равным времени истечения
+    /// Adds the `jti` to the group's ZSET with the expiry time as the score
     /// (`ZADD`).
     ///
-    /// ZSET, а не SET: у элементов множества нет собственного TTL, и истёкшие
-    /// `jti` копились бы в индексе мёртвым грузом. Score = момент истечения
-    /// позволяет отрезать их одной командой (см. [`RedisClient::revoke_group`]).
+    /// A ZSET rather than a SET: elements of a set have no TTL of their own, and
+    /// expired `jti` values would pile up in the index as dead weight. With the
+    /// expiry moment as the score they can be cut off by a single command (see
+    /// [`RedisClient::revoke_group`]).
     ///
-    /// TTL самой группы продлевается до времени жизни самого долгого токена в
-    /// ней: иначе индекс пережил бы все свои токены и остался висеть в памяти.
+    /// The TTL of the group itself is extended to the lifetime of its
+    /// longest-lived token: otherwise the index would outlive all of its tokens
+    /// and hang around in memory.
     #[tracing::instrument(name = "redis.add_to_group", skip_all, err(level = "debug"))]
     async fn add_to_group(&self, group: &str, jti: &str, expires_at: i64) -> Result<(), JtiError> {
         let mut conn = self.connection().await?;
@@ -243,23 +246,24 @@ impl JtiStore for RedisClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Redis: ZADD в группу не выполнился: {}", e);
+                error!("Redis: ZADD into the group failed: {}", e);
                 record_redis_command("add_to_group", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Отзывает все токены группы.
+    /// Revokes every token of a group.
     ///
-    /// Порядок: отрезаем протухшие записи по score, забираем оставшиеся `jti`,
-    /// удаляем их пачкой и саму группу.
+    /// The order: cut off the expired entries by score, take the remaining `jti`
+    /// values, delete them in one batch and then the group itself.
     ///
-    /// Атомарности здесь намеренно нет: параллельный выпуск токена во время
-    /// отзыва может добавить `jti` уже после `ZRANGE`, и такой токен уцелеет.
-    /// Окно — доли миллисекунды, а цена атомарности (Lua-скрипт или WATCH) выше
-    /// пользы: массовый отзыв делают при компрометации, и следом за ним обычно
-    /// меняют учётные данные субъекта.
+    /// There is deliberately no atomicity here: a token issued concurrently with
+    /// a revocation may add its `jti` after the `ZRANGE`, and such a token
+    /// survives. The window is a fraction of a millisecond, and the cost of
+    /// atomicity (a Lua script or WATCH) outweighs the benefit: bulk revocation
+    /// happens on compromise, and the subject's credentials are usually rotated
+    /// right after.
     #[tracing::instrument(name = "redis.revoke_group", skip_all, err(level = "debug"))]
     async fn revoke_group(&self, group: &str) -> Result<u64, JtiError> {
         let mut conn = self.connection().await?;
@@ -268,7 +272,7 @@ impl JtiStore for RedisClient {
         let now = chrono::Utc::now().timestamp();
 
         let result: Result<u64, RedisError> = async {
-            // Протухшие токены отзывать незачем — они и так невалидны.
+            // There is no point revoking expired tokens — they are invalid anyway.
             conn.zrembyscore::<&str, &str, i64, ()>(group, "-inf", now)
                 .await?;
 
@@ -289,14 +293,14 @@ impl JtiStore for RedisClient {
                 Ok(count)
             }
             Err(e) => {
-                error!("Redis: отзыв группы не выполнился: {}", e);
+                error!("Redis: group revocation failed: {}", e);
                 record_redis_command("revoke_group", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Сохраняет запись refresh-токена как HASH с TTL.
+    /// Stores a refresh token record as a HASH with a TTL.
     #[tracing::instrument(name = "redis.store_refresh", skip_all, err(level = "debug"))]
     async fn store_refresh(
         &self,
@@ -308,11 +312,14 @@ impl JtiStore for RedisClient {
         let started = Instant::now();
         let key = refresh_key(id);
 
-        // Аудитория — список, а в HASH значения плоские; кладём JSON-массивом.
+        // The audience is a list while HASH values are flat; we store it as a JSON array.
         let audience = match serde_json::to_string(&record.audience) {
             Ok(v) => v,
             Err(e) => {
-                error!("Redis: не сериализуется audience refresh-токена: {}", e);
+                error!(
+                    "Redis: the refresh token audience does not serialise: {}",
+                    e
+                );
                 return Err(JtiError::WrongOperation);
             }
         };
@@ -338,14 +345,14 @@ impl JtiStore for RedisClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Redis: запись refresh-токена не выполнилась: {}", e);
+                error!("Redis: writing the refresh token failed: {}", e);
                 record_redis_command("store_refresh", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Читает запись refresh-токена (`HGETALL`).
+    /// Reads a refresh token record (`HGETALL`).
     #[tracing::instrument(name = "redis.get_refresh", skip_all, err(level = "debug"))]
     async fn get_refresh(&self, id: &str) -> Result<Option<RefreshRecord>, JtiError> {
         let mut conn = self.connection().await?;
@@ -360,13 +367,13 @@ impl JtiStore for RedisClient {
                 v
             }
             Err(e) => {
-                error!("Redis: чтение refresh-токена не выполнилось: {}", e);
+                error!("Redis: reading the refresh token failed: {}", e);
                 record_redis_command("get_refresh", false, started.elapsed());
                 return Err(classify(&e));
             }
         };
 
-        // Пустой HASH — ключа нет: истёк или отозван.
+        // An empty HASH means there is no key: it expired or was revoked.
         if fields.is_empty() {
             return Ok(None);
         }
@@ -374,16 +381,16 @@ impl JtiStore for RedisClient {
         let (Some(subject), Some(audience), Some(family)) =
             (fields.get("sub"), fields.get("aud"), fields.get("family"))
         else {
-            // Запись есть, но неполная — так быть не должно; трактуем как
-            // отсутствие, чтобы не выпустить токен на мусорных данных.
-            error!("Redis: запись refresh-токена неполная");
+            // The record exists but is incomplete — that should not happen; we
+            // treat it as absent so as not to issue a token on junk data.
+            error!("Redis: the refresh token record is incomplete");
             return Ok(None);
         };
 
         let audience: Vec<String> = match serde_json::from_str(audience) {
             Ok(v) => v,
             Err(e) => {
-                error!("Redis: audience refresh-токена не разбирается: {}", e);
+                error!("Redis: the refresh token audience does not parse: {}", e);
                 return Ok(None);
             }
         };
@@ -395,11 +402,11 @@ impl JtiStore for RedisClient {
         }))
     }
 
-    /// Помечает refresh-токен использованным (`HSETNX`).
+    /// Marks a refresh token as used (`HSETNX`).
     ///
-    /// `HSETNX` возвращает `1`, только если поля ещё не было, — то есть операция
-    /// атомарна и «победитель» ровно один. На этом держится детектор повторного
-    /// использования: второй обмен тем же токеном получит `false`.
+    /// `HSETNX` returns `1` only when the field was not there yet — that is, the
+    /// operation is atomic and there is exactly one winner. The reuse detector
+    /// rests on that: a second exchange of the same token gets `false`.
     #[tracing::instrument(name = "redis.mark_refresh_used", skip_all, err(level = "debug"))]
     async fn mark_refresh_used(&self, id: &str) -> Result<bool, JtiError> {
         let mut conn = self.connection().await?;
@@ -414,21 +421,21 @@ impl JtiStore for RedisClient {
                 Ok(marked)
             }
             Err(e) => {
-                error!("Redis: пометка refresh-токена не выполнилась: {}", e);
+                error!("Redis: marking the refresh token failed: {}", e);
                 record_redis_command("mark_refresh_used", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Резервирует TOTP-код через `SET NX EX`.
+    /// Reserves a TOTP code through `SET NX EX`.
     ///
-    /// `SET NX` возвращает `nil`, если ключ уже существует, — то есть операция
-    /// атомарна и «победитель» ровно один. На этом держится защита от
-    /// переигрывания: второе предъявление того же кода получит `false`.
+    /// `SET NX` returns `nil` when the key already exists — that is, the
+    /// operation is atomic and there is exactly one winner. Replay protection
+    /// rests on that: a second presentation of the same code gets `false`.
     ///
-    /// Значение-заглушка `1`: важен сам факт наличия ключа, а TTL снимает запись
-    /// вместе с окном действия кода.
+    /// The placeholder value is `1`: what matters is the presence of the key,
+    /// and the TTL removes the record together with the code's validity window.
     #[tracing::instrument(name = "redis.claim_totp_code", skip_all, err(level = "debug"))]
     async fn claim_totp_code(&self, hash: &str, ttl: u64) -> Result<bool, JtiError> {
         let mut conn = self.connection().await?;
@@ -444,18 +451,18 @@ impl JtiStore for RedisClient {
         {
             Ok(result) => {
                 record_redis_command("claim_totp_code", true, started.elapsed());
-                // `Some("OK")` — ключ создан нами, `None` — уже существовал.
+                // `Some("OK")` means we created the key, `None` that it already existed.
                 Ok(result.is_some())
             }
             Err(e) => {
-                error!("Redis: резервирование TOTP-кода не выполнилось: {}", e);
+                error!("Redis: reserving the TOTP code failed: {}", e);
                 record_redis_command("claim_totp_code", false, started.elapsed());
                 Err(classify(&e))
             }
         }
     }
 
-    /// Удаляет ключ `jti` (`DEL`); отзыв токена. Идемпотентна.
+    /// Deletes the `jti` key (`DEL`); a token revocation. Idempotent.
     #[tracing::instrument(name = "redis.delete_jti", skip_all, err(level = "debug"))]
     async fn delete_jti(&self, jti: &str) -> Result<(), JtiError> {
         let mut conn = self.connection().await?;
@@ -467,7 +474,7 @@ impl JtiStore for RedisClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Redis: DEL не выполнился: {}", e);
+                error!("Redis: DEL failed: {}", e);
                 record_redis_command("delete_jti", false, started.elapsed());
                 Err(classify(&e))
             }
@@ -477,10 +484,11 @@ impl JtiStore for RedisClient {
 
 #[cfg(test)]
 mod tests {
-    //! Тесты разбора конфигурации и классификации ошибок.
+    //! Tests of configuration parsing and error classification.
     //!
-    //! Живой Redis здесь не нужен: проверяется то, что раньше подразумевалось
-    //! отдельной стадией открытия соединения, а теперь выводится из самой ошибки.
+    //! A live Redis is not needed here: what is checked is what used to be
+    //! implied by a separate connection-opening stage and is now derived from the
+    //! error itself.
 
     use super::*;
     use std::io;
@@ -499,8 +507,8 @@ mod tests {
 
     #[test]
     fn other_errors_mean_wrong_operation() {
-        // Ответ не того типа — сбой не связи, а самой команды.
-        // `UnexpectedReturnType` — это переименованный в redis 1.0 `TypeError`.
+        // A response of the wrong type — the command failed, not the connection.
+        // `UnexpectedReturnType` is what redis 1.0 renamed `TypeError` to.
         let type_error =
             RedisError::from((redis::ErrorKind::UnexpectedReturnType, "unexpected type"));
         assert!(matches!(classify(&type_error), JtiError::WrongOperation));
@@ -508,9 +516,9 @@ mod tests {
 
     #[test]
     fn client_is_created_without_touching_the_network() {
-        // Соединение ленивое, поэтому клиент создаётся даже под заведомо
-        // недоступный адрес — и это именно то поведение, на которое опирается
-        // `/readyz` (сервис поднимается и честно сообщает о недоступности).
+        // The connection is lazy, so a client is created even for a deliberately
+        // unreachable address — and that is exactly the behaviour `/readyz`
+        // relies on (the service comes up and honestly reports unavailability).
         let client = RedisClient::new();
         assert!(client.is_ok());
         assert!(client.unwrap().manager.get().is_none());

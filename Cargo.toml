@@ -1,23 +1,24 @@
 [package]
 name = "jwt-service-app"
-version = "1.17.12"
+version = "1.17.13"
 edition = "2021"
-# Apache-2.0, а не MIT: у Apache есть явный патентный грант (раздел 3), и для
-# криптографического сервиса он существеннее краткости MIT. Полный текст — в
-# `LICENSE` в корне репозитория. Без этого поля публичный репозиторий и
-# публикуемые образы формально оставались «все права защищены»: код нельзя было
-# ни форкнуть, ни использовать. Отсюда же строку берёт `utoipa` в `info.license`
-# OpenAPI-спеки, поэтому после правки поля спеку надо перегенерировать
-# (`UPDATE_OPENAPI=1 cargo test openapi`).
+# Apache-2.0 rather than MIT: Apache has an explicit patent grant (section 3),
+# and for a cryptographic service that matters more than the brevity of MIT. The
+# full text is in `LICENSE` in the repository root. Without this field a public
+# repository and the published images formally stayed "all rights reserved": the
+# code could be neither forked nor used. `utoipa` also takes the string from
+# here for `info.license` of the OpenAPI spec, so after editing the field the
+# spec has to be regenerated (`UPDATE_OPENAPI=1 cargo test openapi`).
 license = "Apache-2.0"
 
 [dependencies]
-# `http2` из дефолтных фич намеренно выключен: он тянет `h2` 0.3, которая не
-# получила патча к RUSTSEC-2026-0258 (ветка 0.3 не выходит с июля 2025), а сам
-# HTTP/2 в сервисе не используется — TLS терминирует обратный прокси и ходит к
-# апстриму по HTTP/1.x. Планируемый gRPC (JWT-102) это не задевает: `tonic`
-# поднимает собственный сервер на `hyper` с `h2` 0.4. Остальные дефолтные фичи
-# перечислены как есть — без `macros` не соберутся атрибуты `#[post]`.
+# `http2` is deliberately excluded from the default features: it pulls in `h2`
+# 0.3, which never got a patch for RUSTSEC-2026-0258 (the 0.3 branch has had no
+# release since July 2025), and HTTP/2 is not used by the service anyway — the
+# reverse proxy terminates TLS and talks to the upstream over HTTP/1.x. The
+# planned gRPC work (JWT-102) is unaffected: `tonic` brings its own server on
+# `hyper` with `h2` 0.4. The remaining default features are listed as they are —
+# without `macros` the `#[post]` attributes do not compile.
 actix-web = { version = "4.9", default-features = false, features = [
     "macros",
     "compress-brotli",
@@ -30,61 +31,66 @@ actix-web = { version = "4.9", default-features = false, features = [
 actix-cors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# TLS-бэкенд задан явно, чтобы в бинарь не линковались два стека сразу. Дефолт
-# `reqwest` 0.13 — это `default-tls`, который означает уже не `native-tls`, а
-# `rustls` (+ `aws-lc-rs`, `webpki`, `rustls-platform-verifier`); при этом
-# `sentry` через свою фичу `transport` тянет `native-tls`, то есть openssl,
-# который у нас и так обязателен для подписи JWT. Оставляем `native-tls`: он
-# переиспользует уже слинкованный openssl и системные корневые сертификаты
-# (`ca-certificates` в рантайм-образе), а весь rustls-стек уходит.
-# Дефолтные фичи перечислены явно, кроме `system-proxy`: та читает системные
-# настройки прокси Windows/macOS, а в контейнере прокси задаётся переменными
-# `HTTP(S)_PROXY` — их разбирает `hyper-util/client-proxy`, он включён всегда.
-# При обновлении `reqwest` список надо сверять с новым дефолтом.
+# The TLS backend is set explicitly so that two stacks are not linked into the
+# binary at once. The default of `reqwest` 0.13 is `default-tls`, which no longer
+# means `native-tls` but `rustls` (+ `aws-lc-rs`, `webpki`,
+# `rustls-platform-verifier`); meanwhile `sentry`, through its `transport`
+# feature, pulls in `native-tls`, that is openssl, which we need anyway for
+# signing JWTs. We keep `native-tls`: it reuses the already linked openssl and
+# the system trust roots (`ca-certificates` in the runtime image), and the whole
+# rustls stack goes away.
+# The default features are listed explicitly except `system-proxy`: that one
+# reads the Windows/macOS system proxy settings, while in a container the proxy
+# comes from the `HTTP(S)_PROXY` variables — parsed by
+# `hyper-util/client-proxy`, which is always enabled.
+# When upgrading `reqwest`, the list has to be checked against the new default.
 reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
     "http2",
     "charset",
     "native-tls",
 ] }
-# `connection-manager` — постоянное мультиплексированное соединение с
-# автоматическим переподключением. Без него каждая команда открывала своё TCP-
-# соединение и под нагрузкой упиралась в исчерпание эфемерных портов.
+# `connection-manager` gives a permanent multiplexed connection with automatic
+# reconnection. Without it every command opened its own TCP connection and under
+# load ran into ephemeral port exhaustion.
 redis = { version = "1.2.4", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5.3.1", features = ["actix_extras", "chrono"] }
 thiserror = "2.0.11"
 parking_lot = "0.12"
-# Только асинхронный примитив синхронизации: замок на обновление кеша JWKS
-# удерживается через `await` (см. `jwk.rs`), где `parking_lot` использовать
-# нельзя. Рантайм тянет actix-web, отдельно он здесь не нужен.
+# Only the async synchronisation primitive: the JWKS cache refresh lock is held
+# across an `await` (see `jwk.rs`), where `parking_lot` cannot be used. The
+# runtime comes from actix-web and is not needed separately here.
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"] }
 openssl = "0.10.70"
 base64 = "0.22.1"
-# Token-bucket rate limiting (алгоритм GCRA). Берём только core-crate `governor`
-# (MIT); actix-обёртку (`actix-governor`, GPL-3.0) не тянем из-за копилефта на
-# публично раздаваемые Docker-образы — middleware реализован свой (см. `rate_limit.rs`).
+# Token bucket rate limiting (the GCRA algorithm). We take only the core crate
+# `governor` (MIT); the actix wrapper (`actix-governor`, GPL-3.0) is kept out
+# because of its copyleft on publicly distributed Docker images — the middleware
+# is our own (see `rate_limit.rs`).
 governor = "0.10"
-# Метрики: фасад `metrics` + Prometheus-рендерер. Лицензии permissive (MIT /
-# MIT+Apache-2.0). `default-features = false` — дефолт тянет собственный
-# HTTP-listener и push-gateway (hyper/rustls), а мы отдаём текст экспозиции
-# через actix на `/metrics` (см. `metrics.rs`).
+# Metrics: the `metrics` facade plus the Prometheus renderer. Permissive
+# licenses (MIT / MIT+Apache-2.0). `default-features = false` because the default
+# pulls in its own HTTP listener and push gateway (hyper/rustls), while we serve
+# the exposition text through actix on `/metrics` (see `metrics.rs`).
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-# Распределённый трейсинг: OTLP-экспорт в OpenTelemetry Collector (через него
-# трейсы забирает Monium). Лицензии permissive (Apache-2.0 / MIT). Включается
-# только при заданном OTEL_EXPORTER_OTLP_ENDPOINT — см. `tracing.rs`.
+# Distributed tracing: OTLP export to an OpenTelemetry Collector (Monium picks
+# the traces up through it). Permissive licenses (Apache-2.0 / MIT). Enabled only
+# when OTEL_EXPORTER_OTLP_ENDPOINT is set — see `tracing.rs`.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-# Транспорт OTLP — HTTP/protobuf (порт 4318 у коллектора), а не gRPC: `reqwest`
-# уже есть в зависимостях, поэтому весь tonic/gRPC-стек не тянем.
-# Клиент — БЛОКИРУЮЩИЙ намеренно: batch-процессор экспортирует span'ы на своём
-# выделенном потоке, где нет tokio-рантайма, и асинхронный клиент там паникует
-# («there is no reactor running»). Основной async-рантайм сервиса это не задевает.
-# `internal-logs` — чтобы ошибки самого экспортёра были видны в логе.
+# The OTLP transport is HTTP/protobuf (port 4318 on the collector) rather than
+# gRPC: `reqwest` is already among the dependencies, so the whole tonic/gRPC
+# stack is kept out.
+# The client is BLOCKING on purpose: the batch processor exports spans on its own
+# dedicated thread, where there is no tokio runtime, and an async client panics
+# there ("there is no reactor running"). The service's main async runtime is
+# unaffected.
+# `internal-logs` makes the exporter's own errors visible in the log.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
@@ -92,45 +98,49 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "reqwest-blocking-client",
     "internal-logs",
 ] }
-# Мост `tracing` → OTLP-логи (сигнал logs). Включается отдельным флагом, чтобы не
-# дублировать stdout-логи там, где их уже собирают агентом.
+# The `tracing` → OTLP logs bridge (the logs signal). It is enabled by a separate
+# flag so as not to duplicate stdout logs where an agent already collects them.
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
 tracing-opentelemetry = "0.33"
-# GlitchTip (Sentry-совместимый): ошибки/паники, performance-транзакции и
-# структурные логи. Лицензия MIT. Все три канала включаются по DSN — см.
-# `sentry_glitchtip.rs`. Фичи: `tracing` — мост из `tracing`-шины (события → issues,
-# span-ы → транзакции), `logs` — структурные логи. Сам канал Logs включается
-# нашим event-фильтром, а не `ClientOptions::enable_logs`: с 0.49 то поле
-# deprecated и влияет только на автозахват интеграциями.
+# GlitchTip (Sentry-compatible): errors and panics, performance transactions and
+# structured logs. MIT license. All three channels are enabled by the DSN — see
+# `sentry_glitchtip.rs`. The features: `tracing` is the bridge from the `tracing`
+# bus (events → issues, spans → transactions) and `logs` is structured logs. The
+# Logs channel itself is enabled by our event filter rather than by
+# `ClientOptions::enable_logs`: since 0.49 that field is deprecated and only
+# affects automatic capture by integrations.
 sentry = { version = "0.49", features = ["tracing", "logs"] }
 
 [dev-dependencies]
-# HTTP-мок сервиса ключей (`jwks-service-app`) для интеграционных тестов
-# HTTP-слоя — эндпоинты выпуска/проверки токенов ходят к JWKS по сети.
+# An HTTP mock of the key service (`jwks-service-app`) for the integration tests
+# of the HTTP layer — the issue and verify endpoints talk to the JWKS over the
+# network.
 wiremock = "0.6"
 
-# Профиль релизной сборки. До этого секции не было вообще, то есть прод-образ
-# собирался дефолтом cargo: LTO выключен, `codegen-units = 16`, таблица символов
-# на месте.
+# The release build profile. There was no such section at all before, so the
+# production image was built with the cargo defaults: LTO off,
+# `codegen-units = 16`, the symbol table intact.
 #
-# `lto = "fat"` — межкрейтовая оптимизация по всему графу зависимостей сразу.
-# Крейтов здесь много и они тонкие (actix + tower-подобные слои, `tracing`,
-# три клиента наблюдаемости), поэтому инлайнить есть что; `"thin"` дешевле по
-# времени сборки, но образ пересобирается в CI, а не на каждом `cargo run`.
+# `lto = "fat"` is cross-crate optimisation over the whole dependency graph at
+# once. There are many crates here and they are thin (actix plus tower-like
+# layers, `tracing`, three observability clients), so there is plenty to inline;
+# `"thin"` is cheaper in build time, but the image is rebuilt in CI rather than
+# on every `cargo run`.
 #
-# `codegen-units = 1` — один codegen-юнит на крейт вместо шестнадцати: без
-# разбиения оптимизатор видит модуль целиком. Параллелизм сборки при этом
-# теряется, и это главный вклад в подорожавшую сборку.
+# `codegen-units = 1` means one codegen unit per crate instead of sixteen:
+# without the split the optimiser sees the whole module. Build parallelism is
+# lost in the process, and that is the main contributor to the more expensive
+# build.
 #
-# `strip = "symbols"` — из бинаря убирается таблица символов (debuginfo в
-# релизе и так нет).
+# `strip = "symbols"` removes the symbol table from the binary (there is no
+# debuginfo in a release build anyway).
 #
-# ВАЖНО: `panic = "abort"` здесь намеренно НЕ задан. Он бы (1) убил канал паник
-# в GlitchTip — `sentry-panic` ловит панику хуком и успевает отправить событие
-# только пока стек разматывается, (2) снял изоляцию воркеров actix: паника в
-# одном запросе роняла бы весь процесс вместо одного соединения. Экономия
-# несопоставима.
+# IMPORTANT: `panic = "abort"` is deliberately NOT set here. It would (1) kill
+# the panic channel into GlitchTip — `sentry-panic` catches a panic with a hook
+# and only manages to send the event while the stack unwinds, and (2) remove the
+# worker isolation of actix: a panic in one request would take the whole process
+# down instead of a single connection. The savings are not comparable.
 [profile.release]
 lto = "fat"
 codegen-units = 1

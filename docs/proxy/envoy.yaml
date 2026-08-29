@@ -1,6 +1,6 @@
-# Envoy — секрет через inline env в конфиге не поддерживается напрямую;
-# используйте подстановку при генерации конфига или Lua/ext_proc для чтения из
-# секрет-хранилища. Ниже — request_headers_to_add (перезапись) + remove.
+# Envoy — a secret through inline env in the config is not supported directly;
+# use substitution when generating the config, or Lua/ext_proc to read it from a
+# secret store. Below: request_headers_to_add (an overwrite) plus remove.
 
 static_resources:
   listeners:
@@ -20,9 +20,9 @@ static_resources:
                 route: { cluster: jwt_service }
                 request_headers_to_add:
                 - header: { key: "X-Proxy-Secret", value: "${PROXY_SECRET}" }
-                  # append_action REPLACE — перезаписывает клиентскую версию.
+                  # append_action REPLACE overwrites the client-supplied version.
                   append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                # (1) Дополнительно удаляем входящий заголовок до маршрутизации.
+                # (1) Additionally delete the incoming header before routing.
                 request_headers_to_remove: ["X-Proxy-Secret"]
           http_filters:
           - name: envoy.filters.http.router

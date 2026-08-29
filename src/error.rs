@@ -1,14 +1,15 @@
-//! Общий тип ошибки HTTP-слоя.
+//! The shared error type of the HTTP layer.
 //!
-//! [`Error`] агрегирует ошибки нижележащих слоёв (JWT, хранилище `jti`,
-//! HTTP-клиент) и реализует [`ResponseError`], сопоставляя каждый вариант с
-//! HTTP-статусом. Тело ответа всегда структурировано ([`ErrorResponse`]).
-//! Внутренние причины (хранилище/reqwest/JWT) наружу не раскрываются — клиент
-//! получает обобщённое «Internal server error».
+//! [`Error`] aggregates the errors of the layers below (JWT, the `jti` store,
+//! the HTTP client) and implements [`ResponseError`], mapping each variant to an
+//! HTTP status. The response body is always structured ([`ErrorResponse`]).
+//! Internal causes (the store, reqwest, JWT) are never exposed — the client gets
+//! a generic "Internal server error".
 //!
-//! О конкретном бэкенде хранилища модуль **не знает**: сюда приходит
-//! [`JtiError`] из трейта [`JtiStore`](crate::models::jwt::JtiStore), а не
-//! `redis::RedisError`. Иначе смена бэкенда тянула бы за собой HTTP-слой.
+//! The module **knows nothing** about the concrete storage backend: what arrives
+//! here is a [`JtiError`] from the [`JtiStore`](crate::models::jwt::JtiStore)
+//! trait, not a `redis::RedisError`. Otherwise swapping the backend would drag
+//! the HTTP layer along.
 
 use actix_web::{HttpResponse, ResponseError};
 use reqwest::Error as ReqwestError;
@@ -17,7 +18,7 @@ use thiserror::Error;
 use crate::models::jwt::{JtiError, JwtError};
 use crate::models::ErrorResponse;
 
-/// Ошибка уровня приложения, преобразуемая в HTTP-ответ.
+/// An application-level error convertible into an HTTP response.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Validation error: {0}")]
@@ -36,21 +37,22 @@ pub enum Error {
     Unauthorized(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
-    // Ни один обработчик пока не отдаёт 404, но вариант достраивает маппинг
-    // ошибок в статусы (400/401/404/422) и покрыт тестом `error_response`.
+    // No handler returns 404 yet, but the variant completes the mapping of
+    // errors to statuses (400/401/404/422) and is covered by the
+    // `error_response` test.
     #[allow(dead_code)]
     #[error("Not Found: {0}")]
     NotFound(String),
 }
 
 impl ResponseError for Error {
-    /// Отображает вариант ошибки в HTTP-ответ со структурированным телом
-    /// [`ErrorResponse`].
+    /// Maps an error variant to an HTTP response with a structured body
+    /// ([`ErrorResponse`]).
     ///
     /// `Validation` → 400, `Unprocessable` → 422, `Unauthorized` → 401,
-    /// `Forbidden` → 403, `NotFound` → 404. Остальные варианты (`Jwt`, `Store`,
-    /// `Reqwest`, `Internal`) считаются внутренними и возвращают 500 с обобщённым
-    /// сообщением — детали наружу не раскрываются.
+    /// `Forbidden` → 403, `NotFound` → 404. The remaining variants (`Jwt`,
+    /// `Store`, `Reqwest`, `Internal`) are treated as internal and return 500
+    /// with a generic message — no detail is exposed.
     fn error_response(&self) -> HttpResponse {
         match self {
             Error::Validation(msg) => HttpResponse::BadRequest().json(ErrorResponse::new(msg)),
@@ -68,16 +70,16 @@ impl ResponseError for Error {
 
 #[cfg(test)]
 mod tests {
-    //! Проверяем маппинг вариантов [`Error`] в HTTP-ответ: статус,
-    //! структурированное тело [`ErrorResponse`] и отсутствие утечки внутренних
-    //! деталей в 500.
+    //! We check the mapping of [`Error`] variants to an HTTP response: the
+    //! status, the structured [`ErrorResponse`] body and the absence of any leak
+    //! of internal detail into a 500.
 
     use super::*;
     use actix_web::body::to_bytes;
     use actix_web::http::StatusCode;
 
-    /// Прогоняет ошибку через [`ResponseError::error_response`] и разбирает
-    /// статус и тело ответа.
+    /// Runs an error through [`ResponseError::error_response`] and parses the
+    /// status and the body of the response.
     async fn render(err: Error) -> (StatusCode, ErrorResponse) {
         let resp = err.error_response();
         let status = resp.status();
@@ -127,7 +129,7 @@ mod tests {
 
     #[actix_web::test]
     async fn internal_maps_to_500_without_leaking_details() {
-        // Внутренняя причина не должна попасть в тело ответа.
+        // The internal cause must not reach the response body.
         let (status, body) = render(Error::Internal("redis://secret-dsn".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.error, "Internal server error");
