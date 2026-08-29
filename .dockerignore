@@ -7,7 +7,7 @@
 .git
 .gitignore
 
-# Private agent notes (see AGENTS.md) — they must not reach the image
+# The maintainer's local working notes — they must not reach the image
 AGENTS_INTERNAL.md
 
 # Other development environment

@@ -111,18 +111,37 @@ script through `"$VAR"` — the shell then receives it as a variable value.
 
 ## Required in the repository settings
 
-Not fixable by code; done by hand in Settings before publication:
+Not fixable by code; done by hand in Settings. **The order matters:** half of
+these settings do not exist for a private repository, so a checklist that says
+"do all of this before publication" cannot be followed — GitHub refuses them
+until the switch has happened.
+
+### Beforehand
 
 - **Settings → Actions → Workflow permissions: `Read repository contents`.**
-  The repository currently has `write` (verified through the API,
-  `default_workflow_permissions: "write"`). It does not affect the current
-  workflows — all five have an explicit `permissions` block that overrides the
-  default — but the very first workflow added without such a block would silently
-  get a write token.
+  Anything else and the very first workflow added without an explicit
+  `permissions` block silently gets a write token. It does not affect the
+  workflows that exist today — all five declare `permissions` and override the
+  default — which is exactly why the wrong value here would go unnoticed.
+
+### In the same sitting as the switch to public
+
+Neither of these can be prepared in advance, and both are easy to forget once
+the repository is already open:
+
 - **Settings → Actions → Fork pull request workflows: `Require approval for all
-  external contributors`.** The default for public repositories is approval only
-  for first-time contributors; after the first merged pull request the runs become
-  automatic.
+  external contributors`.** The default is approval only for a first-time
+  contributor; after their first merged pull request the runs become automatic.
+  The setting does not exist while the repository is private — the API answers
+  `422 Fork PR approval is not allowed for private repositories`.
+- **Settings → Advanced Security → Private vulnerability reporting: on.** It is
+  what makes the "Report a vulnerability" link in
+  [`SECURITY.md`](../../SECURITY.md) work; until it is on, the private channel
+  documented there is email only. Public repositories only — the API answers
+  `404` for `/private-vulnerability-reporting` while the repository is private.
+
+### Optional
+
 - **An environment with required reviewers for publishing the images** — should
   the wish arise to run `docker.yml` other than manually and other than from a
   tag.
