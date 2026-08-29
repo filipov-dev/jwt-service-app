@@ -462,14 +462,30 @@ describe itself.
 hand:
 
 ```bash
-scripts/changelog.sh                 # the body of a section: last tag..HEAD
-scripts/changelog.sh --insert        # insert the section for the Cargo.toml version into CHANGELOG.md
-scripts/changelog.sh --all > CHANGELOG.md   # rebuild the whole file
+scripts/changelog.sh                        # the body of a section: last tag..HEAD
+scripts/changelog.sh --all > CHANGELOG.md   # rebuild the whole file — the only way it is written
+scripts/changelog.sh --check                # is the committed file that rebuild? (CI runs this)
 ```
 
 `release.yml` calls the same script and puts the result into the GitHub release
 description — the wording in the file and in the release matches by
 construction, not because somebody keeps them in sync.
+
+> **Rebuilding is the only way the file is written, and that is the fix for how
+> it drifted** (JWT-115). Sections used to be inserted one per pull request,
+> before the tag existed, and three things followed from that: a section carried
+> the date it was written rather than the date of the tag; it was filed under
+> the version in `Cargo.toml` even when no tag ever got that number, leaving a
+> compare link to a tag that does not exist; and a commit made after the section
+> was written was simply missing from it. Fifteen entries had gone that way, and
+> the section headings still stood in Russian a release after the script had
+> been translated. `--check` in `ci.yml` is what keeps rebuilding the only mode:
+> it regenerates the file and diffs it, exactly as `spec_file_is_up_to_date`
+> does for `docs/openapi.json`. It runs **on pull requests only** — the push
+> that merges a version bump is the push that starts `release.yml`, so master
+> and the new tag arrive together and the file is one release behind itself
+> until the next pull request rebuilds it. That gap is normal; failing master
+> over it every release would not be.
 
 Hence the requirement on commit messages: **conventional commits** (`feat:`,
 `fix:`, `docs:`, `perf:`, `refactor:`, `test:`, `ci:`, `style:`) with the task
@@ -487,7 +503,9 @@ section (the mapping is in `bucket_for`), and `feat!:` moves the change to
 > **There are more versions than releases.** The version is bumped by every
 > commit, while exactly one tag is created — for the final version of the merge.
 > That is why there are gaps in the tags (1.11.0, 1.12.0, 1.12.1): their commits
-> went into the next released tag rather than getting lost.
+> went into the next released tag rather than getting lost. The changelog has a
+> section per **release**, so those numbers have no section of their own — do
+> not add one, `--check` will take it back out.
 
 > **The historical entries in `CHANGELOG.md` are in Russian, and that is a
 > deliberate decision** (JWT-114): the commit history is not being rewritten, so
@@ -1032,11 +1050,12 @@ environment, update the scheme descriptions in `main.rs`.
 
   Note that pushing such a change to `master` triggers a release and publishes
   Docker images (see "Conventions and pitfalls").
-- **Insert the version section into `CHANGELOG.md` before merging**:
-  `scripts/changelog.sh --insert` (see "Releases and the changelog"). The tag
-  only appears after the merge, so rebuilding with `--all` at that moment would
-  file the changes under "Unreleased" — only `--insert` produces a section with
-  a version number.
+- **Rebuild `CHANGELOG.md` when CI asks for it**:
+  `scripts/changelog.sh --all > CHANGELOG.md` (see "Releases and the
+  changelog"). Your own commits land under "Unreleased" until the merge is
+  tagged; the section with a version number appears at the next rebuild, and
+  `scripts/changelog.sh --check` says whether one is due. Never edit the file by
+  hand — the check compares it against the generator and will not take it.
 - **Write in English.** Code, comments, documentation, commit messages, pull
   request titles and bodies — see "Repository language". Run
   `scripts/check-language.sh` before finishing; CI runs it anyway.

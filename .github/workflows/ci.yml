@@ -32,8 +32,13 @@ jobs:
       # run the code from the pull request, that is, someone else's code with
       # access to the working directory. No step below talks to git over the
       # network, so the token has no business being there.
+      #
+      # fetch-depth: 0 — the changelog check regenerates the file from the tags,
+      # and a shallow clone has none of them. It fetches history, not
+      # credentials: the flag above still applies.
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install OpenSSL headers
@@ -62,6 +67,23 @@ jobs:
       # the formatting check — it is instant and needs no toolchain.
       - name: Language
         run: scripts/check-language.sh
+
+      # CHANGELOG.md is generated from the history, so it can go stale without
+      # anyone touching it — a new tag alone is enough. This is the same guard
+      # `spec_file_is_up_to_date` gives docs/openapi.json: a generated file that
+      # nothing compares against drifts from its generator and keeps looking
+      # authoritative while it does.
+      #
+      # Pull requests only, and not because master matters less. The push that
+      # merges a version bump is the push that starts `release.yml`, so master
+      # and the new tag appear at the same moment and the file is legitimately
+      # one release behind itself for as long as it takes the next pull request
+      # to rebuild it. Checking master here would fail on that gap every single
+      # release. The gate belongs on the way in, which is where the fix is
+      # cheap.
+      - name: Changelog
+        if: github.event_name == 'pull_request'
+        run: scripts/changelog.sh --check
 
       # Formatting is checked first: the step is fast and needs no build, so it
       # gives feedback before the others.

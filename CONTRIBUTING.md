@@ -155,7 +155,11 @@ entry to "Breaking changes". **The subject goes into the changelog verbatim** �
 write it as a changelog line, not as a note to yourself. `CHANGELOG.md` itself
 is never edited by hand: [`scripts/changelog.sh`](scripts/changelog.sh)
 assembles it from the commit history, and the same script fills in the body of
-each GitHub release.
+each GitHub release. It is rebuilt whole —
+`scripts/changelog.sh --all > CHANGELOG.md` — and CI runs
+`scripts/changelog.sh --check` to confirm the committed file is that rebuild, so
+a hand edit or a stale file fails the pipeline rather than surviving as
+plausible-looking history.
 
 **Every commit bumps the version in `Cargo.toml`** per semver: major — broken
 compatibility, minor — new functionality, patch — a bug fix, a refactor, a

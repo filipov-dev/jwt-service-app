@@ -4,18 +4,18 @@
 #
 # The same code is used in two places, so the format of the sections in
 # CHANGELOG.md and in the body of a GitHub release matches by construction:
-#   * `--all` — the whole file (that is how CHANGELOG.md was filled in
-#     retroactively);
+#   * `--all` — the whole file, and the only thing that ever writes
+#     CHANGELOG.md;
 #   * no arguments — the body of the section for the next release, which
 #     `release.yml` puts into the release description.
 #
 # Usage:
 #   scripts/changelog.sh                        # section body: last tag..HEAD
 #   scripts/changelog.sh --heading              # the same plus "## [version] - date"
-#   scripts/changelog.sh --insert               # insert the version section into CHANGELOG.md
 #   scripts/changelog.sh --range v1.9.0..v1.10.0
 #   scripts/changelog.sh --version 1.13.0       # the version in the heading (otherwise from Cargo.toml)
 #   scripts/changelog.sh --all > CHANGELOG.md   # regenerate the whole file
+#   scripts/changelog.sh --check                # is the committed file that regeneration?
 #
 # The mapping of commit types to sections is in `bucket_for`.
 
@@ -188,7 +188,14 @@ All notable changes to this project. The format is based on
 The file is assembled from the commit history and regenerated with
 `scripts/changelog.sh --all`; the body of every GitHub release is built by the
 same script. The entries are commit subjects verbatim, with the task key in
-parentheses.
+parentheses — `JWT-NNN` is an identifier in the maintainer's own issue tracker,
+which is not public, so it records where a change came from rather than linking
+anywhere.
+
+**One section per release, not per version bump.** The version is bumped by
+every commit while a tag is created only for the last of them, so the numbers
+here have gaps (1.11.0, 1.12.0, 1.12.1). Nothing is lost: those commits belong
+to the section of the tag that followed them.
 
 Two sections are added to the six of Keep a Changelog: "Documentation" (client
 examples and operating instructions — changes for the consumer of the service)
@@ -235,56 +242,59 @@ HEADER
     done
 }
 
-# Inserts the section for version $1 (range $2) into CHANGELOG.md: both the
-# section itself, after the header, and the version comparison line in the links
-# block at the bottom.
-#
-# It is needed because the version is bumped in the same pull request as the
-# change while the tag only appears after the merge. Regenerating with `--all` at
-# that moment would file the commits under "Unreleased" — a section with a
-# version number can only be produced this way.
-insert_section() {
-    local version="$1" range="$2" file=CHANGELOG.md
-    local head body links tmp prev
+# The "Unreleased" section is the one part of the file that depends on HEAD: on a
+# pull request branch it holds that branch's commits, on master usually nothing.
+# Everything else is a function of the tags alone and is therefore identical
+# wherever it is generated — so a comparison that drops this one section is the
+# same comparison on a branch and on master.
+strip_unreleased() {
+    awk '
+        /^## \[Unreleased\]/ { skip = 1; next }
+        /^## \[/ { skip = 0 }
+        !skip
+    ' "$1"
+}
 
-    if grep -q "^## \[${version}\]" "$file"; then
-        echo "section [${version}] already exists in ${file}" >&2
-        return 1
+# Compares CHANGELOG.md against what the history would generate today.
+#
+# The file used to be grown section by section as each pull request was merged,
+# which is why it drifted: a section carried the date it was written rather than
+# the date of the tag, it was filed under the version in Cargo.toml even when no
+# tag ever got that number (leaving a compare link to a tag that does not
+# exist), and any commit made after the section was written was simply missing
+# from it. Generating the whole file is the only mode now, and this check is
+# what keeps it the only mode.
+check_file() {
+    local file=CHANGELOG.md tmp status=0
+
+    if [ -z "$(tags_ascending)" ]; then
+        echo "changelog: no tags in this clone — fetch them first (git fetch --tags)" >&2
+        return 2
     fi
 
     tmp="$(mktemp -d)"
+    render_all >"${tmp}/generated"
+    strip_unreleased "$file" >"${tmp}/committed"
+    strip_unreleased "${tmp}/generated" >"${tmp}/expected"
 
-    # The file splits into three parts: the header before the first section, the
-    # sections, and the links block. The new section goes at the top of the
-    # sections — Keep a Changelog requires reverse chronological order.
-    head="${tmp}/head"
-    body="${tmp}/body"
-    links="${tmp}/links"
-
-    awk -v head="$head" -v body="$body" -v links="$links" '
-        /^## \[/ { part = 2 }
-        /^\[[^]]+\]: http/ { if (part != 3) part = 3 }
-        { print > (part == 3 ? links : part == 2 ? body : head) }
-    ' part=1 "$file"
-
-    prev="$(last_tag)"
-
-    {
-        cat "$head"
-        printf '## [%s] - %s\n\n' "$version" "$(date +%F)"
-        section_body "$range"
-        cat "$body"
-        # The "Unreleased" line is always first in the links block, and the new
-        # version goes right after it.
-        head -n 1 "$links"
-        printf '[%s]: %s/compare/%s...v%s\n' "$version" "$REPO_URL" "$prev" "$version"
-        tail -n +2 "$links"
-    } >"${tmp}/out"
-
-    mv "${tmp}/out" "$file"
+    diff -u --label "CHANGELOG.md (committed)" --label "CHANGELOG.md (generated)" \
+        "${tmp}/committed" "${tmp}/expected" || status=$?
     rm -rf "$tmp"
 
-    echo "added section [${version}] to ${file}" >&2
+    if [ "$status" = 0 ]; then
+        echo "changelog: up to date" >&2
+        return 0
+    fi
+
+    cat >&2 <<'MSG'
+
+changelog: the committed CHANGELOG.md is not what the history generates.
+Regenerate it and commit the result:
+
+    scripts/changelog.sh --all > CHANGELOG.md
+
+MSG
+    return 1
 }
 
 main() {
@@ -296,8 +306,8 @@ main() {
                 mode=all
                 shift
                 ;;
-            --insert)
-                mode=insert
+            --check)
+                mode=check
                 shift
                 ;;
             --heading)
@@ -329,17 +339,16 @@ main() {
         return 0
     fi
 
+    if [ "$mode" = check ]; then
+        check_file
+        return $?
+    fi
+
     if [ -z "$range" ]; then
         local from
         from="$(last_tag)"
         # The first release in a repository without tags — take the whole history.
         range="${from:+${from}..}HEAD"
-    fi
-
-    if [ "$mode" = insert ]; then
-        [ -n "$version" ] || version="$(version_from_cargo)"
-        insert_section "$version" "$range"
-        return 0
     fi
 
     if [ "$heading" = 1 ]; then
