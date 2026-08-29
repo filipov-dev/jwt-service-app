@@ -2,8 +2,10 @@
 
 Instructions for AI agents and developers working with this repository.
 
-> Private notes (accesses, processes, preferences) live in `AGENTS_INTERNAL.md`;
-> that file is in `.gitignore` and is never committed.
+> **Who this file is for.** It is the working reference of someone changing this
+> code: the architecture, the pitfalls and the full configuration, in one file
+> and at length. It is not user documentation — for that start from
+> [`README.md`](README.md) and the documents it links to.
 
 ## Project overview
 
@@ -269,14 +271,11 @@ lists the deliberate decisions (TOTP replay protection off by default, `404`
 instead of `401` on `/metrics`, failing open when Redis is unavailable), and
 wording that drifts apart turns documented behaviour into a "confirmed finding".
 
-> **Private Vulnerability Reporting is not enabled yet.** The setting is only
-> available to public repositories and this one is still private (see JWT-52):
-> the API returns `404` for `/private-vulnerability-reporting`. Enable it right
-> after the switch to public —
-> `PUT /repos/filipov-dev/jwt-service-app/private-vulnerability-reporting` or
-> Settings → Advanced Security → Private vulnerability reporting. Until then the
-> "Report a vulnerability" link from `SECURITY.md` does not work and email
-> remains the working channel.
+> **The "Report a vulnerability" link in `SECURITY.md` depends on a repository
+> setting** — Private vulnerability reporting, see the settings checklist in
+> [`docs/security/workflow-audit.md`](docs/security/workflow-audit.md). With the
+> setting off the link leads nowhere and email is the only working channel, so
+> check the two together when you touch either.
 
 **CI is built for a public repository**: `ci.yml`, `audit.yml` and `secrets.yml`
 run on `pull_request`, which includes pull requests from other people's forks,
@@ -331,8 +330,9 @@ through `cargo watch` inside the container (the dev image installs
 
 ### Production deployment
 
-`deployments/prod/` holds both ways to run it, and both are meant for our own
-stand as much as for external consumers of the public image:
+`deployments/prod/` holds both ways to run it, and both are written to be
+deployed as they are, by the maintainer and by anyone running the public image
+alike:
 - `docker-compose.yml` — the service and Redis, with the secrets coming from
   `.env` (the sample is `.env.example`; `.env` itself is in `.gitignore`);
 - `k8s/` — Deployment, Service, PodDisruptionBudget, NetworkPolicy and a sample
@@ -477,6 +477,12 @@ key in parentheses. The subject of a commit goes into the changelog verbatim —
 write it as a changelog line, not as a note to yourself. The type picks the
 section (the mapping is in `bucket_for`), and `feat!:` moves the change to
 "Breaking changes".
+
+> **`JWT-NNN` is an identifier in the maintainer's own issue tracker**, which is
+> not public — so the references to it scattered through this file and through
+> the changelog are provenance, not links you can follow. The script does not
+> parse the key and nothing breaks without it: a contribution from outside
+> carries the GitHub issue number instead (`(#123)`), or no key at all.
 
 > **There are more versions than releases.** The version is bumped by every
 > commit, while exactly one tag is created — for the final version of the merge.

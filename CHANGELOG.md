@@ -16,6 +16,12 @@ and "Internal" (CI, tests, formatting).
 Entries before 1.17.13 are in Russian: the repository switched to English in
 JWT-114 and the commit history was deliberately left as it was.
 
+## [1.17.14] - 2026-08-29
+
+### Documentation
+
+- remove internal references from AGENTS.md and docs before publication (JWT-64)
+
 ## [1.17.13] - 2026-08-29
 
 ### Documentation
@@ -399,6 +405,7 @@ JWT-114 and the commit history was deliberately left as it was.
 - Init
 
 [Unreleased]: https://github.com/filipov-dev/jwt-service-app/compare/v1.13.0...HEAD
+[1.17.14]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.13...v1.17.14
 [1.17.13]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.12...v1.17.13
 [1.17.12]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.11...v1.17.12
 [1.17.11]: https://github.com/filipov-dev/jwt-service-app/compare/v1.17.10...v1.17.11

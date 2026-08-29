@@ -144,6 +144,11 @@ fix: do not lose the jti when Redis is unavailable (JWT-77)
 feat!: move the refresh token format to v2 (JWT-90)
 ```
 
+The `JWT-NNN` key comes from the maintainer's issue tracker, which is not
+public — **you are not expected to have one.** Reference the GitHub issue your
+change closes instead (`(#123)`), or leave the parentheses off entirely; nothing
+in the tooling depends on the key.
+
 Types: `feat`, `fix`, `docs`, `perf`, `refactor`, `test`, `ci`, `style`. The
 type picks the section of [CHANGELOG.md](CHANGELOG.md), and `feat!` moves the
 entry to "Breaking changes". **The subject goes into the changelog verbatim** —

@@ -114,11 +114,11 @@ script through `"$VAR"` — the shell then receives it as a variable value.
 Not fixable by code; done by hand in Settings before publication:
 
 - **Settings → Actions → Workflow permissions: `Read repository contents`.**
-  The repository currently has `write` (verified through the API,
-  `default_workflow_permissions: "write"`). It does not affect the current
-  workflows — all five have an explicit `permissions` block that overrides the
-  default — but the very first workflow added without such a block would silently
-  get a write token.
+  At the time of the audit the repository had `write`
+  (`default_workflow_permissions`, read through the API). It does not affect the
+  current workflows — all five have an explicit `permissions` block that
+  overrides the default — but the very first workflow added without such a block
+  would silently get a write token.
 - **Settings → Actions → Fork pull request workflows: `Require approval for all
   external contributors`.** The default for public repositories is approval only
   for first-time contributors; after the first merged pull request the runs become
@@ -126,6 +126,13 @@ Not fixable by code; done by hand in Settings before publication:
 - **An environment with required reviewers for publishing the images** — should
   the wish arise to run `docker.yml` other than manually and other than from a
   tag.
+- **Settings → Advanced Security → Private vulnerability reporting: on.** The
+  setting exists only for public repositories, so it cannot be switched on in
+  advance — the API answers `404` for `/private-vulnerability-reporting` while
+  the repository is private. It is what makes the "Report a vulnerability" link
+  in [`SECURITY.md`](../../SECURITY.md) work; until it is on, the private
+  channel documented there is email only. Enable it in the same sitting as the
+  switch to public, not later.
 
 ## Residual risks
 

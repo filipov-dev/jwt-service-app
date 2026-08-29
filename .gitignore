@@ -1,8 +1,7 @@
 /target
 /.idea
 
-# Internal notes for agents; the canonical copy lives on the wiki
-# (homepage/projects/jwt-service-app/agents-internal)
+# The maintainer's local working notes. Never committed.
 AGENTS_INTERNAL.md
 
 # Artifacts of a load run: the issued tokens and the k6 export.

@@ -1,6 +1,6 @@
 [package]
 name = "jwt-service-app"
-version = "1.17.13"
+version = "1.17.14"
 edition = "2021"
 # Apache-2.0 rather than MIT: Apache has an explicit patent grant (section 3),
 # and for a cryptographic service that matters more than the brevity of MIT. The

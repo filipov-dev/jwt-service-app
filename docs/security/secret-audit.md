@@ -92,7 +92,7 @@ working tree:
 git rev-list --objects --all | awk 'NF>1{ $1=""; print }' | sort -u | grep -Ei '...'
 ```
 
-- `AGENTS_INTERNAL.md` (internal notes, accesses) — never committed;
+- `AGENTS_INTERNAL.md` (the maintainer's local notes) — never committed;
 - `.idea/` — never tracked;
 - `deployments/prod/.env` and `deployments/prod/k8s/secret.yaml` — never
   committed; only the `.env.example` and `secret.example.yaml` templates are in
