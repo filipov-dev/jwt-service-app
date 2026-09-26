@@ -101,7 +101,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 # The `tracing` → OTLP logs bridge (the logs signal). It is enabled by a separate
 # flag so as not to duplicate stdout logs where an agent already collects them.
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-semantic-conventions = "0.33"
 tracing-opentelemetry = "0.33"
 # GlitchTip (Sentry-compatible): errors and panics, performance transactions and
 # structured logs. MIT license. All three channels are enabled by the DSN — see
