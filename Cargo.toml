@@ -56,7 +56,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 redis = { version = "1.2.4", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-utoipa = { version = "5.3.1", features = ["actix_extras", "chrono"] }
+utoipa = { version = "6.0.0", features = ["actix_extras", "chrono"] }
 thiserror = "2.0.11"
 parking_lot = "0.12"
 # Only the async synchronisation primitive: the JWKS cache refresh lock is held
