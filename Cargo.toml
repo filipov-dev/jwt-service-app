@@ -91,7 +91,7 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # there ("there is no reactor running"). The service's main async runtime is
 # unaffected.
 # `internal-logs` makes the exporter's own errors visible in the log.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
     "http-proto",
